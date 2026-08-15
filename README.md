@@ -27,7 +27,10 @@ never re-runs gap detection.
             single-pass per video → wagon_cache/<GW_n>/<camera>/*.jpg
     │
     ▼
-[Stage 3] features.{door,load,damage,ocr} (parallel)
+[Stage 3] features.load  runs FIRST, to completion
+            (damage reads the load JSON to drop floor_damage on LOADED
+             wagons; running it first makes that read deterministic)
+          then features.{door,ocr,damage} in parallel
             pure YOLO inference on cached frames
             persists evidence snapshots + metadata under evidence/
             → wagon_states/<feature>/<GW_n>.json
@@ -84,6 +87,7 @@ never re-runs gap detection.
 wagon_eye_v4/
 ├── README.md                          (this file)
 ├── requirements.txt
+├── pytest.ini                         test collection scope
 ├── orchestrator/master_runner.py      ★ entry point
 ├── reconstruction/runner.py           Stage 1 (subprocess wagon_count)
 ├── materializer/wagon_cache_builder.py Stage 2
@@ -91,6 +95,11 @@ wagon_eye_v4/
 │   ├── _common.py                     YOLO loader cache + helpers
 │   ├── _evidence.py                   evidence persistence helpers
 │   │                                   (per-wagon JPEG + metadata)
+│   ├── inference_lib/                 mature tracking intelligence ported
+│   │                                   from the legacy system (door tracker,
+│   │                                   identity merger, illumination, shape
+│   │                                   prior, damage tracker, OCR + number
+│   │                                   aggregator, temporal reasoning)
 │   ├── door/processor.py              door_state.pt
 │   ├── load/processor.py              loaded.pt
 │   ├── damage/processor.py            damage.pt
@@ -133,17 +142,43 @@ wagon_eye_v4/
 ├── core/
 │   ├── constants.py                   camera ids, classes, statuses
 │   ├── unified_wagon_state.py         UnifiedWagonState dataclass
-│   ├── global_state_loader.py         GlobalTrainState (in-memory)
+│   ├── global_state_loader.py         ★ THE counting→inspection adapter:
+│   │                                   parses the engine JSON, freezes the
+│   │                                   roster, exposes camera offsets,
+│   │                                   roster fingerprint + integrity check
+│   ├── feature_config.py              Stage-3 feature registry + toggles
+│   ├── frame_quality.py               evidence-frame scoring heuristics
 │   └── batch.py                       CameraVideo / TrainBatch
 ├── models/
-│   ├── reconstruction/                drop your 4 Stage-1 .pt files
-│   │                                   (right_up_gap.pt, left_up_gap.pt,
-│   │                                    top_gap.pt, side_classification.pt)
-│   └── features/                      drop your 4 Stage-3 .pt files
+│   ├── reconstruction/                Stage-1 counting weights, EXACT names
+│   │                                   (right_up_wagon_gap.pt,
+│   │                                    left_up_wagon_gap.pt, top_gap.pt,
+│   │                                    side_classification.pt,
+│   │                                    top_classification.pt = optional)
+│   └── features/                      Stage-3 inspection weights
 │                                       (door_state.pt, loaded.pt,
 │                                        damage.pt, wagon_id_counting.pt)
-└── wagon_count/                       Phase-1 backend (copied verbatim
-                                       + short-name alias shim)
+├── tests/                             v4 integration + counting-swap
+│                                       regression suite (70 tests)
+├── _legacy_wagon_count_removed/       the REPLACED counting modules, kept
+│                                       for review only.  Not a package,
+│                                       not importable, asserted unreferenced.
+│                                       Safe to delete after review.
+└── wagon_count/                       ★ the counting engine — adopted
+    ├── run_global_count.py             byte-identical from the proven
+    ├── tracker_engine.py               correct-count implementation
+    ├── fragment_stitching.py           tracker fragments → physical gaps
+    ├── gap_validation.py               candidate → validated boundary
+    ├── temporal_classification.py      class-sequence hysteresis
+    ├── train_structure.py              wagon window (no GW id for
+    │                                    ENGINE / BRAKE_VAN)
+    ├── global_fusion.py                fixed-master fusion + camera offsets
+    ├── global_alignment.py             segment build (+ retained legacy path)
+    ├── global_train_state.py           engine-side data contracts
+    ├── video_segmenter.py              Stage-1 debug overlay videos
+    ├── evidence_report.py              engine's own PDF (skipped by v4)
+    ├── rejection_report.py             gap-rejection CSV/JSON tooling
+    └── tests/                          the engine's own suite (283 tests)
 ```
 
 There are NO `RIGHT_UP/`, `LEFT_UP/`, `RIGHT_UP_TOP/`, `LEFT_UP_TOP/`
@@ -231,6 +266,30 @@ python -m orchestrator.master_runner --auto
 python -m orchestrator.master_runner --batch 20260408_032134
 ```
 
+## Tests
+
+```bash
+cd wagon_eye_v4
+python -m pytest -q                      # 353 tests (v4 + counting engine)
+python -m unittest discover -s tests     # 70 tests (v4 only, stdlib runner)
+```
+
+No model weights, no video decode and no GPU are needed: the counting modules
+are pure stdlib, and the suites drive them with synthetic tracker output.
+Nothing here runs production inference.
+
+| Suite | Covers |
+|---|---|
+| `tests/test_counting_engine_swap.py` | the new engine is wired in; the old one is unreachable; no aliasing/download logic |
+| `tests/test_global_roster_contract.py` | deterministic `GW_1..GW_N`, no duplicates/gaps, count independent of support cameras |
+| `tests/test_roster_immutability.py` | inspection cannot append / remove / reorder / renumber / re-time the roster |
+| `tests/test_downstream_contract.py` | door/load/damage/OCR + fusion + reporting still receive the expected structure |
+| `tests/test_counting_integration.py` | four-camera input → engine → JSON → adapter → inspection; camera offsets reach materialization |
+| `wagon_count/tests/` | the counting engine's own 283-test suite, adopted with it |
+
+Tests that compare the engine against its source folder skip cleanly when
+`wagon_count - Copy_correct_count/` is absent (it is gitignored).
+
 ## Run-mode flags
 
 | Flag                        | Effect                                                |
@@ -301,6 +360,9 @@ never drawn in the processed videos.
 | Failure                                  | Outcome                                            |
 |------------------------------------------|----------------------------------------------------|
 | Stage 1 reconstruction errors / 0 wagons | Batch marked `failed_no_global_state`. Abort.      |
+| Stage 1 required counting model missing  | Engine exits non-zero naming the exact expected path. Batch marked `failed_no_global_state`. Abort. |
+| Stage 1 malformed roster (duplicate / non-contiguous `GW_n`, count mismatch) | Rejected by `verify_roster_integrity()` at the Stage-1 boundary. Batch marked `failed_no_global_state`. Abort. |
+| Inspection mutates the roster            | `RosterImmutabilityError` at the next stage guard. Loud failure, never silent corruption. |
 | Stage 2 cannot open one video            | That camera's wagon_cache subtree empty. Continue. Batch is `completed_partial`. |
 | Stage 3 one feature processor crashes    | Its per-wagon JSONs marked `FAILED`. Other features continue. |
 | Stage 3 one wagon fails in one feature   | That `(feature, GW_n)` JSON marked `FAILED`. Rest unaffected. |
@@ -333,11 +395,28 @@ wagon ids or define wagon boundaries.  It runs fixed-master fusion:
 | Support cameras | evidence + synchronization only; they can never create, delete, split or merge a global gap |
 | Raw YOLO gap | a *candidate* — must pass motion / persistence / trajectory / duplicate validation |
 | Camera clocks | per-camera offset estimated (`t_global = t_local + delta`), `RESOLVED` or `UNRESOLVED`; unresolved contributes 0.0, i.e. the shared-`t=0` assumption |
-| Roster contents | **WAGON units only.**  ENGINE and BRAKE_VAN are preserved as `wagon_window` metadata (and still counted in the report's LOCO KPI via `GlobalTrainState.engine_count`) but never receive a `GW_n` id and never extend the wagon timeline |
+| Roster contents | **WAGON units only.**  ENGINE and BRAKE_VAN are preserved as `wagon_window` metadata but never receive a `GW_n` id and never extend the wagon timeline |
 | Immutability | the roster is frozen the moment Stage 1 returns; `orchestrator` re-checks `roster_fingerprint()` after Stages 2, 3, 4 and 5 |
 
 `core/global_state_loader.py` is the single adapter between this engine and
 everything downstream — nothing else parses the counting engine's JSON.
+
+### What "WAGON units only" changes in the output
+
+`total_wagons` now counts **wagons**, not wagons + loco + brake van, so it
+reads lower than a pre-swap run on the same train. Where the engine/brake-van
+counts surface:
+
+| Consumer | Value | Source |
+|---|---|---|
+| `GlobalTrainState.engine_count` / `.brake_van_count` | preserved | adapter reads `wagon_window` structure metadata |
+| `reports/combined_train_report.json` → `legacy_view_model.summary_kpis.engine_count` | preserved | via the adapter above |
+| `reports/combined_train_report.json` → `summary.engine_count` | **0** | `summarize_wagons()` counts over the roster, which is wagon-only |
+| PDF "LOCO NUMBER" column | `Not Detected` | reads `summary_kpis.loco_numbers`, hard-coded `[]` in `_adapter.py` — unchanged by this swap, it behaved this way before |
+
+The `summary` / `legacy_view_model` disagreement is pre-existing plumbing, left
+as-is deliberately: reconciling it would mean editing the inspection/report
+layer, which is out of scope for a counting-engine swap.
 
 A camera that cannot see a given global wagon contributes **no frames** for it
 (rather than clamping onto an unrelated frame); the feature processors then
