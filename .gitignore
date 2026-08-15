@@ -1,0 +1,35 @@
+# --- Model weights -------------------------------------------------------
+# Placed manually on the target machine; see models/*/README.md for the exact
+# filenames and directories each stage expects.
+*.pt
+*.pth
+*.onnx
+
+# --- Input / output media ------------------------------------------------
+*.mp4
+*.avi
+*.mov
+local_inputs/
+batch_outputs/
+
+# --- Reference copy of the counting engine -------------------------------
+# Source material the wagon_count/ engine was adopted from, byte-for-byte.
+# It carries its own .git, its own input videos and its own weights (~229 MB).
+# Excluded deliberately: it must never become a nested repo or a second
+# competing counter. Provenance tests skip cleanly when it is absent.
+wagon_count - Copy_correct_count/
+
+# --- Python --------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# --- Editors / OS --------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

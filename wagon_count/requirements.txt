@@ -1,0 +1,49 @@
+# Wagon Eye -- Phase 1 standalone wagon counting
+# Requires Python 3.10+
+#
+# These five packages are the complete direct dependency set.  Every import
+# in the project resolves to one of them (or the standard library):
+#   numpy        -- tracker_engine.py, video_segmenter.py
+#   opencv       -- cv2: video read/write, JPEG encode, overlay drawing
+#   torch        -- required by ultralytics; also the torch.load patch that
+#                   lets the .pt checkpoints load on torch >= 2.6
+#   ultralytics  -- YOLO gap detection + side classification
+#   pillow       -- evidence_report.py: writes results/combined_report.pdf.
+#                   Chosen because it needs NO new install (ultralytics
+#                   already requires pillow AND matplotlib), works headless
+#                   with no display, and encodes the evidence pages as JPEG
+#                   inside the PDF -- which keeps a photo-heavy report a few
+#                   MB instead of the hundreds of MB a vector/Flate writer
+#                   such as matplotlib's PdfPages would produce.
+#                   matplotlib is not imported for plotting: evidence_report
+#                   only borrows its bundled DejaVu TrueType fonts, and falls
+#                   back to system fonts, then to Pillow's built-in font.
+#                   No reportlab / fpdf / img2pdf / LaTeX is required.
+#
+# torchvision is pulled in by ultralytics; it is listed explicitly so a
+# fresh install resolves a matching torch/torchvision pair.
+#
+# LAST VERIFIED WORKING COMBINATION (local run, CPU):
+#   Python 3.14.5 / numpy 2.4.6 / opencv-python 4.13.0 /
+#   torch 2.12.0+cpu / torchvision 0.27.0 / ultralytics 8.4.53
+# The floors below are deliberately loose so an EC2 instance with an
+# existing GPU torch build is not forced to downgrade.
+
+ultralytics>=8.0.0
+opencv-python>=4.7.0
+numpy>=1.23.0
+
+# PDF report writer.  Already installed as an ultralytics dependency; listed
+# explicitly because evidence_report.py imports it directly.
+pillow>=9.0.0
+
+# torch is required by ultralytics.  Pin a working pair if installing fresh.
+# For a GPU instance, install the CUDA build FIRST (see README ->
+# "GPU (optional)"), then run this file -- pip will keep the CUDA wheels.
+torch>=2.0.0
+torchvision>=0.15.0
+
+# NOTE for headless servers: if you prefer not to install the OpenCV GUI
+# system libraries (libgl1, libglib2.0-0), you may swap opencv-python for
+# opencv-python-headless -- this project never calls cv2.imshow():
+#   pip uninstall -y opencv-python && pip install opencv-python-headless
