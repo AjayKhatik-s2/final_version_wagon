@@ -4,19 +4,32 @@ ported).
 Per wagon, for each side camera (RIGHT_UP / LEFT_UP):
 
     1. Iterate cached JPEGs in wagon_cache/<GW_n>/<camera>/.
-    2. Score illumination quality per frame (legacy IlluminationProcessor).
-    3. Run YOLO door_state.pt on the raw frame.
-    4. Filter detections through the geometric shape prior (aspect ratio,
-       vertical-edge dominance, border completeness).
-    5. Feed surviving detections + quality score into the legacy
-       DoorTracker (Kalman + Hungarian + per-track 30-frame quality-
-       weighted majority vote + state machine with 2x hysteresis on
-       OPEN -> CLOSED transitions + sticky DAMAGE state).
-    6. After all frames, finalize the tracker -> per-track {state,
+    2. Run YOLO door_state.pt on the raw frame (half=False -- CPU build).
+    3. Apply the model's own confidence gate.
+    4. Feed surviving detections into the legacy DoorTracker (Kalman +
+       Hungarian + per-track 30-frame quality-weighted majority vote +
+       state machine with 2x hysteresis on OPEN -> CLOSED transitions +
+       sticky DAMAGE state).
+    5. After all frames, finalize the tracker -> per-track {state,
        confidence, snapshot}.
-    7. Run DoorIdentityMerger to collapse fragmented tracks of the same
+    6. Run DoorIdentityMerger to collapse fragmented tracks of the same
        physical door (spatial + temporal + context + structural).
-    8. Pick the dominant door state per CAMERA SIDE.
+    7. Pick the dominant door state per CAMERA SIDE, and persist ONE best
+       representative snapshot per side.
+
+REMOVED from this path (both modules remain on disk, untouched; Door was
+their only consumer):
+
+  * IlluminationProcessor -- was inert.  The call passed a `frame_idx=`
+    kwarg the method does not accept, raising TypeError on every frame;
+    the bare `except` pinned quality to 1.0.  Now hard-coded to 1.0, so
+    the tracker receives exactly the same value as before.
+  * GeometricShapePrior -- calibrated for PORTRAIT doors, while these
+    side cameras see LANDSCAPE doors.  It rejected 100% of real
+    detections on aspect and vertical-edge grounds, starved the tracker
+    below n_init, and on LEFT_UP discarded an OPEN_DOOR detection,
+    yielding a false CLOSED.  See the inline note at the call site for
+    the measured before/after.
 
 The per-CAMERA dominant state IS the per-side door state (RIGHT_UP -> right
 door, LEFT_UP -> left door).  Same convention the legacy combined report
@@ -68,12 +81,9 @@ from features.inference_lib.door_tracker import (
 from features.inference_lib.door_identity_merger import (
     DoorIdentityMerger, MergeConfig,
 )
-from features.inference_lib.illumination_processor import (
-    IlluminationProcessor, IlluminationConfig,
-)
-from features.inference_lib.geometric_shape_prior import (
-    GeometricShapePrior, GeometricPriorConfig,
-)
+# NOTE: IlluminationProcessor and GeometricShapePrior are deliberately NOT
+# imported here any more -- see the module docstring.  Both modules are left
+# untouched on disk; only Door's use of them is removed.
 from features._evidence import (
     BestFrameTracker, wagon_evidence_dir,
     save_jpeg, safe_crop, write_metadata, draw_annotated_bbox,
@@ -112,8 +122,6 @@ def _canonical(state_value: str) -> str:
 
 def _run_tracker_one_camera(
     yolo_model,
-    illumination: IlluminationProcessor,
-    geo_prior: GeometricShapePrior,
     tracker_config: TrackerConfig,
     merger_config: MergeConfig,
     cache_root: str,
@@ -200,22 +208,39 @@ def _run_tracker_one_camera(
             })
 
     # ------- frame loop (stable interior only) -------
-    for fi, frame in iter_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True):
+    # EVERY frame of the stable interior is inspected.  Frame sub-sampling was
+    # measured and REJECTED: at stride 2 the per-track hit count halves
+    # (GW_21 6->2, GW_22 8->2), dropping below TrackerConfig.n_init=3 /
+    # min_hits_for_decision=3, so marginal tracks stop confirming.  On both
+    # wagons LEFT_UP lost its track entirely and fell back to CLOSED/0.000 --
+    # re-breaking exactly what removing the geometric prior had recovered.
+    for fi, frame in iter_wagon_frames(cache_root, gw_id, camera_id,
+                                       trim_stable=True):
         if frame_w == 0:
             frame_h, frame_w = frame.shape[:2]
         used += 1
 
-        # 1) quality score (does NOT alter the frame; YOLO sees raw bytes,
-        #    matching the legacy pipeline).
-        try:
-            ill_res = illumination.process_frame(frame, frame_idx=fi)
-            quality = float(getattr(ill_res, "quality_score", 1.0))
-        except Exception:
-            quality = 1.0
+        # 1) Detection quality weight handed to the tracker.
+        #    The legacy IlluminationProcessor is REMOVED from this path.  It was
+        #    already inert: the call site passed a `frame_idx=` kwarg that
+        #    `process_frame(self, frame)` does not accept, so it raised
+        #    TypeError on EVERY frame and the bare `except` pinned quality to
+        #    1.0.  Hard-coding 1.0 therefore feeds the tracker exactly the same
+        #    value it has always received -- bit-identical behaviour, minus a
+        #    per-frame exception.
+        quality = 1.0
 
-        # 2) YOLO detection on raw frame
+        # 2) YOLO detection on raw frame.
+        #    half=False is REQUIRED: production runs on a CPU-only torch build,
+        #    which has no native fp16 kernels.  Measured on door_state.pt with
+        #    identical frames and parameters (torch 2.12.0+cpu):
+        #        half=True   112,637 ms/frame   0 detections
+        #        half=False       675 ms/frame  1 detection @ conf 0.93
+        #    fp16 is emulated (167x slower) AND degrades the numerics enough
+        #    that every box falls below threshold, so the door state silently
+        #    collapsed to CLOSED/0.00 for every wagon.
         try:
-            results = yolo_model(frame, verbose=False, half=True)[0]
+            results = yolo_model(frame, verbose=False, half=False)[0]
         except Exception:
             continue
         if results.boxes is None or len(results.boxes) == 0:
@@ -239,13 +264,26 @@ def _run_tracker_one_camera(
             _snapshot_confirmed(fi)
             continue
 
-        # 4) geometric prior filter (aspect ratio / vertical-edge / border)
-        try:
-            boxes, confs, clss, _idx = geo_prior.filter_detections(
-                frame, boxes, confs, clss,
-            )
-        except Exception:
-            pass
+        # 4) The legacy GeometricShapePrior filter is REMOVED from this path.
+        #    Measured on wagon GW_21 of the validation set (real door_state.pt,
+        #    51 frames per side, identical inputs):
+        #
+        #      prior ON   RIGHT_UP 1 track hits=1  | LEFT_UP 0 tracks -> NO_DATA
+        #      prior OFF  RIGHT_UP 1 track hits=3  | LEFT_UP 1 track  hits=3
+        #
+        #    It is calibrated for a PORTRAIT door (config documents "taller than
+        #    wide", preferred aspect 0.5, vertical edges dominant).  These side
+        #    cameras see LANDSCAPE doors: measured aspect 1.49-2.18 with
+        #    HORIZONTAL edge energy dominant, so the aspect and vertical-edge
+        #    gates fail on 100% of real detections.  Worse, on LEFT_UP it
+        #    discarded an OPEN_DOOR detection outright, leaving the no-track
+        #    fallback to report CLOSED -- a safety-critical false negative.
+        #    Suppressing detections also starved the tracker below n_init=3, so
+        #    tracks never confirmed.  Detection reliability now rests on the
+        #    model's own confidence gate plus temporal confirmation.
+        #
+        #    `features/inference_lib/geometric_shape_prior.py` is left intact;
+        #    Door was its only consumer.
 
         # 5) convert to Detection objects + feed tracker
         names = getattr(yolo_model, "names", {}) or {}
@@ -448,8 +486,6 @@ def run(
     summary: Dict[str, str] = {}
 
     # Pre-construct shared per-process helpers (loaded once across wagons)
-    illumination = IlluminationProcessor(IlluminationConfig())
-    geo_prior    = GeometricShapePrior(GeometricPriorConfig())
     tracker_cfg  = TrackerConfig()
     merger_cfg   = MergeConfig()
 
@@ -479,13 +515,11 @@ def run(
                 continue
 
             l_decisions, l_used, _, _, l_cands, l_overlay = _run_tracker_one_camera(
-                yolo_model, illumination, geo_prior,
-                tracker_cfg, merger_cfg,
+                yolo_model, tracker_cfg, merger_cfg,
                 cache_root, gw_id, C.CAMERA_LEFT_UP,
             )
             r_decisions, r_used, _, _, r_cands, r_overlay = _run_tracker_one_camera(
-                yolo_model, illumination, geo_prior,
-                tracker_cfg, merger_cfg,
+                yolo_model, tracker_cfg, merger_cfg,
                 cache_root, gw_id, C.CAMERA_RIGHT_UP,
             )
 

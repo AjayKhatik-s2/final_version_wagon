@@ -38,7 +38,7 @@ from __future__ import annotations
 import os
 import time
 import traceback
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from core import constants as C
 from core.global_state_loader import GlobalTrainState
@@ -66,7 +66,7 @@ def _canonical_load(raw: str) -> str:
 
 def _aggregate_camera(
     model, cache_root: str, gw_id: str, camera_id: str,
-    *, every_nth: int, max_frames: int,
+    *, every_nth: int, max_frames: Optional[int],
 ) -> Tuple[str, float, int, int, int, "BestFrameTracker", "BestFrameTracker"]:
     """Return (load_status, confidence, frames_used, loaded_count, empty_count,
                best_loaded_frame, best_empty_frame).
@@ -130,7 +130,15 @@ def run(
     output_dir: str,
     evidence_root: Optional[str] = None,
     every_nth: int = 2,
-    max_frames: int = 0,    # legacy walks the full window; 0 = unbounded
+    # MUST be None, not 0, to mean "unbounded".  `features/_common.py`'s
+    # iter_wagon_frames guards its subsample with `max_frames is not None`, so a
+    # 0 was treated as a hard cap of ZERO: np.linspace(0, n-1, 0) returns an
+    # empty array and every frame was discarded.  Load therefore processed 0
+    # frames per wagon and wrote NO_FRAMES for every wagon -- every_nth=2 never
+    # took effect at all.  Verified on a 40-frame cache: max_frames=0 -> 0
+    # frames yielded, max_frames=None -> 17 (34 stable frames, every 2nd).
+    # Fixed Load-side only; the shared helper is deliberately left untouched.
+    max_frames: Optional[int] = None,
     verbose: bool = True,
 ) -> Dict[str, str]:
     model_path = os.path.join(feature_models_dir, C.MODEL_LOADED)

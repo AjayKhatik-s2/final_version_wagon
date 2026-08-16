@@ -1,3 +1,4 @@
+
 """WagonEye v4 Master Orchestrator -- train-state-native.
 
 Run modes:
@@ -40,7 +41,7 @@ if _REPO_ROOT not in sys.path:
 # Local packages
 from core import constants as C
 from core.feature_config import (
-    FeatureConfig, FEATURE_REGISTRY, parse_disable_arg,
+    FeatureConfig, FEATURE_REGISTRY, FEATURE_KEYS, parse_disable_arg,
 )
 from core.batch import (
     CameraVideo, TrainBatch,
@@ -49,6 +50,7 @@ from core.batch import (
 from core.global_state_loader import (
     GlobalTrainState, assert_roster_unchanged, roster_fingerprint,
 )
+from core.stage_timing import StageTimer
 from core.unified_wagon_state import UnifiedWagonState, summarize_wagons
 
 from reconstruction import runner as reconstruction_runner
@@ -92,6 +94,8 @@ class BatchOutcome:
     final_status: str = "unknown"
     error: Optional[str] = None
     elapsed_seconds: float = 0.0
+    # Per-stage wall clock; also persisted to archive/timings.json.
+    timings: Dict[str, float] = field(default_factory=dict)
 
 
 # -----------------------------------------------------------------------------
@@ -184,6 +188,7 @@ def process_batch(
         feature_config = FeatureConfig.all_on()
     t_batch = time.time()
     out = BatchOutcome(batch=batch)
+    timer = StageTimer()
     batch_root  = os.path.join(workspace_root, batch.batch_key)
     download_root  = os.path.join(batch_root, "downloads")
     stage0_root    = os.path.join(batch_root, "global_state")
@@ -223,13 +228,14 @@ def process_batch(
     # ---- Stage 1: reconstruction ----
     print(f"\n--- STAGE 1  Global train reconstruction ---")
     try:
-        recon = reconstruction_runner.run(
-            video_paths=video_paths,
-            reconstruction_models_dir=recon_models_dir,
-            output_dir=stage0_root,
-            repo_root=_REPO_ROOT,
-            verbose=verbose,
-        )
+        with timer.stage("stage1_reconstruction"):
+            recon = reconstruction_runner.run(
+                video_paths=video_paths,
+                reconstruction_models_dir=recon_models_dir,
+                output_dir=stage0_root,
+                repo_root=_REPO_ROOT,
+                verbose=verbose,
+            )
         out.state = recon.state
     except reconstruction_runner.ReconstructionError as e:
         out.error = f"stage1: {e}"
@@ -250,14 +256,15 @@ def process_batch(
     # ---- Stage 2: materializer ----
     print(f"\n--- STAGE 2  Wagon cache materialization ---")
     try:
-        out.cache_summary = wagon_cache_builder.build(
-            state=recon.state,
-            video_paths=video_paths,
-            per_camera_fps=recon.per_camera_fps,
-            cache_root=cache_root,
-            camera_offsets=recon.camera_offsets,
-            verbose=verbose,
-        )
+        with timer.stage("stage2_materializer"):
+            out.cache_summary = wagon_cache_builder.build(
+                state=recon.state,
+                video_paths=video_paths,
+                per_camera_fps=recon.per_camera_fps,
+                cache_root=cache_root,
+                camera_offsets=recon.camera_offsets,
+                verbose=verbose,
+            )
         assert_roster_unchanged(recon.state, roster_guard, stage="Stage 2 (materializer)")
     except Exception as e:
         out.error = f"stage2: {e}"
@@ -287,12 +294,13 @@ def process_batch(
     )
 
     def _run_feature(name, fn):
-        try:
-            return fn(**feature_kwargs)
-        except Exception as e:
-            print(f"[STAGE3/{name}] CRASHED: {e}", file=sys.stderr)
-            traceback.print_exc(limit=3)
-            return {}
+        with timer.stage(f"stage3_{name}"):
+            try:
+                return fn(**feature_kwargs)
+            except Exception as e:
+                print(f"[STAGE3/{name}] CRASHED: {e}", file=sys.stderr)
+                traceback.print_exc(limit=3)
+                return {}
 
     def _mark_disabled(name):
         """Write a DISABLED_BY_USER sentinel JSON for every wagon of a
@@ -312,30 +320,31 @@ def process_batch(
               f"{len(summary)} wagons")
         return summary
 
-    # 1) Load first (deterministic input for damage's load-aware filter).
-    if feature_config.is_enabled("load"):
-        out.feature_summary["load"] = _run_feature("load", load_proc.run)
-    else:
-        out.feature_summary["load"] = _mark_disabled("load")
+    with timer.stage("stage3_total"):
+        # 1) Load first (deterministic input for damage's load-aware filter).
+        if feature_config.is_enabled("load"):
+            out.feature_summary["load"] = _run_feature("load", load_proc.run)
+        else:
+            out.feature_summary["load"] = _mark_disabled("load")
 
-    # 2) Then door / ocr / damage -- only the enabled ones run (in parallel).
-    all_parallel = {
-        "door":   door_proc.run,
-        "ocr":    ocr_proc.run,
-        "damage": damage_proc.run,
-    }
-    parallel_targets = {n: fn for n, fn in all_parallel.items()
-                        if feature_config.is_enabled(n)}
-    for name in all_parallel:
-        if name not in parallel_targets:
-            out.feature_summary[name] = _mark_disabled(name)
+        # 2) Then door / ocr / damage -- only the enabled ones run (in parallel).
+        all_parallel = {
+            "door":   door_proc.run,
+            "ocr":    ocr_proc.run,
+            "damage": damage_proc.run,
+        }
+        parallel_targets = {n: fn for n, fn in all_parallel.items()
+                            if feature_config.is_enabled(n)}
+        for name in all_parallel:
+            if name not in parallel_targets:
+                out.feature_summary[name] = _mark_disabled(name)
 
-    if parallel_targets:
-        with ThreadPoolExecutor(max_workers=len(parallel_targets)) as ex:
-            futs = {ex.submit(_run_feature, name, fn): name
-                    for name, fn in parallel_targets.items()}
-            for f in as_completed(futs):
-                out.feature_summary[futs[f]] = f.result()
+        if parallel_targets:
+            with ThreadPoolExecutor(max_workers=len(parallel_targets)) as ex:
+                futs = {ex.submit(_run_feature, name, fn): name
+                        for name, fn in parallel_targets.items()}
+                for f in as_completed(futs):
+                    out.feature_summary[futs[f]] = f.result()
 
     assert_roster_unchanged(recon.state, roster_guard,
                             stage="Stage 3 (feature inference)")
@@ -343,11 +352,12 @@ def process_batch(
     # ---- Stage 4: fusion ----
     print(f"\n--- STAGE 4  Wagon state fusion ---")
     try:
-        out.unified = wagon_state_builder.build(
-            state=recon.state,
-            wagon_states_root=states_root,
-            verbose=verbose,
-        )
+        with timer.stage("stage4_fusion"):
+            out.unified = wagon_state_builder.build(
+                state=recon.state,
+                wagon_states_root=states_root,
+                verbose=verbose,
+            )
         assert_roster_unchanged(recon.state, roster_guard,
                                 stage="Stage 4 (fusion)")
         # Fusion must produce exactly one UnifiedWagonState per global wagon --
@@ -370,17 +380,18 @@ def process_batch(
     # ---- Stage 4b: feature overlay video rendering (visualization only) ----
     print(f"\n--- STAGE 4b  Feature overlay rendering ---")
     try:
-        out.processed_video_paths = feature_overlay_renderer.render_all_cameras(
-            state=recon.state,
-            unified=out.unified,
-            evidence_root=evidence_root,
-            video_paths=video_paths,
-            per_camera_tracking_path=recon.per_camera_tracking_path,
-            output_dir=processed_root,
-            enabled_features=set(feature_config.enabled_keys()),
-            camera_offsets=recon.camera_offsets,
-            verbose=verbose,
-        )
+        with timer.stage("stage4b_overlay_render"):
+            out.processed_video_paths = feature_overlay_renderer.render_all_cameras(
+                state=recon.state,
+                unified=out.unified,
+                evidence_root=evidence_root,
+                video_paths=video_paths,
+                per_camera_tracking_path=recon.per_camera_tracking_path,
+                output_dir=processed_root,
+                enabled_features=set(feature_config.enabled_keys()),
+                camera_offsets=recon.camera_offsets,
+                verbose=verbose,
+            )
     except Exception as e:
         print(f"[STAGE4b] feature overlay rendering FAILED: {e}", file=sys.stderr)
         traceback.print_exc(limit=3)
@@ -409,8 +420,8 @@ def process_batch(
     # the combined report's DETAILED CAMERA REPORTS table can link them) ----
     print(f"\n--- STAGE 5a  Camera-wise reports ---")
     try:
-        out.camera_pdf_paths = {
-            cam: v for cam, v in camera_reports.build_all(
+        with timer.stage("stage5a_camera_reports"):
+            _cam_reports = camera_reports.build_all(
                 state=recon.state,
                 unified=out.unified,
                 evidence_root=evidence_root,
@@ -421,8 +432,8 @@ def process_batch(
                 batch_key=batch.batch_key,
                 logo_path=_logo_path,
                 verbose=verbose,
-            ).items() if v
-        }
+            )
+        out.camera_pdf_paths = {cam: v for cam, v in _cam_reports.items() if v}
     except Exception as e:
         print(f"[STAGE5a] camera reports FAILED: {e}", file=sys.stderr)
         traceback.print_exc(limit=3)
@@ -437,27 +448,28 @@ def process_batch(
     # ---- Stage 5b: combined report (aggregates the 4 camera reports) ----
     print(f"\n--- STAGE 5b  Combined report ---")
     try:
-        result = combined_train_report.build(
-            state=recon.state,
-            unified=out.unified,
-            output_dir=reports_root,
-            batch_key=batch.batch_key,
-            source_video_urls={
-                cam: (batch.videos[cam].s3_url
-                      if cam in batch.videos
-                      and batch.videos[cam].bucket != "__local__"
-                      else "")
-                for cam in C.ALL_CAMERAS if cam in batch.videos
-            },
-            processed_video_urls=out.processed_video_urls,
-            evidence_root=evidence_root,
-            wagon_states_root=states_root,
-            cache_root=cache_root,
-            missing_cameras=list(batch.missing_cameras()),
-            camera_pdf_urls=camera_pdf_urls,
-            logo_path=_logo_path,
-            verbose=verbose,
-        )
+        with timer.stage("stage5b_combined_report"):
+            result = combined_train_report.build(
+                state=recon.state,
+                unified=out.unified,
+                output_dir=reports_root,
+                batch_key=batch.batch_key,
+                source_video_urls={
+                    cam: (batch.videos[cam].s3_url
+                          if cam in batch.videos
+                          and batch.videos[cam].bucket != "__local__"
+                          else "")
+                    for cam in C.ALL_CAMERAS if cam in batch.videos
+                },
+                processed_video_urls=out.processed_video_urls,
+                evidence_root=evidence_root,
+                wagon_states_root=states_root,
+                cache_root=cache_root,
+                missing_cameras=list(batch.missing_cameras()),
+                camera_pdf_urls=camera_pdf_urls,
+                logo_path=_logo_path,
+                verbose=verbose,
+            )
         out.report_json_path = result.get("json_path")
         out.report_pdf_path  = result.get("pdf_path")
         assert_roster_unchanged(recon.state, roster_guard,
@@ -481,12 +493,40 @@ def process_batch(
             C.BATCH_COMPLETED_PARTIAL if partial else C.BATCH_COMPLETED
         )
 
+    # ---- Persist the stage timings (measurement only; no behaviour depends
+    # on this file).  Written before delivery so a skip-upload benchmarking
+    # run still produces it. ----
+    def _emit_timings() -> None:
+        feature_spans = [f"stage3_{k}" for k in FEATURE_KEYS]
+        extra = {
+            "batch_key": batch.batch_key,
+            "total_wagons": recon.state.total_wagons,
+            "enabled_features": feature_config.enabled_keys(),
+            # >1.0 means the Stage-3 features genuinely overlapped;
+            # ~1.0 means they serialized on the CPU.
+            "stage3_overlap_factor": timer.overlap_factor(
+                "stage3_total", feature_spans),
+        }
+        out.timings = dict(timer.to_dict()["wall_clock_seconds"])
+        try:
+            timer.write(os.path.join(archive_root, "timings.json"), extra=extra)
+        except OSError as e:
+            print(f"[TIMING] could not write timings.json: {e}", file=sys.stderr)
+        print(timer.render_table(title=f"STAGE TIMINGS  {batch.batch_key}"))
+        of = extra["stage3_overlap_factor"]
+        if of is not None:
+            verdict = ("features overlapped" if of > 1.15
+                       else "features effectively SERIALIZED on CPU")
+            print(f"  stage3 overlap factor: {of:.2f}x  ({verdict})")
+
     # ---- Stage 6: delivery ----
     if skip_upload:
+        _emit_timings()
         out.elapsed_seconds = time.time() - t_batch
         return out
 
     print(f"\n--- STAGE 6  Delivery ---")
+    _emit_timings()
     if out.report_pdf_path:
         out.report_pdf_url = s3_upload.upload_pdf(
             s3_client, out.report_pdf_path, batch.batch_key,
