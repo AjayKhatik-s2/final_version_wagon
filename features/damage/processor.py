@@ -67,6 +67,8 @@ from features._evidence import (
     wagon_evidence_dir, save_jpeg, safe_crop,
     write_metadata, draw_annotated_bbox,
 )
+# EXPERIMENTAL sampled path only; the legacy tracker path never touches this.
+from features.evidence_aggregator import EvidenceAggregator, Observation
 
 
 FEATURE_NAME = "damage"
@@ -248,6 +250,111 @@ def _run_tracker_one_camera(
 
 
 # -----------------------------------------------------------------------------
+# EXPERIMENTAL sampled path (inference_mode="sampled")
+# -----------------------------------------------------------------------------
+
+def _run_sampled_one_camera(
+    yolo_model,
+    tracker_config: DamageTrackerConfig,
+    cache_root: str,
+    gw_id: str,
+    camera_id: str,
+    confidence_floor: float,
+    sample_stride: int = 2,
+) -> Tuple[List[Dict[str, Any]], int, int, int, List[Dict[str, Any]]]:
+    """Sampled-frame Damage inference -- EXPERIMENTAL, not the default path.
+
+    Returns the SAME 5-tuple as `_run_tracker_one_camera`, so everything after
+    it in `run()` -- cross-track dedup, the loaded-wagon floor-damage filter,
+    evidence persistence and the JSON contract -- is byte-for-byte unchanged.
+
+    Unchanged from legacy: the model, `_filter_detections_for_top` (confidence
+    floor, area bounds, edge-zone suppression with the high-confidence bypass),
+    and the class vocabulary.  Only the frame sample rate and the grouping
+    mechanism differ: EvidenceAggregator requires a support FRACTION across
+    sampled frames rather than the tracker's absolute hit count, so a lone
+    high-confidence false positive cannot mark a wagon damaged.
+    """
+    paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True)
+    if not paths:
+        return [], 0, 0, 0, []
+
+    stride = max(1, int(sample_stride))
+    frame_w, frame_h = 0, 0
+    used = 0
+    frame_dets: List[Dict[str, Any]] = []
+    agg: Optional[EvidenceAggregator] = None
+    snapshots: Dict[int, Any] = {}
+
+    for fi, frame in iter_wagon_frames(cache_root, gw_id, camera_id,
+                                       every_nth=stride, trim_stable=True):
+        if frame_w == 0:
+            frame_h, frame_w = frame.shape[:2]
+            agg = EvidenceAggregator(frame_width=frame_w, frame_height=frame_h,
+                                     stride=stride)
+        used += 1
+
+        try:
+            results = yolo_model(frame, verbose=False)[0]
+        except Exception:
+            continue
+        if results.boxes is None or len(results.boxes) == 0:
+            agg.add_frame(fi, [])
+            continue
+
+        boxes = results.boxes.xyxy.cpu().numpy()
+        confs = results.boxes.conf.cpu().numpy()
+        clss = results.boxes.cls.cpu().numpy().astype(int)
+        names = getattr(yolo_model, "names", {}) or {}
+
+        # IDENTICAL legacy filtering -- not relaxed for sampling.
+        boxes, confs, clss = _filter_detections_for_top(
+            boxes, confs, clss, names, frame_w, frame_h, confidence_floor,
+        )
+        if len(boxes) == 0:
+            agg.add_frame(fi, [])
+            continue
+
+        observations: List[Observation] = []
+        for bb, cf, ci in zip(boxes, confs, clss):
+            cls_name = str(names.get(int(ci), "")).lower()
+            bl = [float(bb[0]), float(bb[1]), float(bb[2]), float(bb[3])]
+            frame_dets.append({
+                "camera_id": camera_id, "frame_idx": int(fi), "bbox": bl,
+                "class_name": cls_name, "confidence": float(cf),
+            })
+            observations.append(Observation(
+                frame_idx=int(fi), state=cls_name, confidence=float(cf),
+                bbox=(bl[0], bl[1], bl[2], bl[3]), score=float(cf),
+            ))
+        snapshots[int(fi)] = frame
+        agg.add_frame(fi, observations)
+
+    if agg is None:
+        return [], used, frame_w, frame_h, frame_dets
+
+    out: List[Dict[str, Any]] = []
+    for g in agg.finalize()["accepted"]:
+        best = g.get("best")
+        if best is None:
+            continue
+        out.append({
+            "camera_id":   camera_id,
+            "track_id":    int(g["candidate_id"]),
+            "class_name":  str(g["state"]).lower(),
+            "confidence":  float(g["confidence"]),
+            "best_confidence": float(best.confidence),
+            "total_hits":  int(g["frame_support"]),
+            "first_frame": int(g["first_frame"]),
+            "last_frame":  int(g["last_frame"]),
+            "best_frame_idx": int(best.frame_idx),
+            "bbox":        list(best.bbox),
+            "_snapshot":   snapshots.get(int(best.frame_idx)),
+        })
+    return out, used, frame_w, frame_h, frame_dets
+
+
+# -----------------------------------------------------------------------------
 # Cross-track dedup (same class + spatially close tracks collapse)
 # -----------------------------------------------------------------------------
 
@@ -311,8 +418,26 @@ def run(
     every_nth: int = 1,
     max_frames: int = 0,
     min_persistent_frames: int = 2,
+    inference_mode: str = "legacy",
+    sample_stride: int = 2,
 ) -> Dict[str, str]:
+    """`inference_mode`:
+
+        "legacy"  (DEFAULT) every frame + DamageTracker.  Known-good path.
+        "sampled" EXPERIMENTAL: every `sample_stride`-th frame +
+                  EvidenceAggregator.  The orchestrator does not pass this
+                  argument, so production behaviour is unchanged by
+                  construction.
+
+    Both modes share the model, `_filter_detections_for_top`, cross-track
+    dedup, the loaded-wagon floor-damage suppression, evidence persistence and
+    the JSON contract.
+    """
     del every_nth, max_frames, min_persistent_frames  # legacy tracker owns persistence
+    mode = str(inference_mode or "legacy").strip().lower()
+    if mode not in ("legacy", "sampled"):
+        raise ValueError(
+            f"damage inference_mode must be 'legacy' or 'sampled', got {mode!r}")
 
     model_path = os.path.join(feature_models_dir, C.MODEL_DAMAGE)
     yolo_model = load_yolo(model_path)
@@ -375,10 +500,17 @@ def run(
             total_frames = 0
 
             for cam in C.TOP_CAMERAS:
-                tracks, used, _, _, fdets = _run_tracker_one_camera(
-                    yolo_model, tracker_cfg, cache_root, gw_id, cam,
-                    confidence_floor=confidence,
-                )
+                if mode == "sampled":
+                    tracks, used, _, _, fdets = _run_sampled_one_camera(
+                        yolo_model, tracker_cfg, cache_root, gw_id, cam,
+                        confidence_floor=confidence,
+                        sample_stride=sample_stride,
+                    )
+                else:
+                    tracks, used, _, _, fdets = _run_tracker_one_camera(
+                        yolo_model, tracker_cfg, cache_root, gw_id, cam,
+                        confidence_floor=confidence,
+                    )
                 all_frame_dets.extend(fdets)
                 tracks = _dedup_cross_tracks(tracks)
                 per_camera[cam] = {

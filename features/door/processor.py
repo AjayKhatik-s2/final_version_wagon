@@ -88,6 +88,8 @@ from features._evidence import (
     BestFrameTracker, wagon_evidence_dir,
     save_jpeg, safe_crop, write_metadata, draw_annotated_bbox,
 )
+# EXPERIMENTAL sampled path only; the legacy tracker path never touches this.
+from features.evidence_aggregator import EvidenceAggregator, Observation
 
 
 FEATURE_NAME = "door"
@@ -396,6 +398,137 @@ def _run_tracker_one_camera(
 
 
 # -----------------------------------------------------------------------------
+# EXPERIMENTAL sampled path (inference_mode="sampled")
+# -----------------------------------------------------------------------------
+
+def _run_sampled_one_camera(
+    yolo_model,
+    tracker_config: TrackerConfig,
+    cache_root: str,
+    gw_id: str,
+    camera_id: str,
+    sample_stride: int = 2,
+) -> Tuple[List[Dict[str, Any]], int, int, int, Dict[str, "BestFrameTracker"],
+           Dict[str, Any]]:
+    """Sampled-frame Door inference -- EXPERIMENTAL, not the default path.
+
+    Returns the SAME 6-tuple as `_run_tracker_one_camera`, so `run()` below is
+    identical for both modes: same `_pick_side_state`, same `_resolve_evidence`,
+    same evidence files, same JSON.  Only how detections are gathered differs.
+
+    Why this exists: Door spends ~97% of its wall clock in YOLO, so the only
+    real lever is fewer calls.  Plain stride-2 against the legacy tracker
+    failed because `n_init`/`min_hits_for_decision` are ABSOLUTE hit counts
+    that halve with the sample rate (GW_21 6->2, GW_22 8->2, both losing the
+    LEFT_UP track).  EvidenceAggregator replaces that with a support FRACTION,
+    which is stride-invariant.  The tracker is NOT used here and its thresholds
+    are therefore neither read nor modified.
+
+    Deliberately unchanged from legacy: the model, the confidence gate, the
+    class mapping, and the evidence-bucket keying -- including the known
+    `_canonical()` bucket-key quirk.  Replicating that quirk keeps the A/B
+    comparison clean; fixing it here would conflate two changes.
+    """
+    paths = list_wagon_frames(cache_root, gw_id, camera_id, trim_stable=True)
+    if not paths:
+        return [], 0, 0, 0, {}, {"tracks": [], "events": []}
+
+    stride = max(1, int(sample_stride))
+    frame_w, frame_h = 0, 0
+    used = 0
+    cands: Dict[str, BestFrameTracker] = {}
+    names = getattr(yolo_model, "names", {}) or {}
+    min_conf = float(tracker_config.closed_confidence_threshold)
+
+    agg: Optional[EvidenceAggregator] = None
+    trajectory: Dict[int, Dict[str, Any]] = {}
+
+    for fi, frame in iter_wagon_frames(cache_root, gw_id, camera_id,
+                                       every_nth=stride, trim_stable=True):
+        if frame_w == 0:
+            frame_h, frame_w = frame.shape[:2]
+            agg = EvidenceAggregator(frame_width=frame_w, frame_height=frame_h,
+                                     stride=stride)
+        used += 1
+
+        try:
+            results = yolo_model(frame, verbose=False, half=False)[0]
+        except Exception:
+            continue
+        if results.boxes is None or len(results.boxes) == 0:
+            agg.add_frame(fi, [])
+            continue
+
+        boxes = results.boxes.xyxy.cpu().numpy()
+        confs = results.boxes.conf.cpu().numpy()
+        clss = results.boxes.cls.cpu().numpy().astype(int)
+        keep = confs >= min_conf
+        boxes, confs, clss = boxes[keep], confs[keep], clss[keep]
+        if len(boxes) == 0:
+            agg.add_frame(fi, [])
+            continue
+
+        observations: List[Observation] = []
+        for bbox, conf, cls_id in zip(boxes, confs, clss):
+            raw = str(names.get(int(cls_id), "")).lower()
+            # Raw YOLO class -> canonical door state, via the SAME table the
+            # rest of the pipeline uses.  _canonical() is the fallback for any
+            # label the table does not cover.
+            canon_state = C.DOOR_LABEL_TO_STATE.get(raw, _canonical(raw))
+            bl = [float(v) for v in bbox]
+            crop_q = detection_quality(frame, bl)
+            sc = snapshot_score(bl, float(conf), crop_q, frame_w, frame_h)
+            observations.append(Observation(
+                frame_idx=int(fi), state=canon_state, confidence=float(conf),
+                bbox=(bl[0], bl[1], bl[2], bl[3]), score=float(sc),
+            ))
+
+            # Evidence buckets -- keyed exactly as the legacy path keys them.
+            bucket_key = _canonical(raw)
+            bbox_store = expand_bbox(bl, _DOOR_BBOX_EXPAND_FRAC, frame_w, frame_h)
+            bucket = cands.setdefault(bucket_key, BestFrameTracker())
+            if sc > bucket.score:
+                bucket.update(score=sc, frame=frame, bbox=bbox_store,
+                              frame_idx=fi, state=bucket_key,
+                              confidence=float(conf), raw_class=raw,
+                              quality=float(crop_q))
+
+            entry = trajectory.setdefault(len(trajectory) + 1, {
+                "camera_id": camera_id, "track_id": len(trajectory) + 1,
+                "frames": [],
+            })
+            entry["frames"].append({
+                "frame_idx": int(fi), "bbox": bbox_store,
+                "state_raw": raw, "last_class": raw,
+                "confidence": float(conf), "velocity": [0.0, 0.0],
+            })
+
+        agg.add_frame(fi, observations)
+
+    if agg is None:
+        return [], used, frame_w, frame_h, cands, {"tracks": [], "events": []}
+
+    result = agg.finalize()
+    decisions: List[Dict[str, Any]] = []
+    for g in result["accepted"]:
+        best = g.get("best")
+        decisions.append({
+            "camera_id":   camera_id,
+            "track_id":    int(g["candidate_id"]),
+            "state":       str(g["state"]),
+            "confidence":  float(g["confidence"]),
+            "first_frame": int(g["first_frame"]),
+            "last_frame":  int(g["last_frame"]),
+            # Frame support is the sampled-mode analogue of tracker hits.
+            "total_hits":  int(g["frame_support"]),
+            "mean_center_x": float(best.center[0]) if best else 0.0,
+        })
+
+    overlay = {"tracks": list(trajectory.values()), "events": []}
+    return decisions, used, frame_w, frame_h, cands, overlay
+
+
+# -----------------------------------------------------------------------------
 # Per-side decision picker
 # -----------------------------------------------------------------------------
 
@@ -473,9 +606,27 @@ def run(
     every_nth: int = 1,
     max_frames: int = 0,           # 0 = unbounded (legacy used the whole wagon)
     verbose: bool = True,
+    inference_mode: str = "legacy",
+    sample_stride: int = 2,
 ) -> Dict[str, str]:
-    """Run the door feature on every wagon using the mature legacy logic."""
+    """Run the door feature on every wagon.
+
+    `inference_mode`:
+        "legacy"  (DEFAULT) every frame + DoorTracker.  The known-good path;
+                  byte-for-byte the behaviour benchmarked on EC2.
+        "sampled" EXPERIMENTAL: every `sample_stride`-th frame +
+                  EvidenceAggregator.  Never selected unless a caller asks for
+                  it explicitly -- the orchestrator does not pass this
+                  argument, so production is unaffected by construction.
+
+    Both modes share the same model, confidence gate, class mapping, per-side
+    resolution, evidence persistence and JSON schema.
+    """
     del every_nth, max_frames  # kept for API symmetry; we iterate every frame
+    mode = str(inference_mode or "legacy").strip().lower()
+    if mode not in ("legacy", "sampled"):
+        raise ValueError(
+            f"door inference_mode must be 'legacy' or 'sampled', got {mode!r}")
 
     model_path = os.path.join(feature_models_dir, C.MODEL_DOOR_STATE)
     yolo_model = load_yolo(model_path)
@@ -514,14 +665,18 @@ def run(
                 summary[gw_id] = C.NO_DATA
                 continue
 
-            l_decisions, l_used, _, _, l_cands, l_overlay = _run_tracker_one_camera(
-                yolo_model, tracker_cfg, merger_cfg,
-                cache_root, gw_id, C.CAMERA_LEFT_UP,
-            )
-            r_decisions, r_used, _, _, r_cands, r_overlay = _run_tracker_one_camera(
-                yolo_model, tracker_cfg, merger_cfg,
-                cache_root, gw_id, C.CAMERA_RIGHT_UP,
-            )
+            def _one_camera(cam):
+                if mode == "sampled":
+                    return _run_sampled_one_camera(
+                        yolo_model, tracker_cfg, cache_root, gw_id, cam,
+                        sample_stride=sample_stride,
+                    )
+                return _run_tracker_one_camera(
+                    yolo_model, tracker_cfg, merger_cfg, cache_root, gw_id, cam,
+                )
+
+            l_decisions, l_used, _, _, l_cands, l_overlay = _one_camera(C.CAMERA_LEFT_UP)
+            r_decisions, r_used, _, _, r_cands, r_overlay = _one_camera(C.CAMERA_RIGHT_UP)
 
             supporting: List[str] = []
             if l_used > 0: supporting.append(C.CAMERA_LEFT_UP)
