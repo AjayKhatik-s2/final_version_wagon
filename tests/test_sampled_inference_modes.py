@@ -17,6 +17,7 @@ import unittest
 
 from _engine_harness import V4_ROOT  # noqa: F401  (path bootstrap)
 
+from core import constants as C
 from features.damage import processor as damage_proc
 from features.door import processor as door_proc
 from features.evidence_aggregator import EvidenceAggregator, Observation
@@ -66,23 +67,24 @@ class TestOrchestratorSelectsSampled(unittest.TestCase):
         from orchestrator.master_runner import _build_parser
         return _build_parser().parse_args(argv)
 
-    def test_production_command_selects_sampled_stride_2(self):
-        """The exact command that will run on EC2."""
+    def test_production_command_selects_sampled(self):
+        """The exact command that will run on EC2 (strides pinned in
+        TestExperimentTwoConfiguration)."""
         a = self._parse(["--local-only", "--local-inputs", "./local_inputs",
                          "--no-interactive", "--disable-features", "ocr",
                          "--skip-upload", "--skip-email"])
         self.assertEqual(a.door_inference_mode, "sampled")
         self.assertEqual(a.damage_inference_mode, "sampled")
-        self.assertEqual(a.door_sample_stride, 2)
-        self.assertEqual(a.damage_sample_stride, 2)
+        self.assertEqual(a.load_inference_mode, "sampled")
 
     def test_process_batch_defaults_to_sampled(self):
         from orchestrator.master_runner import process_batch
         p = inspect.signature(process_batch).parameters
-        self.assertEqual(p["door_inference_mode"].default, "sampled")
-        self.assertEqual(p["damage_inference_mode"].default, "sampled")
-        self.assertEqual(p["door_sample_stride"].default, 2)
-        self.assertEqual(p["damage_sample_stride"].default, 2)
+        for feat in ("door", "damage", "load"):
+            self.assertEqual(p[f"{feat}_inference_mode"].default, "sampled")
+        self.assertEqual(p["door_sample_stride"].default, 3)
+        self.assertEqual(p["damage_sample_stride"].default, 3)
+        self.assertEqual(p["load_sample_stride"].default, 2)
 
     def test_legacy_is_still_reachable(self):
         """Legacy must never be destroyed -- one flag restores it."""
@@ -94,14 +96,18 @@ class TestOrchestratorSelectsSampled(unittest.TestCase):
         self.assertEqual(b.door_inference_mode, "legacy")
         self.assertEqual(b.damage_inference_mode, "legacy")
 
-    def test_load_and_ocr_are_not_given_an_inference_mode(self):
-        """Only Door and Damage accept the selector; Load/OCR are untouched."""
-        from features.load import processor as load_p
+    def test_ocr_is_not_given_an_inference_mode(self):
+        """OCR is out of scope and must keep its original signature."""
         from features.ocr import processor as ocr_p
-        for name, mod in (("load", load_p), ("ocr", ocr_p)):
-            with self.subTest(feature=name):
-                self.assertNotIn("inference_mode",
-                                 inspect.signature(mod.run).parameters)
+        self.assertNotIn("inference_mode",
+                         inspect.signature(ocr_p.run).parameters)
+
+    def test_load_now_accepts_the_selector(self):
+        """Added in experiment 2 -- Load's stride becomes explicit."""
+        from features.load import processor as load_p
+        p = inspect.signature(load_p.run).parameters
+        self.assertIn("inference_mode", p)
+        self.assertEqual(p["inference_mode"].default, "legacy")
 
 
 class TestSampledPathContract(unittest.TestCase):
@@ -207,8 +213,6 @@ class TestSampledModeActuallySkipsFrames(unittest.TestCase):
     """The point of the whole exercise: stride=2 must halve real YOLO calls."""
 
     def setUp(self):
-        from core import constants as _C
-        globals()["C"] = _C
         self.n = 40
 
     def _stable_count(self, cache, camera):
@@ -301,3 +305,183 @@ class TestStage1IsUntouched(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExperimentTwoConfiguration(unittest.TestCase):
+    """Door=sampled/2, Damage=sampled/3, Load=sampled/2."""
+
+    def _parse(self, argv):
+        from orchestrator.master_runner import _build_parser
+        return _build_parser().parse_args(argv)
+
+    def test_production_command_selects_the_requested_strides(self):
+        a = self._parse(["--local-only", "--local-inputs", "./local_inputs",
+                         "--no-interactive", "--disable-features", "ocr",
+                         "--skip-upload", "--skip-email"])
+        self.assertEqual((a.door_inference_mode, a.door_sample_stride),
+                         ("sampled", 3))
+        self.assertEqual((a.damage_inference_mode, a.damage_sample_stride),
+                         ("sampled", 3))
+        self.assertEqual((a.load_inference_mode, a.load_sample_stride),
+                         ("sampled", 2))
+
+    def test_load_max_frames_default_is_still_none(self):
+        """The functional fix must never regress to 0."""
+        from features.load import processor as load_p
+        self.assertIsNone(
+            inspect.signature(load_p.run).parameters["max_frames"].default)
+
+    def test_load_rejects_bad_mode(self):
+        from features.load import processor as load_p
+        with self.assertRaises(ValueError):
+            load_p.run(state=None, cache_root="", feature_models_dir="",
+                       output_dir="", inference_mode="turbo")
+
+    def test_load_sampled_stride_matches_legacy_every_nth_at_2(self):
+        """Honest check: Load was ALREADY at stride 2, so this is a no-op."""
+        from features.load import processor as load_p
+        p = inspect.signature(load_p.run).parameters
+        self.assertEqual(p["every_nth"].default, 2)
+        self.assertEqual(p["sample_stride"].default, 2)
+
+    def test_damage_stride3_samples_correct_original_indices(self):
+        import shutil
+        from features._common import list_wagon_frames
+        cam = C.CAMERA_RIGHT_UP_TOP
+        cache = _cache_with(40, cam)
+        try:
+            stable = list_wagon_frames(cache, "GW_1", cam, trim_stable=True)
+            expected = [int(os.path.basename(p).split("_")[1].split(".")[0])
+                        for p in stable][::3]
+            seen = []
+
+            class _Rec(_CountingModel):
+                def __call__(self, frame, **kw):
+                    return super().__call__(frame, **kw)
+
+            m = _Rec()
+            _, used, *_ = damage_proc._run_sampled_one_camera(
+                m, damage_proc.DamageTrackerConfig(), cache, "GW_1", cam,
+                confidence_floor=0.55, sample_stride=3)
+            self.assertEqual(used, len(expected))
+            self.assertEqual(m.calls, len(expected))
+            # gaps of exactly 3 in ORIGINAL numbering, no duplicates
+            self.assertEqual(len(set(expected)), len(expected))
+            self.assertTrue(all(b - a == 3 for a, b in zip(expected, expected[1:])))
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+
+    def test_door_stride2_unchanged_by_this_experiment(self):
+        import shutil
+        from features._common import list_wagon_frames
+        cam = C.CAMERA_RIGHT_UP
+        cache = _cache_with(40, cam)
+        try:
+            stable = len(list_wagon_frames(cache, "GW_1", cam, trim_stable=True))
+            m = _CountingModel()
+            _, used, *_ = door_proc._run_sampled_one_camera(
+                m, door_proc.TrackerConfig(), cache, "GW_1", cam, sample_stride=2)
+            self.assertEqual(m.calls, (stable + 1) // 2)
+            self.assertEqual(used, (stable + 1) // 2)
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+
+    def test_fusion_and_reporting_untouched(self):
+        import subprocess
+        r = subprocess.run(["git", "status", "--porcelain",
+                            "fusion", "reporting", "wagon_count", "reconstruction"],
+                           cwd=V4_ROOT, capture_output=True, text=True)
+        if r.returncode != 0:
+            self.skipTest("git unavailable")
+        self.assertEqual(r.stdout.strip(), "")
+
+
+class TestDoorStride3(unittest.TestCase):
+    """Door stride=3 -- the test of whether EvidenceAggregator is really
+    stride-invariant, unlike the absolute-hit-count tracker it replaced."""
+
+    def _cache(self, n=40, cam=None):
+        return _cache_with(n, cam or C.CAMERA_RIGHT_UP)
+
+    def test_stride3_samples_correct_original_indices_no_duplicates(self):
+        import shutil
+        from features._common import list_wagon_frames
+        cam = C.CAMERA_RIGHT_UP
+        cache = self._cache(cam=cam)
+        try:
+            stable = list_wagon_frames(cache, "GW_1", cam, trim_stable=True)
+            expected = [int(os.path.basename(x).split("_")[1].split(".")[0])
+                        for x in stable][::3]
+            m = _CountingModel()
+            _, used, *_ = door_proc._run_sampled_one_camera(
+                m, door_proc.TrackerConfig(), cache, "GW_1", cam, sample_stride=3)
+            self.assertEqual(used, len(expected))
+            self.assertEqual(m.calls, len(expected))
+            self.assertEqual(len(set(expected)), len(expected), "duplicate frames")
+            self.assertTrue(all(b - a == 3 for a, b in zip(expected, expected[1:])),
+                            "sampled indices are not every 3rd ORIGINAL frame")
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+
+    def test_stride3_reduces_calls_below_stride2(self):
+        import shutil
+        from features._common import list_wagon_frames
+        cam = C.CAMERA_RIGHT_UP
+        cache = self._cache(cam=cam)
+        try:
+            stable = len(list_wagon_frames(cache, "GW_1", cam, trim_stable=True))
+            got = {}
+            for stride in (1, 2, 3):
+                m = _CountingModel()
+                door_proc._run_sampled_one_camera(
+                    m, door_proc.TrackerConfig(), cache, "GW_1", cam,
+                    sample_stride=stride)
+                got[stride] = m.calls
+            self.assertEqual(got[1], stable)
+            self.assertEqual(got[2], (stable + 1) // 2)
+            self.assertEqual(got[3], (stable + 2) // 3)
+            self.assertGreater(got[2], got[3])
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+
+    def test_stride2_remains_available(self):
+        a = self._parse_stride(["--local-only", "--door-sample-stride", "2"])
+        self.assertEqual(a.door_sample_stride, 2)
+
+    def test_legacy_door_remains_available(self):
+        a = self._parse_stride(["--local-only", "--door-inference-mode", "legacy"])
+        self.assertEqual(a.door_inference_mode, "legacy")
+
+    def _parse_stride(self, argv):
+        from orchestrator.master_runner import _build_parser
+        return _build_parser().parse_args(argv)
+
+    def test_aggregator_verdict_is_stride_invariant(self):
+        """The property under test: same evidence, different sample rate,
+        same verdict -- which the absolute-hit-count tracker could not do."""
+        verdicts = {}
+        for stride in (1, 2, 3):
+            agg = EvidenceAggregator(frame_width=960, frame_height=540,
+                                     stride=stride)
+            for k in range(9 // stride + 1):
+                fi = k * stride
+                agg.add_frame(fi, [Observation(
+                    frame_idx=fi, state="CLOSED", confidence=0.9,
+                    bbox=(100.0, 100.0, 300.0, 250.0), score=1.0)])
+            acc = agg.finalize()["accepted"]
+            verdicts[stride] = acc[0]["state"] if acc else None
+        self.assertEqual(verdicts[1], "CLOSED")
+        self.assertEqual(verdicts[2], verdicts[1])
+        self.assertEqual(verdicts[3], verdicts[1],
+                         "aggregator verdict changed with stride -- it is NOT "
+                         "stride-invariant, which is the whole premise")
+
+    def test_damage_and_load_untouched_by_this_change(self):
+        import subprocess
+        r = subprocess.run(["git", "diff", "--name-only", "HEAD",
+                            "features/damage", "features/load"],
+                           cwd=V4_ROOT, capture_output=True, text=True)
+        if r.returncode != 0:
+            self.skipTest("git unavailable")
+        changed = [x for x in r.stdout.split() if x]
+        self.assertNotIn("features/damage/processor.py", changed)

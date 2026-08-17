@@ -139,8 +139,20 @@ def run(
     # frames yielded, max_frames=None -> 17 (34 stable frames, every 2nd).
     # Fixed Load-side only; the shared helper is deliberately left untouched.
     max_frames: Optional[int] = None,
+    inference_mode: str = "legacy",
+    sample_stride: int = 2,
     verbose: bool = True,
 ) -> Dict[str, str]:
+    mode = str(inference_mode or "legacy").strip().lower()
+    if mode not in ("legacy", "sampled"):
+        raise ValueError(
+            f"load inference_mode must be 'legacy' or 'sampled', got {mode!r}")
+    # Load ALREADY samples: `every_nth` defaults to 2, and since the
+    # max_frames=0 -> None fix it actually takes effect.  "sampled" therefore
+    # just makes the stride explicit/configurable; at sample_stride=2 it is
+    # behaviourally IDENTICAL to legacy and yields no call reduction.
+    effective_every_nth = max(1, int(sample_stride)) if mode == "sampled" else every_nth
+
     model_path = os.path.join(feature_models_dir, C.MODEL_LOADED)
     model = load_yolo(model_path)
 
@@ -188,7 +200,7 @@ def run(
             for cam in C.TOP_CAMERAS:
                 cls, conf, used, n_l, n_e, b_l, b_e = _aggregate_camera(
                     model, cache_root, gw_id, cam,
-                    every_nth=every_nth, max_frames=max_frames,
+                    every_nth=effective_every_nth, max_frames=max_frames,
                 )
                 per_camera[cam] = {
                     "load_status":  cls,

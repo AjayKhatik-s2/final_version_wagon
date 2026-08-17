@@ -184,9 +184,11 @@ def process_batch(
     verbose: bool = True,
     feature_config: Optional[FeatureConfig] = None,
     door_inference_mode: str = "sampled",
-    door_sample_stride: int = 2,
+    door_sample_stride: int = 3,
     damage_inference_mode: str = "sampled",
-    damage_sample_stride: int = 2,
+    damage_sample_stride: int = 3,
+    load_inference_mode: str = "sampled",
+    load_sample_stride: int = 2,
 ) -> BatchOutcome:
     if feature_config is None:
         feature_config = FeatureConfig.all_on()
@@ -304,10 +306,13 @@ def process_batch(
                        sample_stride=int(door_sample_stride)),
         "damage": dict(inference_mode=damage_inference_mode,
                        sample_stride=int(damage_sample_stride)),
+        "load":   dict(inference_mode=load_inference_mode,
+                       sample_stride=int(load_sample_stride)),
     }
     print(f"  inference modes : door={door_inference_mode}/"
           f"stride={door_sample_stride}  "
-          f"damage={damage_inference_mode}/stride={damage_sample_stride}")
+          f"damage={damage_inference_mode}/stride={damage_sample_stride}  "
+          f"load={load_inference_mode}/stride={load_sample_stride}")
 
     def _run_feature(name, fn):
         with timer.stage(f"stage3_{name}"):
@@ -547,6 +552,8 @@ def process_batch(
                            "sample_stride": int(door_sample_stride)},
                 "damage": {"mode": damage_inference_mode,
                            "sample_stride": int(damage_sample_stride)},
+                "load":   {"mode": load_inference_mode,
+                           "sample_stride": int(load_sample_stride)},
             },
             # frames inspected == YOLO calls for these detectors
             "yolo_calls": frame_counts,
@@ -576,6 +583,8 @@ def process_batch(
                     mode = f"  [{door_inference_mode}/stride={door_sample_stride}]"
                 elif k == "damage":
                     mode = f"  [{damage_inference_mode}/stride={damage_sample_stride}]"
+                elif k == "load":
+                    mode = f"  [{load_inference_mode}/stride={load_sample_stride}]"
                 print(f"    {k:<8} {frame_counts[k]:>7}{mode}")
 
     # ---- Stage 6: delivery ----
@@ -816,13 +825,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--door-inference-mode", choices=("sampled", "legacy"),
                    default="sampled",
                    help="Door Stage-3 inference mode (default: sampled)")
-    p.add_argument("--door-sample-stride", type=int, default=2,
-                   help="Door frame stride when sampled (default: 2)")
+    p.add_argument("--door-sample-stride", type=int, default=3,
+                   help="Door frame stride when sampled (default: 3)")
     p.add_argument("--damage-inference-mode", choices=("sampled", "legacy"),
                    default="sampled",
                    help="Damage Stage-3 inference mode (default: sampled)")
-    p.add_argument("--damage-sample-stride", type=int, default=2,
-                   help="Damage frame stride when sampled (default: 2)")
+    p.add_argument("--damage-sample-stride", type=int, default=3,
+                   help="Damage frame stride when sampled (default: 3)")
+    p.add_argument("--load-inference-mode", choices=("sampled", "legacy"),
+                   default="sampled",
+                   help="Load Stage-3 inference mode (default: sampled). NOTE: "
+                        "Load already sampled at every_nth=2, so sampled/2 is "
+                        "behaviourally identical to legacy -- the flag only "
+                        "makes the stride explicit.")
+    p.add_argument("--load-sample-stride", type=int, default=2,
+                   help="Load frame stride when sampled (default: 2)")
     p.add_argument("--legacy-inference", action="store_true",
                    help="shorthand: force BOTH Door and Damage to legacy "
                         "every-frame tracking (pre-optimization behaviour)")
@@ -845,14 +862,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     # BOTH detectors back to the original every-frame tracker path.
     _door_mode = "legacy" if args.legacy_inference else args.door_inference_mode
     _dmg_mode  = "legacy" if args.legacy_inference else args.damage_inference_mode
+    _load_mode = "legacy" if args.legacy_inference else args.load_inference_mode
     inference_opts = {
         "door_inference_mode":   _door_mode,
         "door_sample_stride":    int(args.door_sample_stride),
         "damage_inference_mode": _dmg_mode,
         "damage_sample_stride":  int(args.damage_sample_stride),
+        "load_inference_mode":   _load_mode,
+        "load_sample_stride":    int(args.load_sample_stride),
     }
     print(f"Stage-3 inference: door={_door_mode}/stride={args.door_sample_stride}"
-          f"  damage={_dmg_mode}/stride={args.damage_sample_stride}")
+          f"  damage={_dmg_mode}/stride={args.damage_sample_stride}"
+          f"  load={_load_mode}/stride={args.load_sample_stride}")
 
     if args.local_only:
         return run_local(
