@@ -156,12 +156,12 @@ def _resolve_model(name: str, models_dir: str) -> str:
 def _process_side_camera(
     camera_id: str, video_path: str, gap_model_path: str,
     confidence: float, min_height_ratio: float,
-    keep_raw_detections: bool, verbose: bool, sample_stride: int = 1,
+    keep_raw_detections: bool, verbose: bool,
 ) -> LocalCameraTracks:
     tracker = GapTracker(
         camera_id=camera_id, model_path=gap_model_path,
         confidence=confidence, min_height_ratio=min_height_ratio,
-        verbose=verbose, sample_stride=sample_stride,
+        verbose=verbose,
     )
     return tracker.process_video(video_path, keep_raw_detections=keep_raw_detections)
 
@@ -169,12 +169,12 @@ def _process_side_camera(
 def _process_top_camera(
     camera_id: str, video_path: str, top_gap_model_path: str,
     confidence: float, min_height_ratio: float,
-    keep_raw_detections: bool, verbose: bool, sample_stride: int = 1,
+    keep_raw_detections: bool, verbose: bool,
 ) -> LocalCameraTracks:
     tracker = GapTracker(
         camera_id=camera_id, model_path=top_gap_model_path,
         confidence=confidence, min_height_ratio=min_height_ratio,
-        verbose=verbose, sample_stride=sample_stride,
+        verbose=verbose,
     )
     return tracker.process_video(video_path, keep_raw_detections=keep_raw_detections)
 
@@ -445,14 +445,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--no-raw-detections", action="store_true",
                    help="Don't keep raw per-frame detections in memory (saves RAM)")
-    p.add_argument("--stage1-sample-stride", type=int, default=1,
-                   help="EXPERIMENTAL. Run gap detection on every Nth frame "
-                        "(default 1 = every frame = proven behaviour). The SAME "
-                        "stride is applied to all four cameras, and frame "
-                        "indices stay original, so cross-camera synchronization "
-                        "is preserved. WARNING: min_hits is an absolute hit "
-                        "count and is NOT compensated -- a marginal gap can drop "
-                        "below it and merge two wagons. Validate the roster.")
     p.add_argument("--quiet", action="store_true", help="Reduce log verbosity")
     return p
 
@@ -578,10 +570,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     # ------------------------------------------------------------------
     print("-" * 70)
     print("  STEP 1  Per-camera gap tracking")
-    if int(args.stage1_sample_stride) > 1:
-        print(f"  *** EXPERIMENTAL: stage1 frame sampling stride="
-              f"{args.stage1_sample_stride} (all four cameras) -- min_hits is "
-              f"NOT compensated; validate the wagon roster ***")
     print("-" * 70)
     tracks: Dict[str, LocalCameraTracks] = {}
     try:
@@ -590,28 +578,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             confidence=args.side_confidence,
             min_height_ratio=args.side_min_height_ratio,
             keep_raw_detections=keep_raw, verbose=verbose,
-            sample_stride=int(args.stage1_sample_stride),
         )
         tracks[CAMERA_LEFT_UP] = _process_side_camera(
             CAMERA_LEFT_UP, left_up_video, left_up_gap_path,
             confidence=args.side_confidence,
             min_height_ratio=args.side_min_height_ratio,
             keep_raw_detections=keep_raw, verbose=verbose,
-            sample_stride=int(args.stage1_sample_stride),
         )
         tracks[CAMERA_RIGHT_UP_TOP] = _process_top_camera(
             CAMERA_RIGHT_UP_TOP, right_up_top_video, top_gap_path,
             confidence=args.top_confidence,
             min_height_ratio=args.top_min_height_ratio,
             keep_raw_detections=keep_raw, verbose=verbose,
-            sample_stride=int(args.stage1_sample_stride),
         )
         tracks[CAMERA_LEFT_UP_TOP] = _process_top_camera(
             CAMERA_LEFT_UP_TOP, left_up_top_video, top_gap_path,
             confidence=args.top_confidence,
             min_height_ratio=args.top_min_height_ratio,
             keep_raw_detections=keep_raw, verbose=verbose,
-            sample_stride=int(args.stage1_sample_stride),
         )
     except Exception as e:
         print(f"ERROR: per-camera tracking failed: {e}", file=sys.stderr)

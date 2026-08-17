@@ -71,23 +71,15 @@ class TestNewEnginePresent(unittest.TestCase):
         self.assertIn('choices=("master-fixed", "legacy")', src)
         self.assertIn('default="master-fixed"', src)
 
-    #: Files intentionally forked from the reference for the OPT-IN Stage-1
-    #: frame-sampling experiment (--stage1-sample-stride, default 1).  At the
-    #: default the executed code path is unchanged; see
-    #: TestStage1SamplingIsOptIn below, which pins that.
-    _EXPERIMENTAL_STAGE1_FORKS = ("tracker_engine.py", "run_global_count.py")
-
     def test_engine_is_byte_identical_to_the_reference(self):
-        """Adopted verbatim, apart from the declared Stage-1 sampling fork.
+        """Adopted verbatim, not reimplemented and not locally patched.
 
-        Every counting module must still match the proven implementation
-        exactly, EXCEPT the two files carrying the opt-in sampling switch.
+        EVERY counting module -- entry point included -- must match the proven
+        implementation exactly.  There is no local fork of the counting engine.
         """
         if not os.path.isdir(REFERENCE_DIR):
             self.skipTest("reference folder removed after review")
         for name in ADOPTED_MODULES + REPLACED_MODULES:
-            if name in self._EXPERIMENTAL_STAGE1_FORKS:
-                continue
             with self.subTest(module=name):
                 live = _read(os.path.join(WAGON_COUNT_DIR, name))
                 ref = _read(os.path.join(REFERENCE_DIR, name))
