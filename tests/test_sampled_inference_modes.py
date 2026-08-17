@@ -289,9 +289,37 @@ class TestStage1IsUntouched(unittest.TestCase):
         changed = [p for p in r.stdout.split() if p]
         protected = ("wagon_count/", "reconstruction/", "core/global_state_loader.py",
                      "materializer/", "fusion/", "reporting/")
-        offenders = [p for p in changed if p.startswith(protected)]
+        # The opt-in Stage-1 sampling experiment intentionally forks exactly
+        # these three files.  Everything else under the protected roots must
+        # still be untouched -- especially the counting/fusion modules.
+        allowed = {
+            "wagon_count/tracker_engine.py",
+            "wagon_count/run_global_count.py",
+            "reconstruction/runner.py",
+        }
+        offenders = [p for p in changed
+                     if p.startswith(protected) and p not in allowed]
         self.assertEqual(offenders, [],
                          f"Stage-1/protected files modified: {offenders}")
+
+    def test_counting_and_fusion_modules_are_still_untouched(self):
+        """The sampling fork must not reach the actual counting algorithms."""
+        import subprocess
+        r = subprocess.run(["git", "diff", "--name-only", "HEAD"],
+                           cwd=V4_ROOT, capture_output=True, text=True)
+        if r.returncode != 0:
+            self.skipTest("git unavailable")
+        changed = set(x for x in r.stdout.split() if x)
+        for critical in ("wagon_count/global_fusion.py",
+                         "wagon_count/gap_validation.py",
+                         "wagon_count/global_alignment.py",
+                         "wagon_count/train_structure.py",
+                         "wagon_count/fragment_stitching.py",
+                         "wagon_count/temporal_classification.py",
+                         "wagon_count/global_train_state.py"):
+            self.assertNotIn(critical, changed,
+                             f"{critical} was modified -- counting logic must "
+                             f"not change for a sampling experiment")
 
     def test_counting_engine_entry_point_untracked_changes_none(self):
         import subprocess
@@ -299,8 +327,12 @@ class TestStage1IsUntouched(unittest.TestCase):
                            cwd=V4_ROOT, capture_output=True, text=True)
         if r.returncode != 0:
             self.skipTest("git unavailable")
-        self.assertEqual(r.stdout.strip(), "",
-                         "wagon_count/ has uncommitted modifications")
+        allowed = {"tracker_engine.py", "run_global_count.py"}
+        touched = {line.split("/")[-1] for line in r.stdout.split() 
+                   if line.endswith(".py")}
+        self.assertTrue(touched.issubset(allowed),
+                        f"unexpected wagon_count/ modifications: "
+                        f"{touched - allowed}")
 
 
 if __name__ == "__main__":
@@ -388,12 +420,12 @@ class TestExperimentTwoConfiguration(unittest.TestCase):
 
     def test_fusion_and_reporting_untouched(self):
         import subprocess
-        r = subprocess.run(["git", "status", "--porcelain",
-                            "fusion", "reporting", "wagon_count", "reconstruction"],
+        r = subprocess.run(["git", "status", "--porcelain", "fusion", "reporting"],
                            cwd=V4_ROOT, capture_output=True, text=True)
         if r.returncode != 0:
             self.skipTest("git unavailable")
-        self.assertEqual(r.stdout.strip(), "")
+        self.assertEqual(r.stdout.strip(), "",
+                         "fusion/ or reporting/ was modified")
 
 
 class TestDoorStride3(unittest.TestCase):
@@ -485,3 +517,88 @@ class TestDoorStride3(unittest.TestCase):
             self.skipTest("git unavailable")
         changed = [x for x in r.stdout.split() if x]
         self.assertNotIn("features/damage/processor.py", changed)
+
+
+class TestStage1SamplingIsOptIn(unittest.TestCase):
+    """Stage-1 frame sampling: default MUST be full-frame legacy behaviour."""
+
+    def _parse(self, argv):
+        from orchestrator.master_runner import _build_parser
+        return _build_parser().parse_args(argv)
+
+    def test_orchestrator_default_is_full_frame(self):
+        self.assertEqual(self._parse(["--local-only"]).stage1_sample_stride, 1)
+
+    def test_process_batch_default_is_full_frame(self):
+        from orchestrator.master_runner import process_batch
+        self.assertEqual(
+            inspect.signature(process_batch).parameters[
+                "stage1_sample_stride"].default, 1)
+
+    def test_reconstruction_runner_default_is_full_frame(self):
+        from reconstruction import runner as recon
+        self.assertEqual(
+            inspect.signature(recon.run).parameters[
+                "stage1_sample_stride"].default, 1)
+
+    def test_flag_is_omitted_from_the_subprocess_at_default(self):
+        """At stride 1 the Stage-1 command line must be byte-identical to the
+        proven invocation -- no new argument appears at all."""
+        p = os.path.join(V4_ROOT, "reconstruction", "runner.py")
+        src = open(p, encoding="utf-8").read()
+        self.assertIn("if int(stage1_sample_stride) > 1:", src)
+        self.assertIn('cmd += ["--stage1-sample-stride"', src)
+
+    def test_gap_tracker_default_stride_is_one(self):
+        import sys as _s
+        wc = os.path.join(V4_ROOT, "wagon_count")
+        if wc not in _s.path:
+            _s.path.insert(0, wc)
+        import tracker_engine
+        self.assertEqual(
+            inspect.signature(tracker_engine.GapTracker.__init__)
+            .parameters["sample_stride"].default, 1)
+
+    def test_sampling_happens_before_inference(self):
+        """The skip must `continue` before _detect_gaps, or no calls are saved."""
+        wc = os.path.join(V4_ROOT, "wagon_count", "tracker_engine.py")
+        src = open(wc, encoding="utf-8").read()
+        skip_at = src.index("if self.sample_stride > 1 and (frame_idx % self.sample_stride)")
+        detect_at = src.index("detections = self._detect_gaps(frame, height)", skip_at)
+        self.assertLess(skip_at, detect_at,
+                        "sampling must occur BEFORE _detect_gaps")
+
+    def test_min_hits_is_not_compensated(self):
+        """min_hits must stay 3 -- compensating it would change counting."""
+        import sys as _s
+        wc = os.path.join(V4_ROOT, "wagon_count")
+        if wc not in _s.path:
+            _s.path.insert(0, wc)
+        import tracker_engine
+        self.assertEqual(
+            inspect.signature(tracker_engine.GapTracker.__init__)
+            .parameters["min_hits"].default, 3)
+
+    def test_all_four_cameras_get_the_same_stride(self):
+        """Cross-camera synchronization depends on identical sampling."""
+        p = os.path.join(V4_ROOT, "wagon_count", "run_global_count.py")
+        src = open(p, encoding="utf-8").read()
+        self.assertEqual(
+            src.count("sample_stride=int(args.stage1_sample_stride)"), 4,
+            "all four cameras must receive the identical stride")
+
+    def test_original_frame_indices_preserved_by_the_skip(self):
+        """frame_idx advances for skipped frames too, so surviving frames keep
+        their ORIGINAL numbering and no index is reused."""
+        stride = 2
+        total = 20
+        kept, idx = [], 0
+        for _ in range(total):
+            if stride > 1 and (idx % stride):
+                idx += 1
+                continue
+            kept.append(idx)
+            idx += 1
+        self.assertEqual(kept, list(range(0, total, 2)))
+        self.assertEqual(len(set(kept)), len(kept), "duplicate frame index")
+        self.assertEqual(len(kept), (total + 1) // 2)

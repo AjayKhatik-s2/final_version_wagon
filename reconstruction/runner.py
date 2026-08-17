@@ -96,6 +96,7 @@ def run(
     python_executable: Optional[str] = None,
     timeout_seconds: int = 7200,
     verbose: bool = True,
+    stage1_sample_stride: int = 1,
 ) -> ReconstructionResult:
     """Run Stage 1.
 
@@ -157,6 +158,10 @@ def run(
         # videos are produced separately by rendering.feature_overlay_renderer.
         "--render-videos",
     ]
+    # EXPERIMENTAL Stage-1 frame sampling. Only appended when > 1, so the
+    # default invocation is byte-identical to the proven command line.
+    if int(stage1_sample_stride) > 1:
+        cmd += ["--stage1-sample-stride", str(int(stage1_sample_stride))]
 
     if verbose:
         print(f"[STAGE1] launching wagon_count: {' '.join(cmd)}")

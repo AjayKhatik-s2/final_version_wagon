@@ -189,6 +189,7 @@ def process_batch(
     damage_sample_stride: int = 3,
     load_inference_mode: str = "sampled",
     load_sample_stride: int = 2,
+    stage1_sample_stride: int = 1,
 ) -> BatchOutcome:
     if feature_config is None:
         feature_config = FeatureConfig.all_on()
@@ -241,6 +242,7 @@ def process_batch(
                 output_dir=stage0_root,
                 repo_root=_REPO_ROOT,
                 verbose=verbose,
+                stage1_sample_stride=int(stage1_sample_stride),
             )
         out.state = recon.state
     except reconstruction_runner.ReconstructionError as e:
@@ -554,6 +556,7 @@ def process_batch(
                            "sample_stride": int(damage_sample_stride)},
                 "load":   {"mode": load_inference_mode,
                            "sample_stride": int(load_sample_stride)},
+                "stage1": {"sample_stride": int(stage1_sample_stride)},
             },
             # frames inspected == YOLO calls for these detectors
             "yolo_calls": frame_counts,
@@ -840,6 +843,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         "makes the stride explicit.")
     p.add_argument("--load-sample-stride", type=int, default=2,
                    help="Load frame stride when sampled (default: 2)")
+    p.add_argument("--stage1-sample-stride", type=int, default=1,
+                   help="EXPERIMENTAL. Stage-1 gap detection on every Nth frame "
+                        "(default 1 = every frame = proven behaviour). Applied "
+                        "identically to all four cameras; frame indices stay "
+                        "original. WARNING: min_hits is NOT compensated -- a "
+                        "marginal gap can vanish and MERGE two wagons. Always "
+                        "validate the wagon roster against a known-good run.")
     p.add_argument("--legacy-inference", action="store_true",
                    help="shorthand: force BOTH Door and Damage to legacy "
                         "every-frame tracking (pre-optimization behaviour)")
@@ -870,10 +880,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         "damage_sample_stride":  int(args.damage_sample_stride),
         "load_inference_mode":   _load_mode,
         "load_sample_stride":    int(args.load_sample_stride),
+        "stage1_sample_stride":  int(args.stage1_sample_stride),
     }
     print(f"Stage-3 inference: door={_door_mode}/stride={args.door_sample_stride}"
           f"  damage={_dmg_mode}/stride={args.damage_sample_stride}"
           f"  load={_load_mode}/stride={args.load_sample_stride}")
+    if int(args.stage1_sample_stride) > 1:
+        print(f"*** EXPERIMENTAL Stage-1 frame sampling stride="
+              f"{args.stage1_sample_stride} -- validate the wagon roster ***")
 
     if args.local_only:
         return run_local(

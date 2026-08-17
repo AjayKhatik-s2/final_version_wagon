@@ -164,6 +164,7 @@ class GapTracker:
         max_miss: int = 30,
         device: Optional[str] = None,
         verbose: bool = True,
+        sample_stride: int = 1,
     ):
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Gap model not found for {camera_id}: {model_path}")
@@ -185,6 +186,18 @@ class GapTracker:
         self.match_distance_px = float(match_distance_px)
         self.min_hits = int(min_hits)
         self.max_miss = int(max_miss)
+        # EXPERIMENTAL Stage-1 frame sampling. 1 == every frame == the proven
+        # behaviour. >1 skips frames BEFORE inference, so YOLO calls really
+        # drop. Frame indices stay ORIGINAL: frame_idx still advances once per
+        # decoded frame, so gap start/end frames, times and the cross-camera
+        # alignment keep their true numbering.
+        #
+        # WARNING: `min_hits` is an ABSOLUTE hit count and is deliberately NOT
+        # adjusted here. Sampling therefore reduces hits per track roughly in
+        # proportion to the stride, and a marginal gap can fall below min_hits
+        # and disappear -- which MERGES two wagons. Validate the roster before
+        # trusting any run with stride > 1.
+        self.sample_stride = max(1, int(sample_stride))
         self.device = device
         self.verbose = verbose
 
@@ -260,6 +273,13 @@ class GapTracker:
             ret, frame = cap.read()
             if not ret:
                 break
+
+            # Sample BEFORE inference. frame_idx is still incremented for every
+            # decoded frame at the bottom of the loop, so skipped frames consume
+            # an index and the surviving ones keep their ORIGINAL numbering.
+            if self.sample_stride > 1 and (frame_idx % self.sample_stride):
+                frame_idx += 1
+                continue
 
             detections = self._detect_gaps(frame, height)
 
