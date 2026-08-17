@@ -129,5 +129,137 @@ class TestAggregatorDrivesTheDecision(unittest.TestCase):
         self.assertEqual(dense["state"], sparse["state"])
 
 
+class _CountingModel:
+    """Minimal YOLO stand-in: records every frame it is asked to infer.
+
+    Returns an empty detection set, so this exercises the SAMPLING logic only
+    and needs no weights. Test-local by design -- nothing like this exists in
+    production code.
+    """
+
+    def __init__(self):
+        self.calls = 0
+        self.names = {0: "closed_door"}
+
+    def __call__(self, frame, **kw):
+        self.calls += 1
+
+        class _R:
+            boxes = None
+        return [_R()]
+
+
+def _cache_with(n_frames: int, camera: str):
+    """Build a wagon_cache exactly as Stage 2 lays it out."""
+    import tempfile
+
+    import cv2
+    import numpy as np
+
+    tmp = tempfile.mkdtemp()
+    d = os.path.join(tmp, "GW_1", C.CAMERA_FOLDER[camera])
+    os.makedirs(d, exist_ok=True)
+    img = np.zeros((48, 64, 3), dtype=np.uint8)
+    for i in range(n_frames):
+        cv2.imwrite(os.path.join(d, f"frame_{i:06d}.jpg"), img)
+    return tmp
+
+
+class TestSampledModeActuallySkipsFrames(unittest.TestCase):
+    """The point of the whole exercise: stride=2 must halve real YOLO calls."""
+
+    def setUp(self):
+        from core import constants as _C
+        globals()["C"] = _C
+        self.n = 40
+
+    def _stable_count(self, cache, camera):
+        from features._common import list_wagon_frames
+        return len(list_wagon_frames(cache, "GW_1", camera, trim_stable=True))
+
+    def test_door_stride2_halves_yolo_calls(self):
+        import shutil
+        cam = C.CAMERA_RIGHT_UP
+        cache = _cache_with(self.n, cam)
+        try:
+            stable = self._stable_count(cache, cam)
+            m1, m2 = _CountingModel(), _CountingModel()
+            _, used1, *_ = door_proc._run_sampled_one_camera(
+                m1, door_proc.TrackerConfig(), cache, "GW_1", cam, sample_stride=1)
+            _, used2, *_ = door_proc._run_sampled_one_camera(
+                m2, door_proc.TrackerConfig(), cache, "GW_1", cam, sample_stride=2)
+            self.assertEqual(m1.calls, stable, "stride=1 must inspect every frame")
+            self.assertEqual(used1, stable)
+            self.assertEqual(m2.calls, (stable + 1) // 2)
+            self.assertEqual(used2, (stable + 1) // 2)
+            self.assertLess(m2.calls, m1.calls,
+                            "sampled mode is executing every frame -- not sampling")
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+
+    def test_damage_stride2_and_stride3_reduce_yolo_calls(self):
+        import shutil
+        cam = C.CAMERA_RIGHT_UP_TOP
+        cache = _cache_with(self.n, cam)
+        try:
+            stable = self._stable_count(cache, cam)
+            counts = {}
+            for stride in (1, 2, 3):
+                m = _CountingModel()
+                _, used, *_ = damage_proc._run_sampled_one_camera(
+                    m, damage_proc.DamageTrackerConfig(), cache, "GW_1", cam,
+                    confidence_floor=0.55, sample_stride=stride)
+                counts[stride] = (m.calls, used)
+            self.assertEqual(counts[1][0], stable)
+            self.assertEqual(counts[2][0], (stable + 1) // 2)
+            self.assertEqual(counts[3][0], (stable + 2) // 3)
+            self.assertGreater(counts[1][0], counts[2][0])
+            self.assertGreater(counts[2][0], counts[3][0])
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+
+    def test_legacy_mode_still_inspects_every_frame(self):
+        """Guard against sampling silently leaking into the legacy path."""
+        import shutil
+        cam = C.CAMERA_RIGHT_UP
+        cache = _cache_with(self.n, cam)
+        try:
+            stable = self._stable_count(cache, cam)
+            m = _CountingModel()
+            _, used, *_ = door_proc._run_tracker_one_camera(
+                m, door_proc.TrackerConfig(), door_proc.MergeConfig(),
+                cache, "GW_1", cam)
+            self.assertEqual(m.calls, stable)
+            self.assertEqual(used, stable)
+        finally:
+            shutil.rmtree(cache, ignore_errors=True)
+
+
+class TestStage1IsUntouched(unittest.TestCase):
+    """Stage 1 must remain functionally identical to the known-good commit."""
+
+    def test_no_stage1_file_is_modified_in_the_working_tree(self):
+        import subprocess
+        r = subprocess.run(["git", "diff", "--name-only", "HEAD"],
+                           cwd=V4_ROOT, capture_output=True, text=True)
+        if r.returncode != 0:
+            self.skipTest("git unavailable")
+        changed = [p for p in r.stdout.split() if p]
+        protected = ("wagon_count/", "reconstruction/", "core/global_state_loader.py",
+                     "materializer/", "fusion/", "reporting/")
+        offenders = [p for p in changed if p.startswith(protected)]
+        self.assertEqual(offenders, [],
+                         f"Stage-1/protected files modified: {offenders}")
+
+    def test_counting_engine_entry_point_untracked_changes_none(self):
+        import subprocess
+        r = subprocess.run(["git", "status", "--porcelain", "wagon_count"],
+                           cwd=V4_ROOT, capture_output=True, text=True)
+        if r.returncode != 0:
+            self.skipTest("git unavailable")
+        self.assertEqual(r.stdout.strip(), "",
+                         "wagon_count/ has uncommitted modifications")
+
+
 if __name__ == "__main__":
     unittest.main()
