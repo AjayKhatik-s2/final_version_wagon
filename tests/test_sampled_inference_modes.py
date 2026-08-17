@@ -54,16 +54,54 @@ class TestDefaultsAreLegacy(unittest.TestCase):
                             output_dir="", inference_mode="turbo")
 
 
-class TestOrchestratorDoesNotEnableSampling(unittest.TestCase):
-    """Production must not be able to drift into sampled mode by accident."""
+class TestOrchestratorSelectsSampled(unittest.TestCase):
+    """The pipeline is now deliberately in sampled mode for the EC2 experiment.
 
-    def test_master_runner_never_passes_the_flag(self):
-        p = os.path.join(V4_ROOT, "orchestrator", "master_runner.py")
-        with open(p, "r", encoding="utf-8") as f:
-            src = f.read()
-        for token in ("inference_mode", "sample_stride", "sampled"):
-            with self.subTest(token=token):
-                self.assertNotIn(token, src)
+    This inverts an earlier guard: sampling used to be unreachable from
+    production on purpose.  It is now the default BY REQUEST, and legacy must
+    stay one flag away.
+    """
+
+    def _parse(self, argv):
+        from orchestrator.master_runner import _build_parser
+        return _build_parser().parse_args(argv)
+
+    def test_production_command_selects_sampled_stride_2(self):
+        """The exact command that will run on EC2."""
+        a = self._parse(["--local-only", "--local-inputs", "./local_inputs",
+                         "--no-interactive", "--disable-features", "ocr",
+                         "--skip-upload", "--skip-email"])
+        self.assertEqual(a.door_inference_mode, "sampled")
+        self.assertEqual(a.damage_inference_mode, "sampled")
+        self.assertEqual(a.door_sample_stride, 2)
+        self.assertEqual(a.damage_sample_stride, 2)
+
+    def test_process_batch_defaults_to_sampled(self):
+        from orchestrator.master_runner import process_batch
+        p = inspect.signature(process_batch).parameters
+        self.assertEqual(p["door_inference_mode"].default, "sampled")
+        self.assertEqual(p["damage_inference_mode"].default, "sampled")
+        self.assertEqual(p["door_sample_stride"].default, 2)
+        self.assertEqual(p["damage_sample_stride"].default, 2)
+
+    def test_legacy_is_still_reachable(self):
+        """Legacy must never be destroyed -- one flag restores it."""
+        a = self._parse(["--local-only", "--legacy-inference"])
+        self.assertTrue(a.legacy_inference)
+        b = self._parse(["--local-only",
+                         "--door-inference-mode", "legacy",
+                         "--damage-inference-mode", "legacy"])
+        self.assertEqual(b.door_inference_mode, "legacy")
+        self.assertEqual(b.damage_inference_mode, "legacy")
+
+    def test_load_and_ocr_are_not_given_an_inference_mode(self):
+        """Only Door and Damage accept the selector; Load/OCR are untouched."""
+        from features.load import processor as load_p
+        from features.ocr import processor as ocr_p
+        for name, mod in (("load", load_p), ("ocr", ocr_p)):
+            with self.subTest(feature=name):
+                self.assertNotIn("inference_mode",
+                                 inspect.signature(mod.run).parameters)
 
 
 class TestSampledPathContract(unittest.TestCase):

@@ -183,6 +183,10 @@ def process_batch(
     skip_email: bool = False,
     verbose: bool = True,
     feature_config: Optional[FeatureConfig] = None,
+    door_inference_mode: str = "sampled",
+    door_sample_stride: int = 2,
+    damage_inference_mode: str = "sampled",
+    damage_sample_stride: int = 2,
 ) -> BatchOutcome:
     if feature_config is None:
         feature_config = FeatureConfig.all_on()
@@ -293,10 +297,22 @@ def process_batch(
         verbose=verbose,
     )
 
+    # Per-feature inference mode.  Door and Damage accept an explicit
+    # legacy/sampled selector; Load and OCR do not and are untouched.
+    _feature_extra: Dict[str, Dict[str, Any]] = {
+        "door":   dict(inference_mode=door_inference_mode,
+                       sample_stride=int(door_sample_stride)),
+        "damage": dict(inference_mode=damage_inference_mode,
+                       sample_stride=int(damage_sample_stride)),
+    }
+    print(f"  inference modes : door={door_inference_mode}/"
+          f"stride={door_sample_stride}  "
+          f"damage={damage_inference_mode}/stride={damage_sample_stride}")
+
     def _run_feature(name, fn):
         with timer.stage(f"stage3_{name}"):
             try:
-                return fn(**feature_kwargs)
+                return fn(**feature_kwargs, **_feature_extra.get(name, {}))
             except Exception as e:
                 print(f"[STAGE3/{name}] CRASHED: {e}", file=sys.stderr)
                 traceback.print_exc(limit=3)
@@ -496,12 +512,44 @@ def process_batch(
     # ---- Persist the stage timings (measurement only; no behaviour depends
     # on this file).  Written before delivery so a skip-upload benchmarking
     # run still produces it. ----
+    def _feature_frame_counts() -> Dict[str, int]:
+        """Frames inspected (== YOLO calls) per feature, from the per-wagon JSON.
+
+        `frame_count` is what each processor already records, so this needs no
+        new instrumentation inside the feature code.
+        """
+        out: Dict[str, int] = {}
+        for key in FEATURE_KEYS:
+            d = os.path.join(states_root, key)
+            if not os.path.isdir(d):
+                continue
+            total = 0
+            for fn in os.listdir(d):
+                if not fn.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(d, fn), "r", encoding="utf-8") as f:
+                        total += int(json.load(f).get("frame_count") or 0)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    pass
+            out[key] = total
+        return out
+
     def _emit_timings() -> None:
         feature_spans = [f"stage3_{k}" for k in FEATURE_KEYS]
+        frame_counts = _feature_frame_counts()
         extra = {
             "batch_key": batch.batch_key,
             "total_wagons": recon.state.total_wagons,
             "enabled_features": feature_config.enabled_keys(),
+            "inference_modes": {
+                "door":   {"mode": door_inference_mode,
+                           "sample_stride": int(door_sample_stride)},
+                "damage": {"mode": damage_inference_mode,
+                           "sample_stride": int(damage_sample_stride)},
+            },
+            # frames inspected == YOLO calls for these detectors
+            "yolo_calls": frame_counts,
             # >1.0 means the Stage-3 features genuinely overlapped;
             # ~1.0 means they serialized on the CPU.
             "stage3_overlap_factor": timer.overlap_factor(
@@ -518,6 +566,17 @@ def process_batch(
             verdict = ("features overlapped" if of > 1.15
                        else "features effectively SERIALIZED on CPU")
             print(f"  stage3 overlap factor: {of:.2f}x  ({verdict})")
+        if frame_counts:
+            print("  frames inspected (== YOLO calls):")
+            for k in FEATURE_KEYS:
+                if k not in frame_counts:
+                    continue
+                mode = ""
+                if k == "door":
+                    mode = f"  [{door_inference_mode}/stride={door_sample_stride}]"
+                elif k == "damage":
+                    mode = f"  [{damage_inference_mode}/stride={damage_sample_stride}]"
+                print(f"    {k:<8} {frame_counts[k]:>7}{mode}")
 
     # ---- Stage 6: delivery ----
     if skip_upload:
@@ -645,6 +704,7 @@ def run_auto(*args, **kwargs):
                 recon_models_dir=recon_models_dir, feat_models_dir=feat_models_dir,
                 s3_client=s3, skip_upload=skip_upload, skip_email=skip_email,
                 feature_config=feature_config,
+                **(kwargs.get("inference_opts") or {}),
             )
             processed[batch.batch_key] = outcome.final_status
             save_batch_state(s3, state_loc, processed)
@@ -673,6 +733,7 @@ def run_local(
     recon_models_dir: str,
     feat_models_dir: str,
     feature_config: Optional[FeatureConfig] = None,
+    inference_opts: Optional[Dict[str, Any]] = None,
 ) -> int:
     if not os.path.isdir(local_inputs):
         print(f"ERROR: {local_inputs} does not exist", file=sys.stderr)
@@ -700,6 +761,7 @@ def run_local(
         s3_client=_NoopS3(),
         skip_upload=True, skip_email=True,
         feature_config=feature_config or FeatureConfig.all_on(),
+        **(inference_opts or {}),
     )
     if outcome.report_pdf_path:
         print(f"[LOCAL] PDF : {outcome.report_pdf_path}")
@@ -744,6 +806,26 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-interactive",   action="store_true",
                    help="never prompt for feature config (force all-ON unless "
                         "--disable-features given)")
+
+    # ---- Stage-3 inference mode (Door / Damage only) ----------------------
+    # 'sampled' inspects every Nth frame and resolves state with
+    # EvidenceAggregator; 'legacy' inspects every frame and uses the original
+    # Kalman/Hungarian trackers.  Legacy is fully retained -- pass
+    # `--door-inference-mode legacy --damage-inference-mode legacy` to restore
+    # the pre-optimization pipeline exactly.  Load and OCR are unaffected.
+    p.add_argument("--door-inference-mode", choices=("sampled", "legacy"),
+                   default="sampled",
+                   help="Door Stage-3 inference mode (default: sampled)")
+    p.add_argument("--door-sample-stride", type=int, default=2,
+                   help="Door frame stride when sampled (default: 2)")
+    p.add_argument("--damage-inference-mode", choices=("sampled", "legacy"),
+                   default="sampled",
+                   help="Damage Stage-3 inference mode (default: sampled)")
+    p.add_argument("--damage-sample-stride", type=int, default=2,
+                   help="Damage frame stride when sampled (default: 2)")
+    p.add_argument("--legacy-inference", action="store_true",
+                   help="shorthand: force BOTH Door and Damage to legacy "
+                        "every-frame tracking (pre-optimization behaviour)")
     return p
 
 
@@ -759,6 +841,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         interactive=interactive,
     )
 
+    # Stage-3 inference mode.  --legacy-inference is a shorthand that forces
+    # BOTH detectors back to the original every-frame tracker path.
+    _door_mode = "legacy" if args.legacy_inference else args.door_inference_mode
+    _dmg_mode  = "legacy" if args.legacy_inference else args.damage_inference_mode
+    inference_opts = {
+        "door_inference_mode":   _door_mode,
+        "door_sample_stride":    int(args.door_sample_stride),
+        "damage_inference_mode": _dmg_mode,
+        "damage_sample_stride":  int(args.damage_sample_stride),
+    }
+    print(f"Stage-3 inference: door={_door_mode}/stride={args.door_sample_stride}"
+          f"  damage={_dmg_mode}/stride={args.damage_sample_stride}")
+
     if args.local_only:
         return run_local(
             local_inputs=args.local_inputs,
@@ -767,6 +862,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             recon_models_dir=args.recon_models_dir,
             feat_models_dir=args.feat_models_dir,
             feature_config=feature_config,
+            inference_opts=inference_opts,
         )
 
     if not (args.auto or args.once or args.batch):
@@ -785,6 +881,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         skip_upload=args.skip_upload,
         skip_email=args.skip_email,
         feature_config=feature_config,
+        inference_opts=inference_opts,
     )
 
 
