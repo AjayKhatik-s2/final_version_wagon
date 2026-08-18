@@ -466,3 +466,73 @@ class TestModelStoreConfig(unittest.TestCase):
         from core import model_sync as MS
         text = MS.reconcile_report(["door"], s3_client=None)
         self.assertIn("model store:", text)   # never raises
+
+
+class TestOperatorStoreNames(unittest.TestCase):
+    """The names actually present in s3://complete-train/new_local/ (2026-08-19).
+
+    Five of the eight required models are there under this package's own names;
+    two are there under the store's names, and the OCR detector is not there at
+    all.  Pinned so a rename on either side is caught rather than silently
+    reported as MISSING.
+    """
+
+    #: Verified by `aws s3 ls s3://complete-train/new_local/`.
+    STORE = {"door_state.pt", "left_up_wagon_gap.pt", "load.pt",
+             "right_up_wagon_gap.pt", "side_classification.pt",
+             "top_classification.pt", "top_damage.pt", "top_gap.pt"}
+
+    def test_accepted_alternatives_cover_the_store_names(self):
+        self.assertEqual(C.FEATURE_MODEL_LEGACY[C.MODEL_LOADED], "load.pt")
+        self.assertEqual(C.FEATURE_MODEL_LEGACY[C.MODEL_DAMAGE], "top_damage.pt")
+
+    def test_every_model_except_ocr_resolves_against_the_store(self):
+        from core import model_sync as MS
+        unresolved = []
+        for r in MS.required_models(["door", "load", "damage", "ocr"]):
+            names = {r.filename}
+            if r.alt_filename:
+                names.add(r.alt_filename)
+            if not (names & self.STORE):
+                unresolved.append(r.filename)
+        self.assertEqual(unresolved, [C.MODEL_WAGON_NUMBER],
+                         "only the OCR plate detector should be absent")
+
+    def test_optional_top_classifier_is_available(self):
+        self.assertIn(C.MODEL_TOP_CLASSIFICATION, self.STORE)
+
+    def test_alias_download_saves_under_the_store_name(self):
+        """An alias is fetched under ITS OWN name, and the processors still
+        resolve it -- so nobody has to rename a production object."""
+        import tempfile
+        from core import model_sync as MS
+
+        class Stub:
+            def __init__(self): self.keys = []
+            def download_file(self, bucket, key, dest):
+                name = key.rsplit("/", 1)[-1]
+                self.keys.append(name)
+                if name not in TestOperatorStoreNames.STORE:
+                    raise FileNotFoundError(f"404 {key}")
+                open(dest, "wb").write(b"\x00")
+
+        req = next(r for r in MS.required_models(["load"])
+                   if r.filename == C.MODEL_LOADED)
+        with tempfile.TemporaryDirectory() as d:
+            req.local_dir = d
+            stub = Stub()
+            st = MS._download(stub, req)
+            self.assertTrue(st.present, st.error)
+            # canonical attempted first, alias second
+            self.assertEqual(stub.keys, [C.MODEL_LOADED, "load.pt"])
+            self.assertTrue(st.local_path.endswith("load.pt"))
+            # and the processors find it through the shared resolver
+            self.assertEqual(os.path.basename(
+                C.feature_model_path(d, C.MODEL_LOADED)), "load.pt")
+
+    def test_ocr_must_be_disabled_until_a_detector_exists(self):
+        """With no plate detector in the store, an OCR-enabled run would report
+        NO_DATA for every wagon; `--disable-features ocr` is the honest setting."""
+        from core import model_sync as MS
+        reqs = MS.required_models(["door", "load", "damage"])   # ocr OFF
+        self.assertNotIn(C.MODEL_WAGON_NUMBER, [r.filename for r in reqs])

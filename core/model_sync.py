@@ -132,6 +132,33 @@ class ModelReq:
         return "/".join(parts)
 
     @property
+    def alt_filename(self) -> Optional[str]:
+        """The accepted alternative name for this model, if any.
+
+        A store may hold the same weights under a different name (e.g.
+        `load.pt` for `loaded.pt`).  `constants` records those, and both the
+        local resolution (`feature_model_path`) and the S3 fetch below honour
+        them, so nobody has to rename a production object.
+        """
+        return (C.FEATURE_MODEL_LEGACY.get(self.filename)
+                or C.RECON_MODEL_LEGACY.get(self.filename))
+
+    @property
+    def alt_s3_key(self) -> Optional[str]:
+        alt = self.alt_filename
+        if not alt:
+            return None
+        parts = [p for p in (C.MODELS_S3_PREFIX,
+                             self.category if C.MODELS_S3_LAYOUT == "nested" else "",
+                             alt) if p]
+        return "/".join(parts)
+
+    @property
+    def alt_local_path(self) -> Optional[str]:
+        alt = self.alt_filename
+        return os.path.join(self.local_dir, alt) if alt else None
+
+    @property
     def s3_uri(self) -> str:
         return f"s3://{C.MODELS_S3_BUCKET}/{self.s3_key}"
 
@@ -284,22 +311,41 @@ def _download(s3_client, req: ModelReq) -> ModelStatus:
     """Download one model atomically.  Returns a populated ModelStatus."""
     st = ModelStatus(req=req)
     os.makedirs(req.local_dir, exist_ok=True)
-    part = req.local_path + ".part"
-    try:
-        s3_client.download_file(C.MODELS_S3_BUCKET, req.s3_key, part)
-        os.replace(part, req.local_path)
-        st.present = True
-        st.downloaded = True
-        st.local_path = req.local_path
-        log.info("[MODEL_SYNC] downloaded %s -> %s", req.s3_uri, req.local_path)
-    except Exception as e:
-        if os.path.exists(part):
-            try:
-                os.remove(part)
-            except OSError:
-                pass
-        st.error = _download_reason(e)
-        log.error("[MODEL_SYNC] FAILED %s : %s", req.s3_uri, st.error)
+
+    # Try the canonical name, then the accepted alternative.  The alternative is
+    # saved under ITS OWN name, not renamed to the canonical one: the processors
+    # resolve either via `constants.feature_model_path`, and keeping the store's
+    # name on disk makes it obvious which object a run actually loaded.
+    attempts = [(req.s3_key, req.local_path)]
+    if req.alt_s3_key:
+        attempts.append((req.alt_s3_key, req.alt_local_path))
+
+    last_error = None
+    for key, dest in attempts:
+        part = dest + ".part"
+        try:
+            s3_client.download_file(C.MODELS_S3_BUCKET, key, part)
+            os.replace(part, dest)
+            st.present = True
+            st.downloaded = True
+            st.local_path = dest
+            note = "" if dest == req.local_path else f"  (accepted as {req.filename})"
+            log.info("[MODEL_SYNC] downloaded s3://%s/%s -> %s%s",
+                     C.MODELS_S3_BUCKET, key, dest, note)
+            return st
+        except Exception as e:
+            if os.path.exists(part):
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
+            last_error = e
+            if len(attempts) > 1 and key == req.s3_key:
+                log.info("[MODEL_SYNC] %s not in the store; trying %s",
+                         req.filename, req.alt_filename)
+
+    st.error = _download_reason(last_error) if last_error else "unknown"
+    log.error("[MODEL_SYNC] FAILED %s : %s", req.s3_uri, st.error)
     return st
 
 

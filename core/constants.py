@@ -207,8 +207,19 @@ FEATURE_MODEL_BY_KEY = {
 # Accepted legacy filename per feature model.  A checkout that only has the old
 # name still satisfies the requirement, so renaming a model never silently
 # invalidates a batch.
+# Names verified present in the operator's store, s3://complete-train/new_local/
+# (listed 2026-08-19).  `load.pt` and `top_damage.pt` are that store's names for
+# the two feature models this package calls `loaded.pt` and `damage.pt`:
+#   * load.pt        -> the LOADED/EMPTY classifier (features/load).
+#   * top_damage.pt  -> the TOP-camera damage detector.  This package's damage
+#                       processor is top-cameras-only (DAMAGE_CLASSES_TOP =
+#                       floor_damage / inner_wall_damage), so the top model is
+#                       the correct weights for the `damage` slot -- the V4
+#                       engine's separate side-damage model has no consumer here.
 FEATURE_MODEL_LEGACY = {
     MODEL_WAGON_NUMBER: MODEL_WAGON_ID_COUNTING,
+    MODEL_LOADED:       "load.pt",
+    MODEL_DAMAGE:       "top_damage.pt",
 }
 
 
