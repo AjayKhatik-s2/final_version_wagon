@@ -119,7 +119,7 @@ def run_camera(
     feat_models_dir: str,
     evidence_root: str,
     enabled_features: Optional[List[str]] = None,
-    camera_local_features: bool = False,
+    camera_local_features: bool = True,
     verbose: bool = True,
 ) -> CameraRunResult:
     """Drive ONE camera PENDING -> SEALED.
@@ -213,20 +213,23 @@ def run_camera(
         _t("materialize", t0)
         bundle.advance("MATERIALIZED")
 
-        # ---- OPTIONAL camera-local features ---------------------------
-        # Off by default, and that default is what makes the sequential result
-        # equal the batch result.
+        # ---- camera-local features, for the camera-local PDF ------------
+        # These produce the ONLY evidence a camera-local report can embed:
+        # reporting/camera_reports.py resolves every image through
+        # `evidence_snapshot(evidence_root, <id>, <feature>, <slot>)`, so with
+        # no local feature run its snapshot pages come out empty.
         #
-        # The old pipeline runs every feature AFTER fusion, over frames the
-        # materializer bucketed with `round((GW.time - delta) * local_fps)`. A
-        # support camera's `delta` cannot be known while it is being processed
-        # alone -- it is estimated from master + support observations together
-        # -- so camera-local windows are not the batch windows and the feature
-        # states would differ.
+        # They are NOT the global answer and are never promoted to one. The old
+        # pipeline runs features AFTER fusion, over frames the materializer
+        # bucketed with `round((GW.time - delta) * local_fps)`; a support
+        # camera's `delta` is estimated from master + support observations
+        # together, so it cannot be known while that camera is processed alone.
+        # Global assembly therefore recomputes all three features over the
+        # global wagons and ignores everything written here.
         #
-        # Enable this only to give the camera-local PDF real feature content;
-        # global assembly ignores whatever it writes and recomputes from the
-        # global wagons.
+        # The cost is one extra feature pass per camera. Pass
+        # camera_local_features=False to skip it: the global result is
+        # bit-for-bit unaffected, and only the camera PDFs lose their images.
         roster = as_feature_wagons(out.segments, camera_id)
         states_dir = os.path.join(bundle.dir, "features")
         common = dict(state=None, cache_root=cache_root,

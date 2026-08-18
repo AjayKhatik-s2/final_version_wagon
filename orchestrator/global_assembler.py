@@ -242,11 +242,11 @@ def assemble(
     gs_dir = os.path.join(batch_root, "global_state")
     states_root = os.path.join(batch_root, "wagon_states")
     reports_root = os.path.join(batch_root, "reports")
-    # The global VIEW of evidence already produced per camera: hardlinks under
-    # GW_n names, so the existing report lookups resolve without a second copy
-    # of every crop.
+    # Stage 2/3 write here, under GW_n names, exactly as batch does. These are
+    # NOT the camera-local trees: each bundle keeps its own cache and evidence
+    # for its own report, and assembly never reads them.
     global_evidence = os.path.join(batch_root, "evidence")
-    global_cache = os.path.join(batch_root, "camera_cache")
+    global_cache = os.path.join(batch_root, "wagon_cache")
     for d in (gs_dir, states_root, reports_root):
         os.makedirs(d, exist_ok=True)
     res.state_json_path = os.path.join(gs_dir, "global_train_state.json")

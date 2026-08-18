@@ -252,11 +252,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"gaps={rr.get('accepted_gaps')} "
             f"calls={rr.get('feature_yolo_calls')} {timings.get(cam)}s")
     say(f"  global wagons : {asm.total_wagons}")
+    say(f"  wagon regions : {asm.wagon_regions_applied}")
+    # `mapping_by_camera` is a DIAGNOSTIC of local segments vs global wagons.
+    # Evidence is assigned by the materializer, so this reports only how the
+    # two segmentations line up -- it is not an assignment result.
     for cam, sm in asm.mapping_by_camera.items():
-        ml = asm.media_linked.get(cam, {})
-        say(f"  mapping {cam:<13} {sm['by_kind']} "
-            f"evidence_linked={ml.get('evidence', 0)} "
-            f"cache_linked={ml.get('cache', 0)}")
+        say(f"  segments {cam:<13} {sm['by_kind']}   (diagnostic)")
+    for feat in sorted(asm.feature_summary):
+        say(f"  feature  {feat:<13} wagons={len(asm.feature_summary[feat])}")
+    if asm.missing_cameras:
+        say(f"  no source video: {asm.missing_cameras}")
     say(f"  assembly      : {timings.get('assembly')}s")
     say(f"  TOTAL         : {time.time() - t_all:.1f}s")
     say(f"  output        : {os.path.join(args.workspace, key)}")

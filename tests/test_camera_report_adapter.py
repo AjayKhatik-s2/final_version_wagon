@@ -31,6 +31,10 @@ from orchestrator import camera_report_adapter as adapter
 CAM = "RIGHT_UP"
 
 
+CAMERA_TINT = {"RIGHT_UP": 40, "LEFT_UP": 90,
+               "RIGHT_UP_TOP": 150, "LEFT_UP_TOP": 210}
+
+
 def _bundle(root, cam=CAM, n=3, with_frames=True, with_features=True):
     """A sealed bundle in the exact shape camera_runner writes."""
     b = CameraEvidenceBundle(root, cam)
@@ -43,7 +47,8 @@ def _bundle(root, cam=CAM, n=3, with_frames=True, with_features=True):
                          label="WAGON", confidence=0.95)
             for i in range(1, n + 1)]
     b.write_segments(segs)
-    img = np.zeros((48, 64, 3), dtype=np.uint8)
+    tint = CAMERA_TINT[cam]
+    img = np.full((48, 64, 3), tint, dtype=np.uint8)
     # Feature JSON only for what this camera is AUTHORITATIVE for, mirroring
     # camera_runner._feature_plan(): side -> door, top -> load + damage.
     payloads = ({"door": {"left_door": "CLOSED", "left_door_confidence": 0.91,
@@ -71,11 +76,186 @@ def _bundle(root, cam=CAM, n=3, with_frames=True, with_features=True):
                               C.CAMERA_FOLDER[cam])
             os.makedirs(cd, exist_ok=True)
             cv2.imwrite(os.path.join(cd, f"frame_{s.start_frame:06d}.jpg"), img)
-            for feat in payloads:
-                ed = os.path.join(b.dir, "evidence", s.local_id, feat)
-                os.makedirs(ed, exist_ok=True)
-                cv2.imwrite(os.path.join(ed, "right_best.jpg"), img)
+            _write_camera_evidence(b.dir, s.local_id, cam, tint)
     return b, segs
+
+
+#: The slot each camera's evidence lands in, as the processors write it and as
+#: reporting/camera_reports.py looks it up. Writing the wrong slot produces a
+#: PDF with no images while the files sit on disk -- which is exactly the bug
+#: these fixtures have to be able to catch.
+EVIDENCE_SLOTS = {
+    "RIGHT_UP":     [("door", "right_best")],
+    "LEFT_UP":      [("door", "left_best")],
+    "RIGHT_UP_TOP": [("load", "best_frame"), ("damage", "track_1")],
+    "LEFT_UP_TOP":  [("damage", "track_1")],
+}
+
+
+def _write_camera_evidence(bundle_dir, local_id, cam, tint):
+    """Evidence for ONE camera, in that camera's own slots.
+
+    `tint` gives each camera a distinguishable image, so a test can prove a
+    snapshot appears in its own report and in no other.
+    """
+    img = np.full((48, 64, 3), tint, dtype=np.uint8)
+    for feature, slot in EVIDENCE_SLOTS[cam]:
+        d = os.path.join(bundle_dir, "evidence", local_id, feature)
+        os.makedirs(d, exist_ok=True)
+        cv2.imwrite(os.path.join(d, f"{slot}.jpg"), img)
+        if feature == "damage":
+            # `_camera_damage_tracks` reads this metadata and filters on
+            # camera_id before it will look for track_<n>.jpg at all.
+            with open(os.path.join(d, "metadata.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"global_id": local_id, "feature": "damage",
+                           "tracks": [{"camera_id": cam, "track_idx": 1,
+                                       "class_name": "inner_wall_damage",
+                                       "best_confidence": 0.77}]}, f)
+
+
+def _embedded_jpegs(path):
+    """Decode every JPEG actually embedded in a PDF.
+
+    Counting `/DCTDecode` markers alone would pass on a PDF that referenced an
+    image it never wrote. These are decoded back to pixels, so a test can
+    assert on real content.
+    """
+    import base64
+    import re
+    import zlib
+    import cv2 as _cv2
+    import numpy as _np
+
+    raw = open(path, "rb").read()
+    out = []
+    for m in re.finditer(br"stream\r?\n(.*?)endstream", raw, re.S):
+        body = m.group(1).strip()
+        # ReportLab stores image streams ASCII85-encoded (sometimes over
+        # Flate), so the raw bytes are not a JPEG and searching for SOI..EOI
+        # in the file finds nothing.
+        for cand in (body,
+                     _try(lambda: base64.a85decode(body, adobe=True)),
+                     _try(lambda: zlib.decompress(body)),
+                     _try(lambda: zlib.decompress(
+                         base64.a85decode(body, adobe=True)))):
+            if not cand or not cand.startswith(b"\xff\xd8\xff"):
+                continue
+            img = _cv2.imdecode(_np.frombuffer(cand, dtype=_np.uint8),
+                                _cv2.IMREAD_COLOR)
+            if img is not None:
+                out.append(img)
+            break
+    return out
+
+
+def _try(fn):
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
+class TestSnapshotsAreEmbedded(unittest.TestCase):
+    """The camera PDFs must actually carry their evidence images.
+
+    They were coming out with empty snapshot pages: every image in
+    reporting/camera_reports.py is resolved through
+    `evidence_snapshot(evidence_root, <id>, <feature>, <slot>)`, and with no
+    camera-local feature run there was nothing on disk to resolve.
+    """
+
+    def _render(self, root, cam):
+        b, segs = _bundle(root, cam=cam)
+        out = os.path.join(root, f"{cam}_report.pdf")
+        p = adapter.build_local_camera_pdf(
+            b, output_pdf=out, batch_key=f"{cam} (camera-local)",
+            fps=15.0, total_frames=3555, verbose=False)
+        self.assertTrue(p and os.path.isfile(p), f"{cam}: no PDF")
+        return p, b, segs
+
+    def test_every_camera_pdf_embeds_decodable_snapshots(self):
+        for cam in C.ALL_CAMERAS:
+            with self.subTest(camera=cam), tempfile.TemporaryDirectory() as root:
+                pdf, _b, _segs = self._render(root, cam)
+                imgs = _embedded_jpegs(pdf)
+                self.assertTrue(imgs, f"{cam}: PDF embeds no decodable image")
+
+    def test_the_embedded_image_is_this_camera_s_own(self):
+        """Each fixture camera writes a distinct grey level; check it survives."""
+        for cam in C.ALL_CAMERAS:
+            with self.subTest(camera=cam), tempfile.TemporaryDirectory() as root:
+                pdf, _b, _segs = self._render(root, cam)
+                tints = [round(float(i.mean())) for i in _embedded_jpegs(pdf)]
+                self.assertTrue(tints, f"{cam}: nothing embedded")
+                want = CAMERA_TINT[cam]
+                self.assertTrue(
+                    any(abs(t - want) <= 2 for t in tints),
+                    f"{cam}: expected a snapshot near tint {want}, got {tints}")
+
+    def test_a_camera_never_embeds_another_camera_s_snapshot(self):
+        """RIGHT_UP images belong only in RIGHT_UP_report.pdf, and so on."""
+        for cam in C.ALL_CAMERAS:
+            with self.subTest(camera=cam), tempfile.TemporaryDirectory() as root:
+                pdf, _b, _segs = self._render(root, cam)
+                tints = [round(float(i.mean())) for i in _embedded_jpegs(pdf)]
+                foreign = {c: t for c, t in CAMERA_TINT.items() if c != cam}
+                for other, otint in foreign.items():
+                    self.assertFalse(
+                        any(abs(t - otint) <= 2 for t in tints),
+                        f"{cam} PDF embeds a {other} snapshot (tint {otint}) "
+                        f"-- got {tints}")
+
+    def test_missing_evidence_yields_no_images_rather_than_a_crash(self):
+        """Negative control: with_frames=False writes no evidence at all.
+
+        This is also what proves the positive tests are not vacuous -- the same
+        renderer produces zero images when the files are absent.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            b, _segs = _bundle(root, cam="RIGHT_UP", with_frames=False)
+            out = os.path.join(root, "x.pdf")
+            p = adapter.build_local_camera_pdf(b, output_pdf=out,
+                                               batch_key="x", verbose=False)
+            self.assertTrue(p and os.path.isfile(p))
+            self.assertEqual(_embedded_jpegs(p), [])
+
+    def test_slots_match_what_the_renderer_looks_up(self):
+        """Pin the per-camera slot contract the renderer depends on."""
+        src = inspect.getsource(
+            __import__("reporting.camera_reports", fromlist=["x"]))
+        for cam, slots in EVIDENCE_SLOTS.items():
+            for feature, slot in slots:
+                if slot.startswith("track_"):
+                    continue          # resolved via damage metadata, not a literal
+                with self.subTest(camera=cam, slot=slot):
+                    self.assertIn(f'"{feature}", "{slot}"', src)
+
+
+class TestCameraLocalEvidenceIsProduced(unittest.TestCase):
+    """The PDFs can only embed what camera arrival actually generated."""
+
+    def test_camera_local_features_run_by_default(self):
+        from orchestrator.camera_runner import run_camera
+        p = inspect.signature(run_camera).parameters
+        self.assertIs(p["camera_local_features"].default, True,
+                      "without a local feature run the camera PDFs are empty")
+
+    def test_local_features_write_into_the_bundle_evidence_root(self):
+        """And that root is the one the adapter hands the renderer."""
+        from orchestrator import camera_runner
+        src = inspect.getsource(camera_runner.run_camera)
+        self.assertIn('evidence_root=os.path.join(bundle.dir, "evidence")', src)
+        with tempfile.TemporaryDirectory() as root:
+            b, _segs = _bundle(root, cam="RIGHT_UP")
+            _s, _u, paths = adapter.adapt(b)
+            self.assertEqual(os.path.normpath(paths["evidence_root"]),
+                             os.path.normpath(os.path.join(b.dir, "evidence")))
+
+    def test_disabling_them_is_still_possible(self):
+        from orchestrator import camera_runner
+        src = inspect.getsource(camera_runner.run_camera)
+        self.assertIn("if camera_local_features else []", src)
 
 
 class TestNoSecondRenderer(unittest.TestCase):

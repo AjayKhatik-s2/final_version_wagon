@@ -304,13 +304,24 @@ class TestArrivalHarnessProcessIsolation(unittest.TestCase):
         self.assertEqual(src.count("camera_runner.run_camera"), 1)
 
     def test_parent_loads_no_video_frames(self):
-        """The orchestrator only resolves paths; decoding happens in children."""
+        """The orchestrator only resolves paths; decoding happens in children.
+
+        Scans CODE only -- prose in a comment may legitimately mention the
+        materializer without the parent ever calling it.
+        """
+        import io as _io
+        import tokenize
         h = self._harness()
+        code = []
         src = inspect.getsource(h)
-        for banned in ("VideoCapture", "cv2.imread", "read_frames",
-                       "materializ"):
+        for tok in tokenize.generate_tokens(_io.StringIO(src).readline):
+            if tok.type not in (tokenize.COMMENT, tokenize.STRING):
+                code.append(tok.string)
+        code = " ".join(code)
+        for banned in ("VideoCapture", "imread", "read_frames",
+                       "wagon_cache_builder", "build_camera_local"):
             with self.subTest(token=banned):
-                self.assertNotIn(banned, src)
+                self.assertNotIn(banned, code)
 
     def test_assembly_happens_after_the_arrival_loop(self):
         h = self._harness()
@@ -458,29 +469,95 @@ class TestAssemblyIsTheBatchSequence(unittest.TestCase):
         self.assertIn("video_paths=video_paths", src)
 
 
-class TestCameraLocalFeaturesAreOptIn(unittest.TestCase):
-    """Camera-time inference is off by default; that default is equivalence."""
+class TestCameraLocalFeaturesDoNotReachTheGlobalResult(unittest.TestCase):
+    """Camera-time inference exists for the camera PDFs and nothing else.
 
-    def test_default_is_off(self):
+    It runs by default -- otherwise the camera-local reports have no snapshots
+    to embed -- but global assembly recomputes every feature over the global
+    wagons and never reads what a camera wrote locally.
+    """
+
+    def test_it_runs_by_default(self):
         from orchestrator.camera_runner import run_camera
         p = inspect.signature(run_camera).parameters
         self.assertIn("camera_local_features", p)
-        self.assertIs(p["camera_local_features"].default, False)
+        self.assertIs(p["camera_local_features"].default, True)
 
-    def test_plan_is_empty_unless_enabled(self):
+    def test_it_can_be_switched_off(self):
         from orchestrator import camera_runner
         src = inspect.getsource(camera_runner.run_camera)
         self.assertIn("if camera_local_features else []", src)
 
-    def test_the_harness_does_not_enable_it(self):
+    def test_assembly_never_reads_the_camera_local_feature_tree(self):
+        """The bundle's own features/ dir must not feed the global answer.
+
+        `models/features` is the weights directory and is unrelated.
+        """
+        from orchestrator import global_assembler as ga
+        src = inspect.getsource(ga.assemble)
+        self.assertNotIn('bundle.dir, "features"', src)
+        self.assertNotIn('b.dir, "features"', src)
+        self.assertIn("output_dir=states_root", src)
+
+    def test_assembly_reads_only_stage1_artefacts_from_the_bundles(self):
+        from orchestrator import global_assembler as ga
+        src = inspect.getsource(ga)
+        read = {"tracking_full.json", "classification.json",
+                "wagon_region.json", "segments.json"}
+        for name in read:
+            if name == "segments.json":
+                continue            # read via bundle.read_segments()
+            self.assertIn(name, src)
+        self.assertNotIn('bundle.dir, "camera_cache"', src,
+                         "assembly must materialize its own cache, not reuse "
+                         "the camera-local one")
+        self.assertIn('batch_root, "wagon_cache"', src,
+                      "the global cache should use the batch pipeline's name")
+
+    def test_assembly_writes_features_to_the_batch_tree(self):
+        from orchestrator import global_assembler as ga
+        src = inspect.getsource(ga.assemble)
+        self.assertIn("feature_kwargs = dict(state=state", src)
+        self.assertIn("evidence_root=global_evidence", src)
+
+
+class TestHarnessUsesRealFields(unittest.TestCase):
+    """The harness crashed on asm.media_linked after that field was removed."""
+
+    def _harness_src(self):
         import importlib
         import sys as _sys
         bench = os.path.join(V4_ROOT, "benchmarks")
         if bench not in _sys.path:
             _sys.path.insert(0, bench)
-        h = importlib.import_module("run_sequential_arrivals")
-        self.assertNotIn("camera_local_features",
-                         inspect.getsource(h.main))
+        return inspect.getsource(importlib.import_module(
+            "run_sequential_arrivals"))
+
+    def test_harness_does_not_touch_media_linked(self):
+        self.assertNotIn("media_linked", self._harness_src())
+
+    def test_media_linked_was_not_reintroduced(self):
+        import dataclasses
+        from orchestrator.global_assembler import AssemblyResult
+        names = {f.name for f in dataclasses.fields(AssemblyResult)}
+        self.assertNotIn("media_linked", names)
+        self.assertNotIn("relabelled", names)
+
+    def test_every_asm_attribute_the_harness_reads_exists(self):
+        """Catches the next stale field before a 40-minute run does."""
+        import ast
+        import dataclasses
+        from orchestrator.global_assembler import AssemblyResult
+        names = {f.name for f in dataclasses.fields(AssemblyResult)}
+        used = set()
+        for n in ast.walk(ast.parse(self._harness_src())):
+            if (isinstance(n, ast.Attribute)
+                    and isinstance(n.value, ast.Name) and n.value.id == "asm"):
+                used.add(n.attr)
+        self.assertTrue(used, "found no asm.* reads -- did the parse work?")
+        self.assertEqual(sorted(used - names), [],
+                         f"harness reads fields that do not exist: "
+                         f"{sorted(used - names)}")
 
 
 class TestProtectedAndAdditive(unittest.TestCase):
