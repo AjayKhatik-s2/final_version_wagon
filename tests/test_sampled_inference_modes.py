@@ -12,6 +12,7 @@ the benchmark harness, not here -- these tests must run without weights.
 from __future__ import annotations
 
 import inspect
+import io
 import os
 import unittest
 
@@ -275,6 +276,107 @@ class TestSampledModeActuallySkipsFrames(unittest.TestCase):
             self.assertEqual(used, stable)
         finally:
             shutil.rmtree(cache, ignore_errors=True)
+
+
+class TestNoFp16Request(unittest.TestCase):
+    """No inference call may ask for fp16, on any code path.
+
+    Two reasons, and either alone is sufficient:
+
+    1. Production runs on a CPU-only torch build with no native fp16 kernels.
+       Measured on door_state.pt with identical frames (torch 2.12.0+cpu):
+       half=True gave 112,637 ms/frame and ZERO detections; half=False gave
+       675 ms/frame and a detection at conf 0.93. fp16 is emulated -- 167x
+       slower -- and degrades the numerics enough that every box falls below
+       threshold, so door state silently collapsed to CLOSED/0.00 everywhere.
+    2. `half` is deprecated in newer ultralytics (renamed `quantize`), so
+       passing it at all logs a warning on every single call -- millions of
+       lines over a full run.
+
+    fp32 is already the default, so the argument is simply omitted. This test
+    fails if anyone reintroduces it, in either direction.
+    """
+
+    #: Every module that may invoke a detector.
+    INFERENCE_PACKAGES = ("features", "wagon_count", "reconstruction",
+                          "materializer", "orchestrator", "core")
+
+    def _py_files(self):
+        for pkg in self.INFERENCE_PACKAGES:
+            root = os.path.join(V4_ROOT, pkg)
+            if not os.path.isdir(root):
+                continue
+            for dirpath, dirs, files in os.walk(root):
+                dirs[:] = [d for d in dirs
+                           if d not in ("__pycache__", "tests", ".venv")]
+                for fn in files:
+                    if fn.endswith(".py"):
+                        yield os.path.join(dirpath, fn)
+
+    def test_no_call_passes_half(self):
+        import ast
+        offenders = []
+        for path in self._py_files():
+            with io.open(path, encoding="utf-8") as f:
+                src = f.read()
+            if "half" not in src:                 # cheap skip
+                continue
+            try:
+                tree = ast.parse(src)
+            except SyntaxError:
+                continue
+            for n in ast.walk(tree):
+                if not isinstance(n, ast.Call):
+                    continue
+                for kw in n.keywords:
+                    if kw.arg == "half":
+                        offenders.append(
+                            f"{os.path.relpath(path, V4_ROOT)}:{n.lineno}")
+        self.assertEqual(sorted(offenders), [],
+                         "fp16 requested at: " + ", ".join(sorted(offenders)))
+
+    def test_no_function_still_takes_a_half_parameter(self):
+        """A dormant `half=` parameter is how the argument creeps back."""
+        import ast
+        offenders = []
+        for path in self._py_files():
+            with io.open(path, encoding="utf-8") as f:
+                src = f.read()
+            if "half" not in src:
+                continue
+            try:
+                tree = ast.parse(src)
+            except SyntaxError:
+                continue
+            for n in ast.walk(tree):
+                if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                a = n.args
+                names = [x.arg for x in (a.posonlyargs + a.args + a.kwonlyargs)]
+                if "half" in names:
+                    offenders.append(
+                        f"{os.path.relpath(path, V4_ROOT)}:{n.lineno} "
+                        f"({n.name})")
+        self.assertEqual(sorted(offenders), [],
+                         "half parameter at: " + ", ".join(sorted(offenders)))
+
+    def test_the_measured_evidence_is_still_documented(self):
+        """Removing the argument must not remove the reason."""
+        with io.open(os.path.join(V4_ROOT, "features", "door", "processor.py"),
+                     encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("112,637", src, "the measurement that justifies fp32 "
+                                     "must stay in the door processor")
+        self.assertIn("0 detections", src)
+
+    def test_the_guard_would_catch_a_reintroduction(self):
+        """Negative control: prove the AST scan actually detects half=."""
+        import ast
+        tree = ast.parse("model(frame, verbose=False, half=True)")
+        found = [kw.arg for n in ast.walk(tree)
+                 if isinstance(n, ast.Call) for kw in n.keywords
+                 if kw.arg == "half"]
+        self.assertEqual(found, ["half"])
 
 
 class TestStage1IsUntouched(unittest.TestCase):

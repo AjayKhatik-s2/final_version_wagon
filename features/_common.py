@@ -188,16 +188,20 @@ def iter_wagon_frames(
 # -----------------------------------------------------------------------------
 
 def run_detection(
-    model, frame: np.ndarray,
-    *, confidence: float = 0.4, half: bool = False,
+    model, frame: np.ndarray, *, confidence: float = 0.4,
 ) -> List[Dict[str, Any]]:
     """Run a YOLO detection model on a frame; return clean dicts.
 
     Each dict: {class_id, class_name, confidence, bbox: [x1, y1, x2, y2]}.
+
+    Always fp32. There is deliberately no half/fp16 switch: production runs on
+    a CPU-only torch build where fp16 is emulated -- measured at 167x slower
+    with zero surviving detections -- and `half` is deprecated in newer
+    ultralytics, so passing it logs a warning on every single call.
     """
     if model is None:
         return []
-    res = model(frame, verbose=False, half=half)[0]
+    res = model(frame, verbose=False)[0]
     if res.boxes is None or len(res.boxes) == 0:
         return []
 

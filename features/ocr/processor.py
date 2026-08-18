@@ -110,9 +110,13 @@ def _process_one_wagon(
     for fi, frame in iter_wagon_frames(cache_root, gw_id, C.CAMERA_RIGHT_UP, trim_stable=True):
         used += 1
 
-        # Stage A: YOLO detection -- locate wagon-number bbox regions
+        # Stage A: YOLO detection -- locate wagon-number bbox regions.
+        # fp32: this used to request half=True, which on the CPU-only torch
+        # build is emulated fp16 -- measured on door_state.pt at 167x slower
+        # with ZERO detections surviving threshold. OCR is off by default so it
+        # never bit here, but it would have the moment OCR was enabled.
         try:
-            results = yolo_model(frame, verbose=False, half=True)[0]
+            results = yolo_model(frame, verbose=False)[0]
         except Exception:
             continue
         if results.boxes is None or len(results.boxes) == 0:

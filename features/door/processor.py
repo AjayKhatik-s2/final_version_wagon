@@ -4,7 +4,7 @@ ported).
 Per wagon, for each side camera (RIGHT_UP / LEFT_UP):
 
     1. Iterate cached JPEGs in wagon_cache/<GW_n>/<camera>/.
-    2. Run YOLO door_state.pt on the raw frame (half=False -- CPU build).
+    2. Run YOLO door_state.pt on the raw frame (fp32 -- CPU-only build).
     3. Apply the model's own confidence gate.
     4. Feed surviving detections into the legacy DoorTracker (Kalman +
        Hungarian + per-track 30-frame quality-weighted majority vote +
@@ -232,17 +232,21 @@ def _run_tracker_one_camera(
         #    per-frame exception.
         quality = 1.0
 
-        # 2) YOLO detection on raw frame.
-        #    half=False is REQUIRED: production runs on a CPU-only torch build,
-        #    which has no native fp16 kernels.  Measured on door_state.pt with
-        #    identical frames and parameters (torch 2.12.0+cpu):
+        # 2) YOLO detection on raw frame, in fp32.
+        #    NEVER ask for fp16 here. Production runs on a CPU-only torch
+        #    build, which has no native fp16 kernels. Measured on door_state.pt
+        #    with identical frames and parameters (torch 2.12.0+cpu):
         #        half=True   112,637 ms/frame   0 detections
         #        half=False       675 ms/frame  1 detection @ conf 0.93
         #    fp16 is emulated (167x slower) AND degrades the numerics enough
         #    that every box falls below threshold, so the door state silently
         #    collapsed to CLOSED/0.00 for every wagon.
+        #    fp32 is already the default, so the argument is omitted rather
+        #    than passed as False: `half` is deprecated in newer ultralytics
+        #    (renamed `quantize`) and passing it at all logs a warning on every
+        #    call. Omitting it is identical in behaviour on both versions.
         try:
-            results = yolo_model(frame, verbose=False, half=False)[0]
+            results = yolo_model(frame, verbose=False)[0]
         except Exception:
             continue
         if results.boxes is None or len(results.boxes) == 0:
@@ -452,7 +456,8 @@ def _run_sampled_one_camera(
         used += 1
 
         try:
-            results = yolo_model(frame, verbose=False, half=False)[0]
+            # fp32, for the reason measured above -- see the sampled path.
+            results = yolo_model(frame, verbose=False)[0]
         except Exception:
             continue
         if results.boxes is None or len(results.boxes) == 0:
