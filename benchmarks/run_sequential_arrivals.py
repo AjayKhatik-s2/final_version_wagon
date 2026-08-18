@@ -224,7 +224,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         t0 = time.time()
         asm = global_assembler.assemble(
             evidence_root=evidence_root, output_root=args.workspace,
-            batch_key=key, verbose=True)
+            batch_key=key, feat_models_dir=args.feat_models_dir,
+            verbose=True)
         timings["assembly"] = round(time.time() - t0, 1)
 
         disk_report("after  assembly", evidence_root)

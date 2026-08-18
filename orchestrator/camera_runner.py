@@ -119,6 +119,7 @@ def run_camera(
     feat_models_dir: str,
     evidence_root: str,
     enabled_features: Optional[List[str]] = None,
+    camera_local_features: bool = False,
     verbose: bool = True,
 ) -> CameraRunResult:
     """Drive ONE camera PENDING -> SEALED.
@@ -212,7 +213,20 @@ def run_camera(
         _t("materialize", t0)
         bundle.advance("MATERIALIZED")
 
-        # ---- features, against CAMERA-LOCAL segments -------------------
+        # ---- OPTIONAL camera-local features ---------------------------
+        # Off by default, and that default is what makes the sequential result
+        # equal the batch result.
+        #
+        # The old pipeline runs every feature AFTER fusion, over frames the
+        # materializer bucketed with `round((GW.time - delta) * local_fps)`. A
+        # support camera's `delta` cannot be known while it is being processed
+        # alone -- it is estimated from master + support observations together
+        # -- so camera-local windows are not the batch windows and the feature
+        # states would differ.
+        #
+        # Enable this only to give the camera-local PDF real feature content;
+        # global assembly ignores whatever it writes and recomputes from the
+        # global wagons.
         roster = as_feature_wagons(out.segments, camera_id)
         states_dir = os.path.join(bundle.dir, "features")
         common = dict(state=None, cache_root=cache_root,
@@ -220,7 +234,12 @@ def run_camera(
                       output_dir=states_dir,
                       evidence_root=os.path.join(bundle.dir, "evidence"),
                       segments=roster, verbose=verbose)
-        for name, mod, extra in _feature_plan(camera_id, enabled):
+        plan = _feature_plan(camera_id, enabled) if camera_local_features else []
+        if not plan and verbose:
+            print(f"[SEQ/{camera_id}] camera-local features SKIPPED -- "
+                  f"inference runs at global assembly, over the materialized "
+                  f"global wagon windows (batch-equivalent)")
+        for name, mod, extra in plan:
             t0 = time.perf_counter()
             try:
                 res.feature_summary[name] = mod.run(**common, **extra) or {}

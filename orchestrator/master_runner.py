@@ -843,7 +843,7 @@ def run_sequential(
     print("--- GLOBAL ASSEMBLY ---")
     asm = global_assembler.assemble(
         evidence_root=evidence_root, output_root=workspace,
-        batch_key=key, verbose=verbose)
+        batch_key=key, feat_models_dir=feat_models_dir, verbose=verbose)
 
     elapsed = time.time() - t0
     print("=" * 78)

@@ -252,258 +252,6 @@ class TestAssemblyGate(unittest.TestCase):
         self.assertEqual(r.total_wagons, 0)
 
 
-class TestRelabelling(unittest.TestCase):
-    """L_<CAM>_<n> -> GW_n on real files, with no inference."""
-
-    class _GW:
-        def __init__(self, gid, s, e):
-            self.global_id, self.start_time, self.end_time = gid, s, e
-
-    def test_feature_evidence_is_relabelled_to_global_ids(self):
-        from orchestrator.global_assembler import _relabel_feature_evidence
-        with tempfile.TemporaryDirectory() as root:
-            b, segs = _seal(root, MASTER,
-                            features={"door": {"left_door": "CLOSED"}})
-            roster = [self._GW(f"GW_{i}", float((i - 1) * 4), float(i * 4))
-                      for i in range(1, 4)]
-            maps = map_segments_to_global(segs, roster, camera_id=MASTER)
-            states = os.path.join(root, "wagon_states")
-            n = _relabel_feature_evidence(b, maps, states)
-            self.assertEqual(n, 3)
-            for i in range(1, 4):
-                p = os.path.join(states, "door", f"GW_{i}.json")
-                self.assertTrue(os.path.isfile(p), f"GW_{i}.json missing")
-                with open(p, encoding="utf-8") as f:
-                    d = json.load(f)
-                self.assertEqual(d["global_id"], f"GW_{i}")
-                self.assertTrue(d["_sequential_audit"]["source_local_id"]
-                                .startswith("L_RIGHT_UP_"))
-                self.assertEqual(d["left_door"], "CLOSED",
-                                 "payload must survive relabelling")
-
-    def test_unmatched_segment_is_never_relabelled(self):
-        from orchestrator.global_assembler import _relabel_feature_evidence
-        with tempfile.TemporaryDirectory() as root:
-            far = [LocalSegment(local_id=local_segment_id(MASTER, 1), index=1,
-                                start_frame=0, end_frame=10,
-                                start_time=900.0, end_time=904.0,
-                                label="WAGON", confidence=0.9)]
-            b, segs = _seal(root, MASTER, segments=far,
-                            features={"door": {"left_door": "OPEN"}})
-            roster = [self._GW("GW_1", 0.0, 4.0)]
-            maps = map_segments_to_global(segs, roster, camera_id=MASTER)
-            states = os.path.join(root, "wagon_states")
-            self.assertEqual(_relabel_feature_evidence(b, maps, states), 0)
-            self.assertFalse(os.path.exists(os.path.join(states, "door")))
-
-
-class TestCrossCameraFeatureMerge(unittest.TestCase):
-    """Each camera reports only its own half; assembly must combine them.
-
-    In batch mode one processor invocation read every relevant camera. In
-    sequential mode RIGHT_UP fills right_door and leaves left_door NO_DATA,
-    LEFT_UP the reverse, and each top camera reports only what it saw. Keeping
-    the first writer would silently drop half the readings.
-    """
-
-    def _merge(self, feature, base, new):
-        from orchestrator.global_assembler import _merge_payloads
-        return _merge_payloads(feature, base, new)
-
-    def _door(self, cam, *, left="NO_DATA", right="NO_DATA",
-              lc=0.0, rc=0.0, fl=0, fr=0):
-        return {"global_id": "GW_1", "feature": "door", "status": "OK",
-                "left_door": left, "left_door_confidence": lc,
-                "right_door": right, "right_door_confidence": rc,
-                "frames_left": fl, "frames_right": fr,
-                "frame_count": fl + fr, "tracks": [],
-                "supporting_cameras": [cam]}
-
-    def test_both_door_sides_survive(self):
-        r = self._door("RIGHT_UP", right="OPEN", rc=0.88, fr=9)
-        l = self._door("LEFT_UP", left="CLOSED", lc=0.91, fl=7)
-        m = self._merge("door", r, l)
-        self.assertEqual(m["right_door"], "OPEN")
-        self.assertEqual(m["left_door"], "CLOSED")
-        self.assertAlmostEqual(m["left_door_confidence"], 0.91)
-        self.assertAlmostEqual(m["right_door_confidence"], 0.88)
-        self.assertEqual(sorted(m["supporting_cameras"]),
-                         ["LEFT_UP", "RIGHT_UP"])
-        self.assertEqual(m["frame_count"], 16)
-
-    def test_merge_order_does_not_matter_for_doors(self):
-        r = self._door("RIGHT_UP", right="OPEN", rc=0.88, fr=9)
-        l = self._door("LEFT_UP", left="CLOSED", lc=0.91, fl=7)
-        a = self._merge("door", r, l)
-        b = self._merge("door", l, r)
-        for k in ("left_door", "right_door", "left_door_confidence",
-                  "right_door_confidence", "frame_count"):
-            self.assertEqual(a[k], b[k], k)
-
-    def test_a_real_reading_never_loses_to_no_data(self):
-        r = self._door("RIGHT_UP", right="OPEN", rc=0.88)
-        l = self._door("LEFT_UP", left="CLOSED", lc=0.91)
-        self.assertEqual(self._merge("door", r, l)["left_door"], "CLOSED")
-        self.assertEqual(self._merge("door", l, r)["right_door"], "OPEN")
-
-    def test_conflicting_same_side_keeps_higher_confidence(self):
-        a = self._door("RIGHT_UP", right="CLOSED", rc=0.55)
-        b = self._door("RIGHT_UP", right="OPEN", rc=0.93)
-        self.assertEqual(self._merge("door", a, b)["right_door"], "OPEN")
-        self.assertEqual(self._merge("door", b, a)["right_door"], "OPEN")
-
-    def _load(self, cam, status, conf):
-        return {"global_id": "GW_1", "feature": "load", "status": "OK",
-                "load_status": status, "load_confidence": conf,
-                "supporting_cameras": [cam]}
-
-    def test_right_up_top_is_authoritative_for_load(self):
-        """features/load/processor.py: RIGHT_UP_TOP authoritative when present."""
-        r = self._load("RIGHT_UP_TOP", "LOADED", 0.7)
-        l = self._load("LEFT_UP_TOP", "EMPTY", 0.99)
-        self.assertEqual(self._merge("load", r, l)["load_status"], "LOADED")
-        self.assertEqual(self._merge("load", l, r)["load_status"], "LOADED")
-
-    def test_left_up_top_is_the_fallback_for_load(self):
-        r = self._load("RIGHT_UP_TOP", "NO_DATA", 0.0)
-        l = self._load("LEFT_UP_TOP", "EMPTY", 0.8)
-        self.assertEqual(self._merge("load", r, l)["load_status"], "EMPTY")
-
-    def _dmg(self, cam, status, details=None, conf=0.0):
-        return {"global_id": "GW_1", "feature": "damage", "status": "OK",
-                "top_damage": status, "top_damage_confidence": conf,
-                "top_damage_details": list(details or []),
-                "supporting_cameras": [cam]}
-
-    def test_any_top_camera_damage_wins(self):
-        """features/damage/processor.py combines with `any_damage`."""
-        ok = self._dmg("RIGHT_UP_TOP", "OK")
-        bad = self._dmg("LEFT_UP_TOP", "DAMAGE", ["floor_damage"], 0.8)
-        self.assertEqual(self._merge("damage", ok, bad)["top_damage"], "DAMAGE")
-        self.assertEqual(self._merge("damage", bad, ok)["top_damage"], "DAMAGE")
-
-    def test_damage_details_from_both_cameras_are_kept(self):
-        a = self._dmg("RIGHT_UP_TOP", "DAMAGE", ["floor_damage"], 0.7)
-        b = self._dmg("LEFT_UP_TOP", "DAMAGE", ["inner_wall_damage"], 0.6)
-        m = self._merge("damage", a, b)
-        self.assertEqual(sorted(m["top_damage_details"]),
-                         ["floor_damage", "inner_wall_damage"])
-
-    def test_damage_no_data_is_replaced_by_a_real_ok(self):
-        nd = self._dmg("RIGHT_UP_TOP", "NO_DATA")
-        ok = self._dmg("LEFT_UP_TOP", "OK")
-        self.assertEqual(self._merge("damage", nd, ok)["top_damage"], "OK")
-
-    def test_merge_invents_no_reading(self):
-        nd1 = self._dmg("RIGHT_UP_TOP", "NO_DATA")
-        nd2 = self._dmg("LEFT_UP_TOP", "NO_DATA")
-        self.assertEqual(self._merge("damage", nd1, nd2)["top_damage"],
-                         "NO_DATA")
-
-    def test_merge_runs_no_inference(self):
-        """It only chooses between values already computed on disk."""
-        import ast
-        from orchestrator import global_assembler as ga
-        fn = next(n for n in ast.walk(ast.parse(inspect.getsource(ga)))
-                  if isinstance(n, ast.FunctionDef)
-                  and n.name == "_merge_payloads")
-        calls = {ast.unparse(n.func) for n in ast.walk(fn)
-                 if isinstance(n, ast.Call)}
-        self.assertTrue(calls, "found no calls -- did the parse work?")
-        for c in calls:
-            for banned in ("YOLO", "predict", "model", "infer"):
-                self.assertNotIn(banned, c, f"{c} looks like inference")
-
-    def test_on_disk_relabelling_merges_two_cameras(self):
-        """End to end through the real file path, not just the merge helper."""
-        from orchestrator.global_assembler import _relabel_feature_evidence
-
-        class _GW:
-            def __init__(self, gid, s, e):
-                self.global_id, self.start_time, self.end_time = gid, s, e
-
-        with tempfile.TemporaryDirectory() as root:
-            states = os.path.join(root, "wagon_states")
-            roster = [_GW(f"GW_{i}", float((i - 1) * 4), float(i * 4))
-                      for i in range(1, 4)]
-            for cam, feats in (
-                ("RIGHT_UP", {"door": {"right_door": "OPEN",
-                                       "right_door_confidence": 0.88,
-                                       "left_door": "NO_DATA",
-                                       "left_door_confidence": 0.0,
-                                       "supporting_cameras": ["RIGHT_UP"],
-                                       "frames_right": 9, "frames_left": 0}}),
-                ("LEFT_UP", {"door": {"left_door": "CLOSED",
-                                      "left_door_confidence": 0.91,
-                                      "right_door": "NO_DATA",
-                                      "right_door_confidence": 0.0,
-                                      "supporting_cameras": ["LEFT_UP"],
-                                      "frames_left": 7, "frames_right": 0}}),
-            ):
-                b, segs = _seal(root, cam, features=feats)
-                maps = map_segments_to_global(segs, roster, camera_id=cam)
-                _relabel_feature_evidence(b, maps, states)
-            for i in range(1, 4):
-                with open(os.path.join(states, "door", f"GW_{i}.json"),
-                          encoding="utf-8") as f:
-                    d = json.load(f)
-                self.assertEqual(d["right_door"], "OPEN", f"GW_{i}")
-                self.assertEqual(d["left_door"], "CLOSED", f"GW_{i}")
-                self.assertEqual(sorted(d["supporting_cameras"]),
-                                 ["LEFT_UP", "RIGHT_UP"])
-                self.assertTrue(d["_sequential_audit"]["merged_from"])
-
-    def test_fused_state_reports_both_doors_after_merge(self):
-        """The payoff: wagon_state_builder sees both sides, not one."""
-        from orchestrator.global_assembler import _relabel_feature_evidence
-        from fusion import wagon_state_builder
-        from core.global_state_loader import GlobalTrainState, GlobalWagon
-
-        class _GW:
-            def __init__(self, gid, s, e):
-                self.global_id, self.start_time, self.end_time = gid, s, e
-
-        with tempfile.TemporaryDirectory() as root:
-            states = os.path.join(root, "wagon_states")
-            roster = [_GW("GW_1", 0.0, 4.0)]
-            for cam, feats in (
-                ("RIGHT_UP", {"door": {"right_door": "OPEN",
-                                       "right_door_confidence": 0.88,
-                                       "left_door": "NO_DATA",
-                                       "left_door_confidence": 0.0,
-                                       "supporting_cameras": ["RIGHT_UP"],
-                                       "frames_right": 9, "frames_left": 0}}),
-                ("LEFT_UP", {"door": {"left_door": "CLOSED",
-                                      "left_door_confidence": 0.91,
-                                      "right_door": "NO_DATA",
-                                      "right_door_confidence": 0.0,
-                                      "supporting_cameras": ["LEFT_UP"],
-                                      "frames_left": 7, "frames_right": 0}}),
-            ):
-                segs = [LocalSegment(local_id=local_segment_id(cam, 1),
-                                     index=1, start_frame=0, end_frame=59,
-                                     start_time=0.0, end_time=4.0,
-                                     label="WAGON", confidence=0.9)]
-                b, segs = _seal(root, cam, segments=segs, features=feats)
-                maps = map_segments_to_global(segs, roster, camera_id=cam)
-                _relabel_feature_evidence(b, maps, states)
-            state = GlobalTrainState(
-                total_wagons=1,
-                wagons=(GlobalWagon(global_id="GW_1", wagon_index=1,
-                                    start_frame_master=0, end_frame_master=59,
-                                    start_time=0.0, end_time=4.0,
-                                    classification="WAGON",
-                                    classification_confidence=1.0),),
-                master_camera=MASTER)
-            unified = wagon_state_builder.build(
-                state=state, wagon_states_root=states,
-                write_per_wagon_json=False, verbose=False)
-            u = unified["GW_1"]
-            self.assertEqual(u.right_door, "OPEN")
-            self.assertEqual(u.left_door, "CLOSED")
-            self.assertIn("RIGHT_DOOR_OPEN", u.anomalies)
-
-
 class TestArrivalHarnessProcessIsolation(unittest.TestCase):
     """Four OS processes, not one in-process loop.
 
@@ -603,124 +351,136 @@ class TestArrivalHarnessProcessIsolation(unittest.TestCase):
                              "hardlink double-counted as new disk")
 
 
-class TestMediaAssociation(unittest.TestCase):
-    """Image evidence must gain its GLOBAL name, or the combined report is blank.
+class TestAssemblyIsTheBatchSequence(unittest.TestCase):
+    """Assembly must BE the old pipeline from Stage 2 on, run late.
 
-    The JSON relabelling alone is not enough: the existing global report
-    resolves `<evidence_root>/<GW_n>/<feature>/<slot>.jpg` and
-    `<cache_root>/<GW_n>/<camera_folder>/*.jpg`.
+    `run_global_count.py` STEP 3 then `master_runner.process_batch` Stages 2-5:
+    fusion(with wagon_regions) -> materializer -> features(load first) ->
+    wagon_state_builder -> combined_train_report. Feature inference belongs
+    HERE, because a support camera's clock offset -- and therefore its feature
+    windows -- cannot be known while that camera is being processed alone.
     """
 
-    class _GW:
-        def __init__(self, gid, s, e):
-            self.global_id, self.start_time, self.end_time = gid, s, e
-
-    def _fixture(self, root, cam=MASTER):
-        import numpy as np
-        import cv2
-        b, segs = _seal(root, cam)
-        img = np.zeros((32, 32, 3), dtype=np.uint8)
-        for sg in segs:
-            ed = os.path.join(b.dir, "evidence", sg.local_id, "door")
-            os.makedirs(ed, exist_ok=True)
-            cv2.imwrite(os.path.join(ed, "right_best.jpg"), img)
-            cd = os.path.join(b.dir, "camera_cache", sg.local_id,
-                              C.CAMERA_FOLDER[cam])
-            os.makedirs(cd, exist_ok=True)
-            cv2.imwrite(os.path.join(cd, "frame_000001.jpg"), img)
-        roster = [self._GW(f"GW_{i}", float((i - 1) * 4), float(i * 4))
-                  for i in range(1, 4)]
-        maps = map_segments_to_global(segs, roster, camera_id=cam)
-        return b, segs, maps
-
-    def test_existing_report_lookups_resolve_under_global_ids(self):
-        from orchestrator.global_assembler import _associate_media
-        from reporting import _evidence_lookup as ev
-        with tempfile.TemporaryDirectory() as root:
-            b, _segs, maps = self._fixture(root)
-            ed = os.path.join(root, "out", "evidence")
-            cd = os.path.join(root, "out", "camera_cache")
-            n = _associate_media(b, maps, evidence_dst=ed, cache_dst=cd)
-            self.assertEqual(n["evidence"], 3)
-            self.assertEqual(n["cache"], 3)
-            for i in range(1, 4):
-                self.assertTrue(
-                    ev.evidence_snapshot(ed, f"GW_{i}", "door", "right_best"),
-                    f"GW_{i} door evidence unresolved")
-                self.assertTrue(os.path.isdir(os.path.join(
-                    cd, f"GW_{i}", C.CAMERA_FOLDER[MASTER])))
-
-    def test_camera_local_evidence_is_not_moved_away(self):
-        """The camera bundles stay intact -- assembly only adds a global view."""
-        from orchestrator.global_assembler import _associate_media
-        with tempfile.TemporaryDirectory() as root:
-            b, segs, maps = self._fixture(root)
-            _associate_media(b, maps,
-                             evidence_dst=os.path.join(root, "o", "evidence"),
-                             cache_dst=os.path.join(root, "o", "cache"))
-            for sg in segs:
-                self.assertTrue(os.path.isfile(os.path.join(
-                    b.dir, "evidence", sg.local_id, "door", "right_best.jpg")))
-
-    def test_no_extra_disk_for_the_global_view(self):
-        """Hardlinks, not copies -- the previous run filled the root volume."""
-        from orchestrator.global_assembler import _associate_media
-        with tempfile.TemporaryDirectory() as root:
-            b, segs, maps = self._fixture(root)
-            ed = os.path.join(root, "out", "evidence")
-            _associate_media(b, maps, evidence_dst=ed,
-                             cache_dst=os.path.join(root, "out", "cache"))
-            src = os.path.join(b.dir, "evidence", segs[0].local_id, "door",
-                              "right_best.jpg")
-            dst = os.path.join(ed, "GW_1", "door", "right_best.jpg")
-            if not hasattr(os, "link"):
-                self.skipTest("no hardlink support")
-            a, c = os.stat(src), os.stat(dst)
-            if a.st_ino == 0:            # some Windows filesystems report 0
-                self.skipTest("inode numbers unavailable")
-            self.assertEqual(a.st_ino, c.st_ino,
-                             "evidence was copied instead of linked")
-
-    def test_unmatched_segment_media_is_never_given_a_global_name(self):
-        from orchestrator.global_assembler import _associate_media
-        with tempfile.TemporaryDirectory() as root:
-            b, _segs, maps = self._fixture(root)
-            for m in maps:                       # simulate all UNMATCHED
-                m.global_id = ""
-            ed = os.path.join(root, "out", "evidence")
-            n = _associate_media(b, maps, evidence_dst=ed,
-                                 cache_dst=os.path.join(root, "out", "cache"))
-            self.assertEqual(n, {"evidence": 0, "cache": 0})
-            self.assertFalse(os.path.exists(ed))
-
-    def test_assembler_points_the_report_at_the_populated_roots(self):
-        """A regression guard: cache_root=None rendered blank evidence pages."""
+    def _src(self, fn=None):
         from orchestrator import global_assembler as ga
-        src = inspect.getsource(ga.assemble)
-        self.assertIn("evidence_root=global_evidence", src)
+        return inspect.getsource(fn or ga)
+
+    def test_wagon_regions_are_passed_to_fusion(self):
+        """The confirmed omission: run_global_count.py:932 passes these."""
+        from orchestrator import global_assembler as ga
+        src = self._src(ga.assemble)
+        self.assertIn("wagon_regions=support_regions", src)
+        self.assertIn("_load_wagon_region(", src)
+
+    def test_support_order_follows_all_cameras(self):
+        """Batch builds support from ALL_CAMERAS, not dict insertion order."""
+        src = self._src()
+        self.assertIn("for c in all_cameras", src)
+
+    def test_stage_order_matches_batch(self):
+        from orchestrator import global_assembler as ga
+        src = self._src(ga.assemble)
+        seq = ["assemble_global_train_state_master_fixed",
+               "wagon_cache_builder.build",
+               "_FEATURE_ORDER",
+               "wagon_state_builder.build",
+               "combined_train_report"]
+        pos = [src.index(tok) for tok in seq]
+        self.assertEqual(pos, sorted(pos), f"stages out of order: {seq}")
+
+    def test_load_runs_before_damage(self):
+        """damage reads the sibling load JSON to drop floor_damage on LOADED."""
+        from orchestrator.global_assembler import _FEATURE_ORDER
+        names = [n for n, _e in _FEATURE_ORDER]
+        self.assertEqual(names[0], "load")
+        self.assertLess(names.index("load"), names.index("damage"))
+
+    def test_strides_match_the_approved_values(self):
+        from orchestrator.global_assembler import _FEATURE_ORDER
+        got = {n: e["sample_stride"] for n, e in _FEATURE_ORDER}
+        self.assertEqual(got, {"door": 3, "damage": 3, "load": 2})
+        for _n, e in _FEATURE_ORDER:
+            self.assertEqual(e["inference_mode"], "sampled")
+
+    def test_no_ocr_in_assembly(self):
+        from orchestrator.global_assembler import _FEATURE_ORDER
+        self.assertNotIn("ocr", [n for n, _e in _FEATURE_ORDER])
+
+    def test_features_run_over_the_global_state(self):
+        """Not over camera-local segments -- that was the divergence."""
+        from orchestrator import global_assembler as ga
+        src = self._src(ga.assemble)
+        self.assertIn("feature_kwargs = dict(state=state", src)
         self.assertIn("cache_root=global_cache", src)
-        self.assertNotIn("cache_root=None", src)
 
+    def test_no_stage1_runs_during_assembly(self):
+        """Tracking, stitching, validation and classification are READ BACK.
 
-class TestNoInferenceDuringAssembly(unittest.TestCase):
-    def test_assembler_source_invokes_no_detector(self):
-        from orchestrator import global_assembler as ga
-        src = inspect.getsource(ga)
-        for banned in ("door_proc", "damage_proc", "load_proc",
-                       "load_yolo", "ultralytics", "from features.door",
-                       "from features.damage", "from features.load"):
+        Feature detectors are expected here now; Stage-1 ones never are.
+        """
+        src = self._src()
+        for banned in ("GapTracker", "reassemble_fragments",
+                       "validate_gap_events", "renumber_gap_events",
+                       "recover_wagon_active_candidates",
+                       "apply_temporal_classification", "classify_segments",
+                       "MasterClassifier", "segments_from_gaps",
+                       "process_video", "ultralytics"):
             with self.subTest(token=banned):
                 self.assertNotIn(banned, src)
 
-    def test_relabelling_only_moves_files(self):
-        """No model object is ever constructed or called during relabelling."""
-        from orchestrator.global_assembler import _relabel_feature_evidence
-        src = inspect.getsource(_relabel_feature_evidence)
-        parts = src.split('"""')          # drop the docstring: it says
-        code = parts[0] + "".join(parts[2:])   # "No inference." in prose
-        for banned in ("YOLO", "predict", "infer", "model("):
-            with self.subTest(token=banned):
-                self.assertNotIn(banned, code)
+    def test_the_overlap_mapper_is_diagnostic_only(self):
+        """It must not decide where any feature frame goes."""
+        from orchestrator import global_assembler as ga
+        src = self._src(ga.assemble)
+        i = src.index("map_segments_to_global(")
+        j = src.index("wagon_cache_builder.build(")
+        self.assertLess(i, j)
+        # the block is labelled as diagnostic in the comment above the call
+        self.assertIn("diagnostic", src[max(0, i - 700):j].lower())
+        # nothing derived from the mapping may reach the feature stage
+        after = src[j:]
+        for tok in ("maps", "mapping_by_camera["):
+            self.assertNotIn(f"{tok})", after)
+
+    def test_relabelling_machinery_is_gone(self):
+        from orchestrator import global_assembler as ga
+        for name in ("_relabel_feature_evidence", "_associate_media",
+                     "_merge_payloads", "_link_or_copy"):
+            with self.subTest(symbol=name):
+                self.assertFalse(hasattr(ga, name),
+                                 f"{name} should have been removed")
+
+    def test_materializer_is_called_with_resolved_offsets(self):
+        from orchestrator import global_assembler as ga
+        src = self._src(ga.assemble)
+        self.assertIn("camera_offsets=resolved", src)
+        self.assertIn("per_camera_fps=per_camera_fps", src)
+        self.assertIn("video_paths=video_paths", src)
+
+
+class TestCameraLocalFeaturesAreOptIn(unittest.TestCase):
+    """Camera-time inference is off by default; that default is equivalence."""
+
+    def test_default_is_off(self):
+        from orchestrator.camera_runner import run_camera
+        p = inspect.signature(run_camera).parameters
+        self.assertIn("camera_local_features", p)
+        self.assertIs(p["camera_local_features"].default, False)
+
+    def test_plan_is_empty_unless_enabled(self):
+        from orchestrator import camera_runner
+        src = inspect.getsource(camera_runner.run_camera)
+        self.assertIn("if camera_local_features else []", src)
+
+    def test_the_harness_does_not_enable_it(self):
+        import importlib
+        import sys as _sys
+        bench = os.path.join(V4_ROOT, "benchmarks")
+        if bench not in _sys.path:
+            _sys.path.insert(0, bench)
+        h = importlib.import_module("run_sequential_arrivals")
+        self.assertNotIn("camera_local_features",
+                         inspect.getsource(h.main))
 
 
 class TestProtectedAndAdditive(unittest.TestCase):

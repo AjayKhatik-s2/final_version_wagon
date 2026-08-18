@@ -1,25 +1,42 @@
 """Sequential mode: global assembly from SEALED camera bundles.
 
-Runs only once the required camera evidence exists. It reconstructs each
-camera's tracks from its bundle, applies the EXISTING fixed-master fusion,
-maps every camera-local segment onto a `GW_n`, relabels the ALREADY-COMPUTED
-feature evidence, fuses, and emits the combined report.
+This stage IS the old batch pipeline from Stage 2 onward, run late. Once every
+camera has arrived and persisted its Stage-1 output, assembly performs exactly
+what `run_global_count.py` STEP 3 and `master_runner.process_batch` Stages 2-5
+did, in the same order, with the same functions and arguments:
 
-HARD RULE: no detector runs here. Door/Damage/Load inference happened while
-each camera was being processed; assembly only moves and fuses files. A test
-asserts zero YOLO calls during this stage.
+    STEP 3   gf.assemble_global_train_state_master_fixed(..., wagon_regions=)
+    Stage 2  materializer.wagon_cache_builder.build(...)
+    Stage 3  features load -> {door, damage}      (load first, as in batch)
+    Stage 4  fusion.wagon_state_builder.build(...)
+    Stage 5  reporting.combined_train_report.build(...)
 
-Nothing under wagon_count/, reconstruction/ or fusion/ is modified, and the
-existing global report builder is used unchanged.
+Two things follow from that, and they are the whole point of this module:
+
+  * Support-camera evidence is bucketed by the materializer's arithmetic --
+    `local_frame = round((GW.time - delta) * local_fps)` -- NOT by matching a
+    camera's own local segments against the global wagons. The old pipeline has
+    no local->global segment matcher, so neither does this one. The overlap
+    mapper is retained ONLY to write a diagnostic audit file; nothing reads it.
+
+  * Feature inference therefore runs HERE, not at camera arrival: a support
+    camera's clock offset is unknowable until the master and that camera have
+    both been seen, so its feature windows cannot be known earlier. This is not
+    a Stage-1 re-run -- no gap model, tracker, stitching, validation or
+    classification executes in this module. Those results are read back from
+    the bundles.
+
+Nothing under wagon_count/, reconstruction/, fusion/, materializer/ or
+reporting/ is modified; every one of them is called exactly as batch calls it.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -47,8 +64,10 @@ class AssemblyResult:
     sealed_cameras: List[str] = field(default_factory=list)
     failed_cameras: List[str] = field(default_factory=list)
     mapping_by_camera: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    relabelled: Dict[str, int] = field(default_factory=dict)
-    media_linked: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    wagon_regions_applied: List[str] = field(default_factory=list)
+    cache_summary: Any = None
+    feature_summary: Dict[str, Any] = field(default_factory=dict)
+    missing_cameras: List[str] = field(default_factory=list)
     timings: Dict[str, float] = field(default_factory=dict)
     state_json_path: str = ""
     report_pdf_path: str = ""
@@ -73,244 +92,69 @@ def _load_master_classifications(bundle: CameraEvidenceBundle) -> List[Any]:
     return out
 
 
-def _relabel_feature_evidence(
-    bundle: CameraEvidenceBundle, mappings, states_root: str,
-) -> int:
-    """Copy per-LOCAL-segment feature JSON onto its GLOBAL wagon id.
+def _load_wagon_region(bundle: CameraEvidenceBundle):
+    """Rebuild this camera's `LocalWagonRegion` from its bundle.
 
-    Pure file movement -- the payload is rewritten only to carry the new
-    `global_id` and an audit trail of where it came from. No inference.
-    Several locals landing on one GW (MANY_TO_ONE) do not overwrite each
-    other silently: the first wins and the rest are recorded in
-    `merged_from`, so nothing is lost.
+    STEP 2b of `run_global_count.py` classifies every SUPPORT camera and builds
+    a `train_structure.LocalWagonRegion`, which STEP 3 passes to fusion as
+    `wagon_regions=`. Fusion uses it to keep engine / brake-van observations out
+    of wagon alignment -- `global_fusion.filter_observations_to_wagon_region`,
+    whose output "IS the canonical sequence given to the DP".
+
+    Sequential mode already computes the identical region at camera time
+    (`camera_pipeline.run_support_camera` -> `ts.build_local_wagon_region`) and
+    persists it. This reads it back verbatim; the dataclass has no from_dict, so
+    the fields are restored explicitly and any unknown key is ignored rather
+    than silently dropping the whole region.
     """
-    n = 0
-    by_local = {m.local_id: m for m in mappings}
-    feat_dir = os.path.join(bundle.dir, "features")
-    if not os.path.isdir(feat_dir):
-        return 0
-    for feature in sorted(os.listdir(feat_dir)):
-        src_dir = os.path.join(feat_dir, feature)
-        if not os.path.isdir(src_dir):
-            continue
-        dst_dir = os.path.join(states_root, feature)
-        for fn in sorted(os.listdir(src_dir)):
-            if not fn.endswith(".json"):
-                continue
-            local_id = fn[:-5]
-            m = by_local.get(local_id)
-            if m is None or not m.global_id:
-                continue                      # UNMATCHED -> never invented
-            try:
-                with open(os.path.join(src_dir, fn), "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                continue
-            payload["global_id"] = m.global_id
-            payload.setdefault("_sequential_audit", {})
-            payload["_sequential_audit"].update({
-                "source_local_id": local_id,
-                "source_camera": m.camera_id,
-                "mapping_kind": m.kind,
-                "overlap_fraction": m.overlap_fraction,
-                "offset_applied": m.offset_applied,
-            })
-            # Created lazily: an all-UNMATCHED camera must leave no empty
-            # feature directory behind to be mistaken for "ran, found nothing".
-            os.makedirs(dst_dir, exist_ok=True)
-            dst = os.path.join(dst_dir, f"{m.global_id}.json")
-            if os.path.exists(dst):
-                # Another camera already reported this wagon. Each camera saw
-                # only its own half, so MERGE rather than keep the first --
-                # see _merge_payloads().
-                try:
-                    with open(dst, "r", encoding="utf-8") as f:
-                        existing = json.load(f)
-                except (OSError, json.JSONDecodeError):
-                    continue
-                merged = _merge_payloads(feature, existing, payload)
-                merged.setdefault("_sequential_audit", {}) \
-                      .setdefault("merged_from", []).append({
-                          "local_id": local_id, "camera": m.camera_id,
-                          "mapping_kind": m.kind})
-                try:
-                    with open(dst, "w", encoding="utf-8") as f:
-                        json.dump(merged, f, indent=2, default=str)
-                except OSError:
-                    pass
-                continue
-            with open(dst, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, default=str)
-            n += 1
-    return n
+    from train_structure import LocalWagonRegion
+
+    d = bundle.read_json("wagon_region.json")
+    if not isinstance(d, dict) or not d.get("camera_id"):
+        return None
+    return LocalWagonRegion(
+        camera_id=str(d.get("camera_id") or bundle.camera_id),
+        classifier_model=str(d.get("classifier_model") or ""),
+        found=bool(d.get("found", False)),
+        reason=str(d.get("reason") or ""),
+        start_time=(None if d.get("start_time") is None
+                    else float(d["start_time"])),
+        end_time=(None if d.get("end_time") is None
+                  else float(d["end_time"])),
+        start_frame=(None if d.get("start_frame") is None
+                     else int(d["start_frame"])),
+        end_frame=(None if d.get("end_frame") is None
+                   else int(d["end_frame"])),
+        class_counts=dict(d.get("class_counts") or {}),
+        segment_labels=list(d.get("segment_labels") or []),
+        unmapped_classes=list(d.get("unmapped_classes") or []),
+    )
 
 
-def _is_real(v) -> bool:
-    """A feature value that actually carries a reading."""
-    return bool(v) and v != C.NO_DATA
+#: Stage-3 order and per-feature arguments, identical to master_runner's.
+#: LOAD first -- the damage processor reads the sibling load JSON.
+DOOR_STRIDE = 3
+DAMAGE_STRIDE = 3
+LOAD_STRIDE = 2
+
+_FEATURE_ORDER = (
+    ("load",   dict(inference_mode="sampled", sample_stride=LOAD_STRIDE)),
+    ("door",   dict(inference_mode="sampled", sample_stride=DOOR_STRIDE)),
+    ("damage", dict(inference_mode="sampled", sample_stride=DAMAGE_STRIDE)),
+)
 
 
-def _union(a, b) -> List[str]:
-    out = list(a or [])
-    for x in (b or []):
-        if x not in out:
-            out.append(x)
-    return out
-
-
-def _merge_payloads(feature: str, base: Dict[str, Any],
-                    new: Dict[str, Any]) -> Dict[str, Any]:
-    """Combine two camera-local payloads describing the SAME global wagon.
-
-    In batch mode ONE processor invocation read every relevant camera and
-    combined them itself: `features/door/processor.py` calls
-    `_one_camera(LEFT_UP)` and `_one_camera(RIGHT_UP)`, and the load/damage
-    processors loop over `C.TOP_CAMERAS`.
-
-    Sequential mode runs the same processors against ONE camera's cache at a
-    time, so each camera emits only its own half: RIGHT_UP fills `right_door`
-    and leaves `left_door` NO_DATA, LEFT_UP the reverse; each top camera
-    reports only what it saw. Keeping the first writer would therefore DROP
-    the second camera's readings -- every wagon's left door would come back
-    NO_DATA in the global report.
-
-    This reproduces the processors' OWN precedence rules and adds none:
-
-      door    left_* comes from LEFT_UP, right_* from RIGHT_UP -- disjoint by
-              construction, so the merge is per side. If both somehow carry a
-              reading, the higher confidence wins.
-      load    RIGHT_UP_TOP is authoritative, LEFT_UP_TOP is the fallback
-              (features/load/processor.py: "RIGHT_UP_TOP authoritative when
-              present; LEFT_UP_TOP supports").
-      damage  any top camera reporting DAMAGE wins
-              (features/damage/processor.py: `any_damage`).
-
-    No inference, no thresholds -- only choosing between values already
-    computed on disk.
-    """
-    m = dict(base)
-    if C.STATUS_OK in (base.get("status"), new.get("status")):
-        m["status"] = C.STATUS_OK
-    m["supporting_cameras"] = _union(base.get("supporting_cameras"),
-                                     new.get("supporting_cameras"))
-    for k in ("frame_count", "frames_left", "frames_right"):
-        if k in base or k in new:
-            m[k] = int(base.get(k) or 0) + int(new.get(k) or 0)
-    if base.get("tracks") is not None or new.get("tracks") is not None:
-        m["tracks"] = list(base.get("tracks") or []) + list(new.get("tracks") or [])
-    # Slot names are side/camera specific, so the first writer keeps its slot
-    # and the other camera's slots are added alongside it.
-    if base.get("evidence") or new.get("evidence"):
-        m["evidence"] = {**(new.get("evidence") or {}),
-                         **(base.get("evidence") or {})}
-    if base.get("per_camera") or new.get("per_camera"):
-        m["per_camera"] = {**(new.get("per_camera") or {}),
-                           **(base.get("per_camera") or {})}
-
-    if feature == "door":
-        for side in ("left", "right"):
-            key, ckey = f"{side}_door", f"{side}_door_confidence"
-            b_ok, n_ok = _is_real(base.get(key)), _is_real(new.get(key))
-            take_new = n_ok and (
-                not b_ok
-                or float(new.get(ckey) or 0.0) > float(base.get(ckey) or 0.0))
-            if take_new:
-                m[key] = new[key]
-                m[ckey] = new.get(ckey, 0.0)
-    elif feature == "load":
-        b_ok, n_ok = (_is_real(base.get("load_status")),
-                      _is_real(new.get("load_status")))
-        auth = C.CAMERA_RIGHT_UP_TOP
-        new_is_auth = auth in (new.get("supporting_cameras") or [])
-        base_is_auth = auth in (base.get("supporting_cameras") or [])
-        if n_ok and (not b_ok or (new_is_auth and not base_is_auth)):
-            m["load_status"] = new["load_status"]
-            m["load_confidence"] = new.get("load_confidence", 0.0)
-    elif feature == "damage":
-        b_dmg = base.get("top_damage") == C.DAMAGE_PRESENT
-        n_dmg = new.get("top_damage") == C.DAMAGE_PRESENT
-        if n_dmg and not b_dmg:
-            m["top_damage"] = C.DAMAGE_PRESENT
-            m["top_damage_confidence"] = new.get("top_damage_confidence", 0.0)
-        elif not b_dmg and not _is_real(base.get("top_damage")) \
-                and _is_real(new.get("top_damage")):
-            m["top_damage"] = new["top_damage"]
-            m["top_damage_confidence"] = new.get("top_damage_confidence", 0.0)
-        if b_dmg or n_dmg:
-            m["top_damage_details"] = _union(base.get("top_damage_details"),
-                                             new.get("top_damage_details"))
+def _feature_module(name: str):
+    """Import a feature processor lazily, so assembly costs nothing if unused."""
+    if name == "load":
+        from features.load import processor as m
+    elif name == "door":
+        from features.door import processor as m
+    elif name == "damage":
+        from features.damage import processor as m
+    else:
+        raise ValueError(f"unknown feature {name!r}")
     return m
-
-
-def _link_or_copy(src: str, dst: str) -> bool:
-    """Hardlink `src` to `dst`, copying only if the filesystem refuses.
-
-    Frame crops and cache frames are the bulk of a run's disk footprint, and
-    the previous experiment filled the root volume. A hardlink costs an inode,
-    not a frame, so the global view of the evidence is free. Existing files
-    are never overwritten.
-    """
-    if os.path.exists(dst):
-        return False
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    try:
-        os.link(src, dst)
-        return True
-    except (OSError, AttributeError, NotImplementedError):
-        try:
-            shutil.copy2(src, dst)
-            return True
-        except OSError:
-            return False
-
-
-def _associate_media(
-    bundle: CameraEvidenceBundle, mappings, *,
-    evidence_dst: str, cache_dst: str,
-) -> Dict[str, int]:
-    """Give the ALREADY-GENERATED image evidence its global name.
-
-    The combined report resolves evidence as
-    `<evidence_root>/<GW_n>/<feature>/<slot>.jpg` and cache frames as
-    `<cache_root>/<GW_n>/<camera_folder>/*.jpg`. Sequential mode wrote both
-    under CAMERA-LOCAL ids inside each bundle, so without this step the global
-    report renders with empty evidence pages -- a regression against the batch
-    pipeline rather than a design choice.
-
-    Pure file linking, mirroring `_relabel_feature_evidence`: UNMATCHED
-    segments are never invented into a global id, first writer wins on a
-    MANY_TO_ONE collision, and nothing in the bundle is moved or deleted --
-    the camera-local PDFs keep resolving afterwards.
-    """
-    n = {"evidence": 0, "cache": 0}
-    for m in mappings:
-        if not m.global_id:
-            continue                          # UNMATCHED -> never invented
-        src_ev = os.path.join(bundle.dir, "evidence", m.local_id)
-        if os.path.isdir(src_ev):
-            for feature in sorted(os.listdir(src_ev)):
-                fd = os.path.join(src_ev, feature)
-                if not os.path.isdir(fd):
-                    continue
-                for fn in sorted(os.listdir(fd)):
-                    if _link_or_copy(os.path.join(fd, fn),
-                                     os.path.join(evidence_dst, m.global_id,
-                                                  feature, fn)):
-                        n["evidence"] += 1
-        # Cache frames are already per camera folder, so two cameras landing
-        # on the same GW cannot collide.
-        src_ca = os.path.join(bundle.dir, "camera_cache", m.local_id)
-        if os.path.isdir(src_ca):
-            for folder in sorted(os.listdir(src_ca)):
-                cd = os.path.join(src_ca, folder)
-                if not os.path.isdir(cd):
-                    continue
-                for fn in sorted(os.listdir(cd)):
-                    if _link_or_copy(os.path.join(cd, fn),
-                                     os.path.join(cache_dst, m.global_id,
-                                                  folder, fn)):
-                        n["cache"] += 1
-    return n
 
 
 def assemble(
@@ -318,6 +162,7 @@ def assemble(
     evidence_root: str,
     output_root: str,
     batch_key: str,
+    feat_models_dir: str = "",
     master_camera: str = C.MASTER_CAMERA,
     all_cameras: Tuple[str, ...] = C.ALL_CAMERAS,
     verbose: bool = True,
@@ -327,6 +172,8 @@ def assemble(
 
     res = AssemblyResult()
     t_all = time.perf_counter()
+    feat_models_dir = feat_models_dir or os.path.join(_ROOT, "models",
+                                                      "features")
 
     ok, why = ready_for_global_assembly(evidence_root, master_camera,
                                         all_cameras)
@@ -353,15 +200,40 @@ def assemble(
         return res
     res.timings["load_bundles"] = round(time.perf_counter() - t0, 3)
 
-    # ---- existing fixed-master fusion, unchanged -----------------------
+    # ---- STEP 3: existing fixed-master fusion, called as batch calls it ----
+    # Support-camera wagon regions are restored from the bundles and passed
+    # through, exactly as run_global_count.py STEP 3 does. Without them the
+    # engine / brake-van observations of a support camera stay in the DP
+    # alignment and displace correct matches -- the count is unaffected
+    # (offsets are estimated pre-filter, by design) but the per-wagon evidence
+    # association is not.
+    support_regions: Dict[str, Any] = {}
+    for c in res.sealed_cameras:
+        if c == master_camera:
+            continue                       # master has no support region
+        region = _load_wagon_region(bundles[c])
+        if region is not None:
+            support_regions[c] = region
+    res.wagon_regions_applied = sorted(support_regions)
+    if verbose:
+        missing = [c for c in res.sealed_cameras
+                   if c != master_camera and c not in support_regions]
+        print(f"[ASSEMBLY] wagon regions restored: {res.wagon_regions_applied}"
+              + (f"  MISSING: {missing}" if missing else ""))
+
+    # Support order follows ALL_CAMERAS, as batch does, not dict insertion.
+    support = [tracks[c] for c in all_cameras
+               if c != master_camera and c in tracks]
+
     t0 = time.perf_counter()
     engine_state = gf.assemble_global_train_state_master_fixed(
         master_tracks=tracks[master_camera],
-        support_tracks=[t for c, t in tracks.items() if c != master_camera],
+        support_tracks=support,
         initial_classifications=_load_master_classifications(
             bundles[master_camera]),
         config=gf.FusionConfig(),
         verbose=verbose,
+        wagon_regions=support_regions,
         wagon_only=True,
     )
     res.timings["fusion_alignment"] = round(time.perf_counter() - t0, 3)
@@ -386,9 +258,15 @@ def assemble(
     offsets_meta = state.camera_offsets or {}
     resolved = state.camera_time_offsets()
 
-    # ---- map local -> global, then relabel evidence --------------------
+    # ---- DIAGNOSTIC ONLY: local segment -> global wagon audit -----------
+    # This mapping is NOT how evidence is assigned. The old pipeline has no
+    # local->global segment matcher; frames are bucketed by the materializer's
+    # arithmetic below. The audit is written so a run can be compared against
+    # the batch reference, and nothing downstream reads it.
     t0 = time.perf_counter()
-    audit: Dict[str, Any] = {}
+    audit: Dict[str, Any] = {"_note": ("diagnostic only -- evidence assignment "
+                                       "is done by the materializer, not by "
+                                       "this mapping")}
     for c in res.sealed_cameras:
         segs = bundles[c].read_segments()
         is_resolved = (offsets_meta.get(c, {}) or {}).get(
@@ -399,17 +277,67 @@ def assemble(
         summary = mapping_summary(maps)
         res.mapping_by_camera[c] = summary
         audit[c] = {"summary": summary, "mappings": [m.to_dict() for m in maps]}
-        res.relabelled[c] = _relabel_feature_evidence(bundles[c], maps,
-                                                      states_root)
-        res.media_linked[c] = _associate_media(
-            bundles[c], maps, evidence_dst=global_evidence,
-            cache_dst=global_cache)
     with open(os.path.join(gs_dir, "local_to_global_mapping.json"), "w",
               encoding="utf-8") as f:
         json.dump(audit, f, indent=2, default=str)
-    res.timings["mapping_relabel"] = round(time.perf_counter() - t0, 3)
+    res.timings["mapping_audit"] = round(time.perf_counter() - t0, 3)
 
-    # ---- fuse + combined report (existing builders, unchanged) ---------
+    # ---- Stage 2: materializer, byte-for-byte the batch call ------------
+    # `local_frame = round((GW.time - delta) * local_fps)` is the ONLY rule the
+    # old pipeline uses to decide which of a camera's frames belong to a global
+    # wagon. Source videos come from each bundle's manifest, so no Stage-1 work
+    # is repeated -- this decodes frames, nothing else.
+    from materializer import wagon_cache_builder
+
+    video_paths: Dict[str, str] = {}
+    per_camera_fps: Dict[str, float] = {}
+    for c in res.sealed_cameras:
+        mf = bundles[c].load_manifest()
+        if mf.video_path and os.path.exists(mf.video_path):
+            video_paths[c] = mf.video_path
+            per_camera_fps[c] = float(mf.fps or 0.0)
+        else:
+            res.missing_cameras.append(c)
+            print(f"[ASSEMBLY] {c}: source video unavailable "
+                  f"({mf.video_path!r}) -- no cache for this camera")
+
+    t0 = time.perf_counter()
+    res.cache_summary = wagon_cache_builder.build(
+        state=state,
+        video_paths=video_paths,
+        per_camera_fps=per_camera_fps,
+        cache_root=global_cache,
+        camera_offsets=resolved,
+        verbose=verbose,
+    )
+    res.timings["stage2_materializer"] = round(time.perf_counter() - t0, 3)
+
+    # ---- Stage 3: feature inference over the GLOBAL wagons --------------
+    # Same processors, same strides, same order as master_runner: LOAD runs to
+    # completion first so the damage processor's loaded-wagon floor-damage
+    # filter always reads a fully-written wagon_states/load/<gw>.json.
+    feature_kwargs = dict(state=state, cache_root=global_cache,
+                          feature_models_dir=feat_models_dir,
+                          output_dir=states_root,
+                          evidence_root=global_evidence, verbose=verbose)
+    t0 = time.perf_counter()
+    for name, extra in _FEATURE_ORDER:
+        try:
+            mod = _feature_module(name)
+        except Exception as e:
+            print(f"[ASSEMBLY/{name}] unavailable: {e}")
+            continue
+        t1 = time.perf_counter()
+        try:
+            res.feature_summary[name] = mod.run(**feature_kwargs, **extra) or {}
+        except Exception as e:
+            print(f"[ASSEMBLY/{name}] CRASHED: {e}")
+            traceback.print_exc(limit=3)
+            res.feature_summary[name] = {}
+        res.timings[f"stage3_{name}"] = round(time.perf_counter() - t1, 3)
+    res.timings["stage3_features"] = round(time.perf_counter() - t0, 3)
+
+    # ---- Stage 4: fuse (existing builder, unchanged) --------------------
     t0 = time.perf_counter()
     from fusion import wagon_state_builder
     unified = wagon_state_builder.build(state=state,
@@ -426,7 +354,9 @@ def assemble(
             processed_video_urls={},
             evidence_root=global_evidence,
             wagon_states_root=states_root, cache_root=global_cache,
-            missing_cameras=list(res.failed_cameras), camera_pdf_urls={},
+            missing_cameras=sorted(set(res.failed_cameras)
+                                   | set(res.missing_cameras)),
+            camera_pdf_urls={},
             logo_path=os.path.join(_ROOT, "reporting", "assets", "Logo.jpeg"),
             verbose=verbose)
         res.report_json_path = out.get("json_path") or ""
@@ -440,7 +370,8 @@ def assemble(
         print(f"[ASSEMBLY] wagons={res.total_wagons} "
               f"sealed={res.sealed_cameras} failed={res.failed_cameras}")
         for c, s in res.mapping_by_camera.items():
-            ml = res.media_linked.get(c, {})
-            print(f"  {c:<13} {s['by_kind']}  relabelled={res.relabelled.get(c, 0)}"
-                  f"  evidence={ml.get('evidence', 0)} cache={ml.get('cache', 0)}")
+            print(f"  {c:<13} {s['by_kind']}   (diagnostic)")
+        print(f"  wagon regions applied : {res.wagon_regions_applied}")
+        for k, v in sorted(res.feature_summary.items()):
+            print(f"  feature {k:<8} wagons={len(v)}")
     return res
