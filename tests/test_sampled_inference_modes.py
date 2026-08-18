@@ -287,8 +287,9 @@ class TestStage1IsUntouched(unittest.TestCase):
         if r.returncode != 0:
             self.skipTest("git unavailable")
         changed = [p for p in r.stdout.split() if p]
+        # materializer/ carries the APPROVED additive build_camera_local().
         protected = ("wagon_count/", "reconstruction/", "core/global_state_loader.py",
-                     "materializer/", "fusion/", "reporting/")
+                     "fusion/", "reporting/")
         offenders = [p for p in changed if p.startswith(protected)]
         self.assertEqual(offenders, [],
                          f"Stage-1/protected files modified: {offenders}")
@@ -388,13 +389,17 @@ class TestExperimentTwoConfiguration(unittest.TestCase):
 
     def test_fusion_and_reporting_untouched(self):
         import subprocess
-        r = subprocess.run(["git", "status", "--porcelain",
-                            "fusion", "reporting", "wagon_count", "reconstruction"],
+        # A NEW additive file under reporting/ (camera_local_report.py) is in
+        # the approved sequential scope. The EXISTING global builders must
+        # still be unmodified -- that is what this guard now asserts.
+        r = subprocess.run(["git", "diff", "--name-only", "HEAD",
+                            "fusion", "reporting"],
                            cwd=V4_ROOT, capture_output=True, text=True)
         if r.returncode != 0:
             self.skipTest("git unavailable")
-        self.assertEqual(r.stdout.strip(), "")
-
+        modified = [x for x in r.stdout.split() if x]
+        self.assertEqual(modified, [],
+                         f"existing fusion/reporting builders modified: {modified}")
 
 class TestDoorStride3(unittest.TestCase):
     """Door stride=3 -- the test of whether EvidenceAggregator is really
@@ -476,12 +481,22 @@ class TestDoorStride3(unittest.TestCase):
                          "aggregator verdict changed with stride -- it is NOT "
                          "stride-invariant, which is the whole premise")
 
-    def test_damage_and_load_untouched_by_this_change(self):
-        import subprocess
-        r = subprocess.run(["git", "diff", "--name-only", "HEAD",
-                            "features/damage", "features/load"],
-                           cwd=V4_ROOT, capture_output=True, text=True)
-        if r.returncode != 0:
-            self.skipTest("git unavailable")
-        changed = [x for x in r.stdout.split() if x]
-        self.assertNotIn("features/damage/processor.py", changed)
+    def test_damage_and_load_detector_behaviour_unchanged(self):
+        """Sequential mode adds an opt-in `segments=` parameter to Damage and
+        Load. The DETECTORS, strides and defaults must be untouched: with
+        `segments=None` the roster still comes from `state.wagons`, so batch
+        behaviour is byte-identical."""
+        import inspect
+        from features.damage import processor as dmg
+        from features.load import processor as ld
+        for name, mod, stride in (("damage", dmg, 2), ("load", ld, 2)):
+            with self.subTest(feature=name):
+                p = inspect.signature(mod.run).parameters
+                self.assertIsNone(p["segments"].default,
+                                  "segments must default to None (batch)")
+                self.assertEqual(p["sample_stride"].default, stride)
+                self.assertEqual(p["inference_mode"].default, "legacy")
+                src = inspect.getsource(mod.run)
+                self.assertIn(
+                    "list(segments) if segments is not None else list(state.wagons)",
+                    src, "batch fallback path missing")

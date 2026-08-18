@@ -384,6 +384,58 @@ never drawn in the processed videos.
 | load_status            | RIGHT_UP_TOP (LEFT_UP_TOP fall) |
 | top_damage             | any TOP camera reporting DAMAGE |
 
+## Sequential mode (EXPERIMENTAL, opt-in)
+
+`--mode batch` is the **default** and is the proven `process_batch()` path,
+unchanged. `--mode sequential` is an experimental architecture in which each
+camera is processed and sealed **independently**, then a global assembly step
+fuses the persisted evidence.
+
+```
+CAMERA ARRIVES (one at a time, own process)
+  GapTracker -> fragment stitching -> gap validation -> temporal
+  classification -> segments_from_gaps          (the proven Stage-1 chain)
+    -> camera_cache/<CAM>/L_<CAM>_<n>/...       (local materialization)
+    -> Door | Load | Damage on LOCAL segments   (3 / 3 / 2, unchanged)
+    -> camera_evidence/<CAM>/ + <CAM>_report.pdf
+    -> SEALED                                   (never waits for a camera)
+
+ALL REQUIRED BUNDLES SEALED
+  fixed-master fusion -> GW_1..GW_N
+    -> map L_<CAM>_<n> -> GW_n  (EXACT / MANY_TO_ONE / ONE_TO_MANY /
+                                 UNMATCHED / UNRESOLVED_OFFSET, all audited)
+    -> relabel persisted evidence   (NO detector re-runs)
+    -> fusion -> combined_train_report.{pdf,json}
+```
+
+Each camera runs only the features it is **authoritative** for: Door on the
+side cameras, Load and Damage on the top cameras.
+
+```bash
+# full sequential pipeline
+python -m orchestrator.master_runner --mode sequential     --local-inputs ./local_inputs --no-interactive --disable-features ocr
+
+# arrival simulation: four SEPARATE processes, with filesystem assertions
+# between arrivals proving no camera waits for another
+python benchmarks/run_sequential_arrivals.py --local-inputs ./local_inputs
+```
+
+Output lands in `batch_outputs/sequential_<YYYYMMDD_HHMMSS>/`; existing batches
+are never touched. Camera-local reports use **local ids only** (`L_RIGHT_UP_1`)
+— a `GW_n` is never invented before assembly.
+
+| Component | Role |
+|---|---|
+| `orchestrator/camera_pipeline.py` | literal extraction of the per-camera Stage-1 order |
+| `orchestrator/camera_runner.py` | one camera, `PENDING -> SEALED`, failure-isolated |
+| `orchestrator/global_assembler.py` | fusion + mapping + relabel + combined report |
+| `core/camera_evidence.py` | bundle, lifecycle, local→global mapping audit |
+| `core/camera_tracks_io.py` | lossless `LocalCameraTracks` persistence |
+| `reporting/camera_local_report.py` | camera-local PDF (additive; global builders untouched) |
+
+**Status: experimental.** The assembler's fusion path has not yet been
+exercised end-to-end on real four-camera input.
+
 ## Counting authority (Stage 1)
 
 `wagon_count/` is the **only** component allowed to detect gaps, count, assign

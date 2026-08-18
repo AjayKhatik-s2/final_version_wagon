@@ -785,6 +785,83 @@ def run_local(
 
 
 # -----------------------------------------------------------------------------
+# SEQUENTIAL MODE (opt-in) -- one camera at a time, then global assembly
+# -----------------------------------------------------------------------------
+
+def run_sequential(
+    *,
+    local_inputs: str,
+    workspace: Optional[str] = None,
+    recon_models_dir: str = DEFAULT_RECON_MODELS_DIR,
+    feat_models_dir: str = DEFAULT_FEAT_MODELS_DIR,
+    batch_key: Optional[str] = None,
+    feature_config: Optional[FeatureConfig] = None,
+    arrival_order: Optional[List[str]] = None,
+    verbose: bool = True,
+) -> int:
+    """Process each camera independently, then assemble.
+
+    Every camera is fully persisted and SEALED before the next starts, so the
+    sequence is resumable and no camera waits on another. Global assembly runs
+    only afterwards and re-runs no detector.
+    """
+    from datetime import datetime
+    from orchestrator import camera_runner, global_assembler
+
+    if not os.path.isdir(local_inputs):
+        print(f"ERROR: {local_inputs} does not exist", file=sys.stderr)
+        return 2
+    videos = scan_local_video_dir(local_inputs)
+    order = arrival_order or list(C.ALL_CAMERAS)
+    key = batch_key or ("sequential_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+    workspace = workspace or DEFAULT_WORKSPACE_PARENT
+    evidence_root = os.path.join(workspace, key, "camera_evidence")
+    os.makedirs(evidence_root, exist_ok=True)
+    enabled = (feature_config or FeatureConfig.all_on()).enabled_keys()
+
+    print("=" * 78)
+    print(f"  SEQUENTIAL MODE  {key}")
+    print("=" * 78)
+    print(f"  arrival order : {order}")
+    print(f"  output        : {os.path.join(workspace, key)}")
+
+    t0 = time.time()
+    results = []
+    for cam in order:
+        vp = videos.get(cam)
+        if not vp:
+            print(f"--- ARRIVAL {cam}: no video, skipping ---")
+            continue
+        print(f"--- ARRIVAL {cam} ---")
+        results.append(camera_runner.run_camera(
+            camera_id=cam, video_path=vp,
+            recon_models_dir=recon_models_dir,
+            feat_models_dir=feat_models_dir,
+            evidence_root=evidence_root,
+            enabled_features=enabled, verbose=verbose))
+
+    print("--- GLOBAL ASSEMBLY ---")
+    asm = global_assembler.assemble(
+        evidence_root=evidence_root, output_root=workspace,
+        batch_key=key, verbose=verbose)
+
+    elapsed = time.time() - t0
+    print("=" * 78)
+    print(f"  SEQUENTIAL SUMMARY  {key}")
+    print("=" * 78)
+    for r in results:
+        print(f"  {r.camera_id:<13} {r.state:<8} segments={r.local_segments:<4} "
+              f"gaps={r.accepted_gaps:<4} calls={r.feature_calls} "
+              f"{r.timings.get('total', 0):.1f}s")
+    print(f"  global wagons : {asm.total_wagons}")
+    for cam, sm in asm.mapping_by_camera.items():
+        print(f"  mapping {cam:<13} {sm['by_kind']}")
+    print(f"  combined pdf  : {asm.report_pdf_path or '(none)'}")
+    print(f"  TOTAL         : {elapsed:.1f}s")
+    return 0 if asm.ready and asm.total_wagons > 0 else 3
+
+
+# -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 
@@ -840,6 +917,12 @@ def _build_parser() -> argparse.ArgumentParser:
                         "makes the stride explicit.")
     p.add_argument("--load-sample-stride", type=int, default=2,
                    help="Load frame stride when sampled (default: 2)")
+    p.add_argument("--mode", choices=("batch", "sequential"), default="batch",
+                   help="Pipeline architecture. 'batch' (DEFAULT) is the "
+                        "proven process_batch() path, unchanged. 'sequential' "
+                        "is EXPERIMENTAL: each camera is processed and sealed "
+                        "independently, then global assembly fuses the "
+                        "persisted evidence.")
     p.add_argument("--legacy-inference", action="store_true",
                    help="shorthand: force BOTH Door and Damage to legacy "
                         "every-frame tracking (pre-optimization behaviour)")
@@ -874,6 +957,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Stage-3 inference: door={_door_mode}/stride={args.door_sample_stride}"
           f"  damage={_dmg_mode}/stride={args.damage_sample_stride}"
           f"  load={_load_mode}/stride={args.load_sample_stride}")
+
+    # Sequential is opt-in and dispatches BEFORE the batch path; batch mode
+    # continues to reach the unchanged process_batch() exactly as before.
+    if args.mode == "sequential":
+        return run_sequential(
+            local_inputs=args.local_inputs, workspace=args.workspace,
+            recon_models_dir=args.recon_models_dir,
+            feat_models_dir=args.feat_models_dir,
+            batch_key=args.batch, feature_config=feature_config)
 
     if args.local_only:
         return run_local(

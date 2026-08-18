@@ -355,3 +355,54 @@ def ready_for_global_assembly(
     if pending:
         return False, f"waiting on {pending}"
     return True, "all required camera evidence available"
+
+
+# ---------------------------------------------------------------------------
+# Adapter: LocalSegment -> the shape the feature processors already iterate
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _FeatureWagonView:
+    """Duck-type of `GlobalWagon` over a camera-LOCAL segment.
+
+    The feature processors read exactly these attributes off each roster entry.
+    Presenting a local segment through the same shape means their bodies need
+    no knowledge of sequential mode: `global_id` simply carries `L_<CAM>_<n>`
+    instead of `GW_n`, and the cache key follows automatically.
+    """
+    global_id: str
+    wagon_index: int
+    classification: str
+    classification_confidence: float
+    start_frame_master: int
+    end_frame_master: int
+    start_time: float
+    end_time: float
+    supporting_cameras: Tuple[str, ...] = ()
+    split_from_global_id: Optional[str] = None
+    leading_gap: Optional[Dict[str, Any]] = None
+    trailing_gap: Optional[Dict[str, Any]] = None
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end_time - self.start_time)
+
+
+def as_feature_wagons(
+    segments: Sequence[LocalSegment], camera_id: str,
+) -> List[_FeatureWagonView]:
+    """Wrap camera-local segments so the existing feature loops accept them.
+
+    Frame numbers stay the camera's OWN absolute indices -- they are not
+    rebased, so evidence and overlays keep true frame numbering.
+    """
+    return [
+        _FeatureWagonView(
+            global_id=s.local_id, wagon_index=s.index,
+            classification=s.label, classification_confidence=s.confidence,
+            start_frame_master=s.start_frame, end_frame_master=s.end_frame,
+            start_time=s.start_time, end_time=s.end_time,
+            supporting_cameras=(camera_id,),
+        )
+        for s in segments
+    ]

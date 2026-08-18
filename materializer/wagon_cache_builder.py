@@ -281,3 +281,81 @@ def build(
             print(f"  {cam:<14} {status}")
 
     return result
+
+
+# -----------------------------------------------------------------------------
+# SEQUENTIAL MODE -- camera-local materialization
+#
+# Additive: `build()` above is untouched and remains the batch path.  This
+# variant slices ONE camera against ITS OWN local segments, so it needs no
+# GlobalTrainState and no camera offset -- a local segment's frame numbers are
+# already this camera's own absolute indices.
+#
+# Layout mirrors the batch cache so `features/_common.py` needs no change --
+# `wagon_camera_dir()` treats the id as an opaque string:
+#
+#     <cache_root>/<L_CAM_n>/<camera_folder>/frame_NNNNNN.jpg
+#
+# with `cache_root = camera_cache/<CAMERA>`.
+# -----------------------------------------------------------------------------
+
+def build_camera_local(
+    *,
+    camera_id: str,
+    video_path: str,
+    segments,                       # Sequence[core.camera_evidence.LocalSegment]
+    cache_root: str,
+    jpeg_quality: int = C.JPEG_QUALITY,
+    verbose: bool = True,
+) -> Dict[str, int]:
+    """Extract per-LOCAL-segment JPEGs for ONE camera.
+
+    Returns `{local_id -> frames_written}`.  Opens the video once and walks it
+    linearly, exactly as the batch extractor does.  NO GW id is used or
+    produced, and NO clock offset is applied: these are the camera's own frames
+    in its own numbering.
+    """
+    if not os.path.exists(video_path):
+        if verbose:
+            print(f"[SEQ/STAGE2/{camera_id}] video missing: {video_path}")
+        return {}
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        if verbose:
+            print(f"[SEQ/STAGE2/{camera_id}] cv2 could not open {video_path}")
+        return {}
+
+    cam_folder = C.CAMERA_FOLDER[camera_id]
+    frame_to_target: Dict[int, Tuple[str, str]] = {}
+    counts: Dict[str, int] = {}
+    for seg in segments:
+        dst = os.path.join(cache_root, seg.local_id, cam_folder)
+        os.makedirs(dst, exist_ok=True)
+        counts[seg.local_id] = 0
+        for f in range(int(seg.start_frame), int(seg.end_frame) + 1):
+            frame_to_target[f] = (seg.local_id, dst)
+
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)]
+    frame_idx = 0
+    written = 0
+    t0 = time.time()
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        target = frame_to_target.get(frame_idx)
+        if target is not None:
+            local_id, dst = target
+            # ORIGINAL absolute frame number preserved in the filename.
+            out_path = os.path.join(dst, f"frame_{frame_idx:06d}.jpg")
+            if cv2.imwrite(out_path, frame, encode_params):
+                counts[local_id] = counts.get(local_id, 0) + 1
+                written += 1
+        frame_idx += 1
+    cap.release()
+
+    if verbose:
+        print(f"[SEQ/STAGE2/{camera_id}] {len(counts)} local segments, "
+              f"{written} frames in {time.time() - t0:.1f}s")
+    return counts

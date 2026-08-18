@@ -59,7 +59,7 @@ from __future__ import annotations
 import os
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -606,6 +606,11 @@ def run(
     every_nth: int = 1,
     max_frames: int = 0,           # 0 = unbounded (legacy used the whole wagon)
     verbose: bool = True,
+    # SEQUENTIAL MODE (opt-in). When None -- the batch default -- the roster
+    # comes from `state.wagons` and behaviour is byte-identical to before.
+    # When supplied, these are CAMERA-LOCAL segments (L_<CAM>_<n>) presented
+    # through the same attribute shape, so the loop body below is unchanged.
+    segments: Optional[Sequence[Any]] = None,
     inference_mode: str = "legacy",
     sample_stride: int = 2,
 ) -> Dict[str, str]:
@@ -635,6 +640,9 @@ def run(
     os.makedirs(feature_out, exist_ok=True)
     timer = FeatureTimer("door")
     summary: Dict[str, str] = {}
+    # Batch: roster is the global wagon list. Sequential: caller supplies
+    # CAMERA-LOCAL segments. `segments=None` -> byte-identical to batch.
+    roster = list(segments) if segments is not None else list(state.wagons)
 
     # Pre-construct shared per-process helpers (loaded once across wagons)
     tracker_cfg  = TrackerConfig()
@@ -645,11 +653,11 @@ def run(
               f"for every wagon.")
 
     if verbose:
-        print(f"[FEAT/door] running on {len(state.wagons)} wagons "
+        print(f"[FEAT/door] running on {len(roster)} wagons "
               f"(conf>={confidence}, legacy DoorTracker + IdentityMerger + "
               f"GeometricPrior + IlluminationQuality)")
 
-    for gw in state.wagons:
+    for gw in roster:
         gw_id = gw.global_id
         t0 = time.time()
         try:

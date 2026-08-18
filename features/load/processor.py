@@ -38,7 +38,7 @@ from __future__ import annotations
 import os
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from core import constants as C
 from core.global_state_loader import GlobalTrainState
@@ -139,6 +139,11 @@ def run(
     # frames yielded, max_frames=None -> 17 (34 stable frames, every 2nd).
     # Fixed Load-side only; the shared helper is deliberately left untouched.
     max_frames: Optional[int] = None,
+    # SEQUENTIAL MODE (opt-in). When None -- the batch default -- the roster
+    # comes from `state.wagons` and behaviour is byte-identical to before.
+    # When supplied, these are CAMERA-LOCAL segments (L_<CAM>_<n>) presented
+    # through the same attribute shape, so the loop body below is unchanged.
+    segments: Optional[Sequence[Any]] = None,
     inference_mode: str = "legacy",
     sample_stride: int = 2,
     verbose: bool = True,
@@ -160,15 +165,18 @@ def run(
     os.makedirs(feature_out, exist_ok=True)
     timer = FeatureTimer("load")
     summary: Dict[str, str] = {}
+    # Batch: roster is the global wagon list. Sequential: caller supplies
+    # CAMERA-LOCAL segments. `segments=None` -> byte-identical to batch.
+    roster = list(segments) if segments is not None else list(state.wagons)
 
     if model is None and verbose:
         print(f"[FEAT/load] WARNING: {model_path} missing -- NO_DATA for all wagons.")
 
     if verbose:
-        print(f"[FEAT/load] running on {len(state.wagons)} wagons "
+        print(f"[FEAT/load] running on {len(roster)} wagons "
               f"(legacy frame-by-frame voting, >{_LOADED_RATIO_THRESHOLD:.0%} -> LOADED)")
 
-    for gw in state.wagons:
+    for gw in roster:
         gw_id = gw.global_id
         t0 = time.time()
         try:

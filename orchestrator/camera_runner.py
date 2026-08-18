@@ -1,0 +1,292 @@
+"""Sequential mode: process ONE camera, end to end, independently.
+
+A camera runs its complete proven Stage-1 chain, materializes its own local
+segments, runs the features it is authoritative for, persists a
+CameraEvidenceBundle plus a camera-local report, then SEALS.
+
+It never waits for another camera and never sees a GW id -- global wagon ids do
+not exist until global assembly. State lives on disk, so cameras may arrive
+minutes or hours apart and the process may exit in between.
+
+Nothing under wagon_count/, reconstruction/, fusion/ or reporting/ is touched;
+the Stage-1 work is delegated to orchestrator/camera_pipeline.py, which is a
+literal extraction of the proven per-camera order.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+import traceback
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+from core import constants as C
+from core.camera_evidence import (
+    CameraEvidenceBundle, CameraManifest, as_feature_wagons,
+)
+from core.camera_tracks_io import write_tracks
+from materializer import wagon_cache_builder
+from orchestrator import camera_pipeline as cp
+
+# Stage-3 configuration -- IDENTICAL to the tuned batch defaults.
+DOOR_STRIDE = 3
+DAMAGE_STRIDE = 3
+LOAD_STRIDE = 2
+
+
+@dataclass
+class CameraRunResult:
+    camera_id: str
+    state: str = "PENDING"
+    sealed: bool = False
+    failure_reason: str = ""
+    local_segments: int = 0
+    accepted_gaps: int = 0
+    rejected_gaps: int = 0
+    recovered_gaps: int = 0
+    raw_detections: int = 0
+    frames_materialized: int = 0
+    feature_calls: Dict[str, int] = field(default_factory=dict)
+    feature_summary: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    timings: Dict[str, float] = field(default_factory=dict)
+    report_path: str = ""
+    bundle_dir: str = ""
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "camera_id": self.camera_id, "state": self.state,
+            "sealed": self.sealed, "failure_reason": self.failure_reason,
+            "local_segments": self.local_segments,
+            "accepted_gaps": self.accepted_gaps,
+            "rejected_gaps": self.rejected_gaps,
+            "recovered_gaps": self.recovered_gaps,
+            "raw_detections": self.raw_detections,
+            "frames_materialized": self.frames_materialized,
+            "feature_yolo_calls": dict(self.feature_calls),
+            "timings": dict(self.timings),
+            "report_path": self.report_path,
+        }
+
+
+def _feature_frame_count(states_dir: str, feature: str) -> int:
+    """Frames inspected == YOLO calls, read from the per-segment JSON."""
+    d = os.path.join(states_dir, feature)
+    if not os.path.isdir(d):
+        return 0
+    n = 0
+    for fn in os.listdir(d):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(d, fn), "r", encoding="utf-8") as f:
+                n += int(json.load(f).get("frame_count") or 0)
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    return n
+
+
+def _feature_plan(camera_id: str, enabled: set) -> List:
+    """Which features this camera is AUTHORITATIVE for.
+
+    Door lives on the side cameras; Load and Damage on the top cameras. Running
+    every feature on every camera would quadruple the work and produce
+    meaningless results, so each camera runs only its own.
+    """
+    plan = []
+    if camera_id in C.SIDE_CAMERAS and "door" in enabled:
+        from features.door import processor as door_proc
+        plan.append(("door", door_proc,
+                     dict(inference_mode="sampled", sample_stride=DOOR_STRIDE)))
+    if camera_id in C.TOP_CAMERAS and "load" in enabled:
+        from features.load import processor as load_proc
+        plan.append(("load", load_proc,
+                     dict(inference_mode="sampled", sample_stride=LOAD_STRIDE)))
+    if camera_id in C.TOP_CAMERAS and "damage" in enabled:
+        from features.damage import processor as damage_proc
+        plan.append(("damage", damage_proc,
+                     dict(inference_mode="sampled",
+                          sample_stride=DAMAGE_STRIDE)))
+    return plan
+
+
+def run_camera(
+    *,
+    camera_id: str,
+    video_path: str,
+    recon_models_dir: str,
+    feat_models_dir: str,
+    evidence_root: str,
+    enabled_features: Optional[List[str]] = None,
+    verbose: bool = True,
+) -> CameraRunResult:
+    """Drive ONE camera PENDING -> SEALED.
+
+    Never raises: any failure seals this camera FAILED and returns, so it
+    cannot block another camera. Global assembly decides separately whether a
+    failed support camera is tolerable (a failed MASTER is not).
+    """
+    enabled = set(enabled_features if enabled_features is not None
+                  else ("door", "damage", "load"))
+    bundle = CameraEvidenceBundle(evidence_root, camera_id)
+    res = CameraRunResult(camera_id=camera_id, bundle_dir=bundle.dir)
+    t_all = time.perf_counter()
+
+    def _t(name: str, t0: float) -> None:
+        res.timings[name] = round(time.perf_counter() - t0, 3)
+
+    try:
+        os.makedirs(bundle.dir, exist_ok=True)
+        bundle.save_manifest(CameraManifest(camera_id=camera_id,
+                                            video_path=video_path))
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"video not available: {video_path}")
+
+        # ---- Stage 1: the proven camera-local chain --------------------
+        t0 = time.perf_counter()
+        if camera_id == C.MASTER_CAMERA:
+            out = cp.run_master_camera(
+                camera_id=camera_id, video_path=video_path,
+                gap_model_path=os.path.join(recon_models_dir,
+                                            "right_up_wagon_gap.pt"),
+                side_cls_path=os.path.join(recon_models_dir,
+                                           "side_classification.pt"),
+                verbose=verbose)
+        else:
+            is_top = camera_id in C.TOP_CAMERAS
+            gap_model = "top_gap.pt" if is_top else "left_up_wagon_gap.pt"
+            cls_name = ("top_classification.pt" if is_top
+                        else "side_classification.pt")
+            cls_path = os.path.join(recon_models_dir, cls_name)
+            out = cp.run_support_camera(
+                camera_id=camera_id, video_path=video_path,
+                gap_model_path=os.path.join(recon_models_dir, gap_model),
+                classifier_path=cls_path if os.path.exists(cls_path) else None,
+                is_top=is_top, verbose=verbose)
+        _t("stage1", t0)
+
+        bundle.advance("TRACKING", fps=out.tracks.fps,
+                       total_frames=out.tracks.total_frames,
+                       width=out.tracks.width, height=out.tracks.height)
+        bundle.advance("VALIDATED")
+
+        res.accepted_gaps = len(out.tracks.gaps)
+        res.rejected_gaps = len(getattr(out.validation, "rejected", []) or [])
+        res.recovered_gaps = (len(getattr(out.recovery, "recovered", []) or [])
+                              if out.recovery is not None else 0)
+        res.raw_detections = sum(
+            len(v) for v in (out.tracks.raw_frame_detections or {}).values())
+
+        # ---- persist Stage-1 evidence ----------------------------------
+        # FULL-FIDELITY snapshot -- global assembly reconstructs
+        # LocalCameraTracks from this without re-running Stage 1.
+        # `tracking.json` keeps the human-readable reporting view alongside it.
+        write_tracks(os.path.join(bundle.dir, "tracking_full.json"), out.tracks)
+        bundle.write_json("tracking.json",
+                          out.tracks.to_dict(include_classifications=True))
+        if out.validation is not None:
+            bundle.write_json("gap_validation.json",
+                              out.validation.to_dict(include_rejections=True))
+        if out.stitch is not None:
+            bundle.write_json("fragments.json", out.stitch.to_dict())
+        if out.recovery is not None:
+            bundle.write_json("wagon_active_recovery.json",
+                              out.recovery.to_dict())
+        if out.wagon_region is not None and hasattr(out.wagon_region, "to_dict"):
+            bundle.write_json("wagon_region.json", out.wagon_region.to_dict())
+        bundle.write_json("classification.json",
+                          [c.to_dict() for c in out.classifications
+                           if hasattr(c, "to_dict")])
+        bundle.write_segments(out.segments)
+        res.local_segments = len(out.segments)
+        bundle.advance("SEGMENTED")
+
+        # ---- materialize LOCAL segments --------------------------------
+        t0 = time.perf_counter()
+        cache_root = os.path.join(bundle.dir, "camera_cache")
+        counts = wagon_cache_builder.build_camera_local(
+            camera_id=camera_id, video_path=video_path,
+            segments=out.segments, cache_root=cache_root, verbose=verbose)
+        res.frames_materialized = sum(counts.values())
+        _t("materialize", t0)
+        bundle.advance("MATERIALIZED")
+
+        # ---- features, against CAMERA-LOCAL segments -------------------
+        roster = as_feature_wagons(out.segments, camera_id)
+        states_dir = os.path.join(bundle.dir, "features")
+        common = dict(state=None, cache_root=cache_root,
+                      feature_models_dir=feat_models_dir,
+                      output_dir=states_dir,
+                      evidence_root=os.path.join(bundle.dir, "evidence"),
+                      segments=roster, verbose=verbose)
+        for name, mod, extra in _feature_plan(camera_id, enabled):
+            t0 = time.perf_counter()
+            try:
+                res.feature_summary[name] = mod.run(**common, **extra) or {}
+            except Exception as e:
+                print(f"[SEQ/{camera_id}/{name}] CRASHED: {e}")
+                traceback.print_exc(limit=3)
+                res.feature_summary[name] = {}
+            _t(f"feature_{name}", t0)
+            res.feature_calls[name] = _feature_frame_count(states_dir, name)
+        bundle.advance("FEATURES")
+
+        # ---- camera-local report ---------------------------------------
+        # JSON, not PDF: the PDF builders in reporting/ require a
+        # GlobalTrainState and reporting/ is protected. A camera-local report
+        # has no GW ids by definition, so it is emitted as structured JSON;
+        # the PDF is produced later by the combined report.
+        t0 = time.perf_counter()
+        report_payload = {
+            "schema": "wagon_eye.camera_report.v1",
+            "camera_id": camera_id,
+            "is_master": camera_id == C.MASTER_CAMERA,
+            "fps": out.tracks.fps,
+            "total_frames": out.tracks.total_frames,
+            "raw_detections": res.raw_detections,
+            "accepted_gaps": res.accepted_gaps,
+            "rejected_gaps": res.rejected_gaps,
+            "recovered_gaps": res.recovered_gaps,
+            "reclassified_after_recovery": out.reclassified_after_recovery,
+            "local_segments": [s.to_dict() for s in out.segments],
+            "feature_summary": res.feature_summary,
+            "feature_yolo_calls": res.feature_calls,
+            "frames_materialized": res.frames_materialized,
+            "notes": list(out.notes),
+        }
+        bundle.write_json("camera_report.json", report_payload)
+        # Camera-LOCAL PDF, emitted BEFORE sealing and without any other
+        # camera. Local ids only -- no GW_n is invented here.
+        from reporting.camera_local_report import build_camera_report
+        pdf = build_camera_report(
+            camera_id=camera_id, report=report_payload,
+            output_path=os.path.join(bundle.dir, f"{camera_id}_report.pdf"),
+            verbose=verbose)
+        res.report_path = pdf or os.path.join(bundle.dir, "camera_report.json")
+        _t("report", t0)
+        bundle.advance("REPORTED")
+
+        bundle.advance("SEALED")
+        res.state, res.sealed = "SEALED", True
+
+    except Exception as e:
+        res.failure_reason = f"{type(e).__name__}: {e}"
+        res.state = "FAILED"
+        try:
+            bundle.fail(res.failure_reason)
+        except Exception:
+            pass
+        print(f"[SEQ/{camera_id}] FAILED: {res.failure_reason}")
+        traceback.print_exc(limit=3)
+
+    res.timings["total"] = round(time.perf_counter() - t_all, 3)
+    try:
+        bundle.write_json("run_result.json", res.to_dict())
+    except Exception:
+        pass
+    if verbose:
+        print(f"[SEQ/{camera_id}] {res.state}  segments={res.local_segments} "
+              f"gaps={res.accepted_gaps} frames={res.frames_materialized} "
+              f"calls={res.feature_calls} {res.timings['total']:.1f}s")
+    return res
