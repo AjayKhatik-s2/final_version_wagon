@@ -15,7 +15,7 @@ import inspect
 import os
 import unittest
 
-from _engine_harness import V4_ROOT  # noqa: F401  (path bootstrap)
+from _engine_harness import V4_ROOT, changed_paths  # noqa: F401
 
 from core import constants as C
 from features.damage import processor as damage_proc
@@ -281,12 +281,9 @@ class TestStage1IsUntouched(unittest.TestCase):
     """Stage 1 must remain functionally identical to the known-good commit."""
 
     def test_no_stage1_file_is_modified_in_the_working_tree(self):
-        import subprocess
-        r = subprocess.run(["git", "diff", "--name-only", "HEAD"],
-                           cwd=V4_ROOT, capture_output=True, text=True)
-        if r.returncode != 0:
+        changed = changed_paths()
+        if changed is None:
             self.skipTest("git unavailable")
-        changed = [p for p in r.stdout.split() if p]
         # materializer/ carries the APPROVED additive build_camera_local().
         protected = ("wagon_count/", "reconstruction/", "core/global_state_loader.py",
                      "fusion/", "reporting/")
@@ -388,16 +385,12 @@ class TestExperimentTwoConfiguration(unittest.TestCase):
             shutil.rmtree(cache, ignore_errors=True)
 
     def test_fusion_and_reporting_untouched(self):
-        import subprocess
-        # A NEW additive file under reporting/ (camera_local_report.py) is in
-        # the approved sequential scope. The EXISTING global builders must
-        # still be unmodified -- that is what this guard now asserts.
-        r = subprocess.run(["git", "diff", "--name-only", "HEAD",
-                            "fusion", "reporting"],
-                           cwd=V4_ROOT, capture_output=True, text=True)
-        if r.returncode != 0:
+        # Sequential mode adds no renderer: the camera-local PDF is built by
+        # the EXISTING reporting/camera_reports.py through an adapter that
+        # lives in orchestrator/. So fusion/ and reporting/ must be clean.
+        modified = changed_paths("fusion", "reporting")
+        if modified is None:
             self.skipTest("git unavailable")
-        modified = [x for x in r.stdout.split() if x]
         self.assertEqual(modified, [],
                          f"existing fusion/reporting builders modified: {modified}")
 

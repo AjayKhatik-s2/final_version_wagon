@@ -16,7 +16,9 @@ import os
 import re
 import unittest
 
-from _engine_harness import V4_ROOT, WAGON_COUNT_DIR  # noqa: F401
+from _engine_harness import (  # noqa: F401
+    V4_ROOT, WAGON_COUNT_DIR, changed_paths,
+)
 
 from orchestrator import camera_pipeline as cp
 
@@ -182,16 +184,12 @@ class TestNoGlobalIdsLeak(unittest.TestCase):
 
 class TestProtectedFilesUntouched(unittest.TestCase):
     def test_wagon_count_and_reconstruction_unmodified(self):
-        import subprocess
-        # reporting/ gains ONE approved additive file; existing builders and
-        # the protected counting packages must remain unmodified.
-        r = subprocess.run(["git", "diff", "--name-only", "HEAD",
-                            "wagon_count", "reconstruction", "fusion",
-                            "reporting"],
-                           cwd=V4_ROOT, capture_output=True, text=True)
-        if r.returncode != 0:
+        # The counting packages and every existing reporting builder must
+        # remain byte-identical; sequential mode is additive only.
+        modified = changed_paths("wagon_count", "reconstruction", "fusion",
+                                 "reporting")
+        if modified is None:
             self.skipTest("git unavailable")
-        modified = [x for x in r.stdout.split() if x]
         self.assertEqual(modified, [],
                          f"protected packages modified: {modified}")
 

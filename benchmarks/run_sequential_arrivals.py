@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -46,6 +47,55 @@ ARRIVAL_ORDER = ["RIGHT_UP", "LEFT_UP", "RIGHT_UP_TOP", "LEFT_UP_TOP"]
 
 def say(*a) -> None:
     print(*a, flush=True)
+
+
+def _gb(n: int) -> str:
+    return f"{n / (1024 ** 3):.2f} GB"
+
+
+def tree_bytes(path: str) -> int:
+    """Bytes under `path`, counting each inode once.
+
+    Global assembly hardlinks the per-camera evidence into GW_n names, so
+    counting naively would double-count every crop and make the growth
+    numbers meaningless.
+    """
+    seen, total = set(), 0
+    for dirpath, _dirs, files in os.walk(path):
+        for fn in files:
+            try:
+                st = os.stat(os.path.join(dirpath, fn))
+            except OSError:
+                continue
+            key = (st.st_dev, st.st_ino)
+            if st.st_ino and key in seen:
+                continue
+            if st.st_ino:
+                seen.add(key)
+            total += st.st_size
+    return total
+
+
+def disk_report(label: str, evidence_root: str) -> Dict[str, int]:
+    """Free space on the volume plus the size of each camera bundle.
+
+    The previous experiment died with the root filesystem at 100%, so this
+    prints before and after every arrival: if one camera is responsible
+    for the growth it shows up on its own line, rather than being inferred
+    after the fact.
+    """
+    du = shutil.disk_usage(evidence_root)
+    say(f"    [disk] {label}: free {_gb(du.free)} / {_gb(du.total)} "
+        f"({100.0 * du.used / du.total:.1f}% used)")
+    sizes: Dict[str, int] = {}
+    for cam in ARRIVAL_ORDER:
+        d = bundle_dir(evidence_root, cam)
+        if os.path.isdir(d):
+            sizes[cam] = tree_bytes(d)
+            say(f"    [disk]   {cam:<13} {_gb(sizes[cam])}")
+    if sizes:
+        say(f"    [disk]   {'TOTAL':<13} {_gb(sum(sizes.values()))}")
+    return {"free": du.free, "used": du.used, **sizes}
 
 
 class AssertionFailed(RuntimeError):
@@ -155,6 +205,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         for i, cam in enumerate(ARRIVAL_ORDER, start=1):
             say(f"\n--- ARRIVAL {i}: {cam} ---")
+            disk_report(f"before {cam}", evidence_root)
             t0 = time.time()
             rc = run_one_arrival(evidence_root, cam, videos[cam], models)
             timings[cam] = round(time.time() - t0, 1)
@@ -163,10 +214,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             arrived.append(cam)
             say(f"    verifying persisted state after arrival {i}")
             assert_after_arrival(evidence_root, arrived)
+            disk_report(f"after  {cam}", evidence_root)
             say(f"    {cam} done in {timings[cam]}s "
                 f"(process exited; state on disk only)")
 
         say("\n--- GLOBAL ASSEMBLY (only now, after arrival 4) ---")
+        disk_report("before assembly", evidence_root)
         from orchestrator import global_assembler
         t0 = time.time()
         asm = global_assembler.assemble(
@@ -174,6 +227,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             batch_key=key, verbose=True)
         timings["assembly"] = round(time.time() - t0, 1)
 
+        disk_report("after  assembly", evidence_root)
         reports = os.path.join(args.workspace, key, "reports")
         _check(asm.ready, "assembly reported ready")
         _check(os.path.isfile(os.path.join(reports,
@@ -198,7 +252,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"calls={rr.get('feature_yolo_calls')} {timings.get(cam)}s")
     say(f"  global wagons : {asm.total_wagons}")
     for cam, sm in asm.mapping_by_camera.items():
-        say(f"  mapping {cam:<13} {sm['by_kind']}")
+        ml = asm.media_linked.get(cam, {})
+        say(f"  mapping {cam:<13} {sm['by_kind']} "
+            f"evidence_linked={ml.get('evidence', 0)} "
+            f"cache_linked={ml.get('cache', 0)}")
     say(f"  assembly      : {timings.get('assembly')}s")
     say(f"  TOTAL         : {time.time() - t_all:.1f}s")
     say(f"  output        : {os.path.join(args.workspace, key)}")

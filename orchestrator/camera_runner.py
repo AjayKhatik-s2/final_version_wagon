@@ -232,13 +232,16 @@ def run_camera(
             res.feature_calls[name] = _feature_frame_count(states_dir, name)
         bundle.advance("FEATURES")
 
-        # ---- camera-local report ---------------------------------------
-        # JSON, not PDF: the PDF builders in reporting/ require a
-        # GlobalTrainState and reporting/ is protected. A camera-local report
-        # has no GW ids by definition, so it is emitted as structured JSON;
-        # the PDF is produced later by the combined report.
+        # ---- camera-local report -----------------------------------
+        # Rendered by the EXISTING proven renderer
+        # (reporting/camera_reports.py::build_camera_report) via a thin state
+        # adapter, so layout/styling/sections are identical to the batch camera
+        # reports. Only the wagon ids differ: L_<CAM>_<n>, never GW_n.
         t0 = time.perf_counter()
-        report_payload = {
+        # Machine-readable audit of what this camera actually did. Kept
+        # alongside the PDF: it carries the gap/recovery counters and per-
+        # feature call counts that the rendered report does not show.
+        bundle.write_json("camera_report.json", {
             "schema": "wagon_eye.camera_report.v1",
             "camera_id": camera_id,
             "is_master": camera_id == C.MASTER_CAMERA,
@@ -254,15 +257,22 @@ def run_camera(
             "feature_yolo_calls": res.feature_calls,
             "frames_materialized": res.frames_materialized,
             "notes": list(out.notes),
-        }
-        bundle.write_json("camera_report.json", report_payload)
-        # Camera-LOCAL PDF, emitted BEFORE sealing and without any other
-        # camera. Local ids only -- no GW_n is invented here.
-        from reporting.camera_local_report import build_camera_report
-        pdf = build_camera_report(
-            camera_id=camera_id, report=report_payload,
-            output_path=os.path.join(bundle.dir, f"{camera_id}_report.pdf"),
-            verbose=verbose)
+        })
+        pdf = None
+        try:
+            from orchestrator.camera_report_adapter import build_local_camera_pdf
+            pdf = build_local_camera_pdf(
+                bundle,
+                output_pdf=os.path.join(bundle.dir, f"{camera_id}_report.pdf"),
+                batch_key=f"{camera_id} (camera-local)",
+                fps=out.tracks.fps, total_frames=out.tracks.total_frames,
+                logo_path=os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "reporting", "assets", "Logo.jpeg"),
+                verbose=verbose)
+        except Exception as e:
+            print(f"[SEQ/{camera_id}] camera PDF failed: "
+                  f"{type(e).__name__}: {e}")
         res.report_path = pdf or os.path.join(bundle.dir, "camera_report.json")
         _t("report", t0)
         bundle.advance("REPORTED")

@@ -198,3 +198,33 @@ def write_stage1_outputs(engine_state, tracks, output_dir: str) -> Dict[str, str
             include_classifications=(cam == CAMERA_RIGHT_UP))
             for cam in ALL_CAMERAS}, f, indent=2)
     return {"state": state_path, "tracking": tracking_path}
+
+
+# --- protected-path guards -------------------------------------------------
+#
+# The first sequential implementation wrongly added a second, from-scratch
+# camera report renderer at `reporting/camera_local_report.py`. It has been
+# deleted: the camera-local PDF is now produced by the EXISTING
+# `reporting/camera_reports.py` via `orchestrator/camera_report_adapter.py`.
+#
+# Until that deletion is committed, `git diff HEAD -- reporting` reports it,
+# and the "reporting is unmodified" guards would fire on the very change that
+# restores them. Exempting exactly this one path keeps the guards strict about
+# every real builder while allowing the file's removal. The assertion that it
+# stays gone lives in tests/test_camera_report_adapter.py.
+DELETED_BY_DESIGN = ("reporting/camera_local_report.py",)
+
+
+def changed_paths(*pathspecs) -> "list":
+    """Worktree changes vs HEAD under `pathspecs`, minus DELETED_BY_DESIGN.
+
+    Returns None when git is unavailable so callers can skip.
+    """
+    import subprocess
+
+    r = subprocess.run(["git", "diff", "--name-only", "HEAD", *pathspecs],
+                       cwd=V4_ROOT, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return [p for p in r.stdout.split()
+            if p and p not in DELETED_BY_DESIGN]
