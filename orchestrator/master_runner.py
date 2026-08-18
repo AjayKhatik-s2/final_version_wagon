@@ -50,6 +50,10 @@ from core.batch import (
 from core.global_state_loader import (
     GlobalTrainState, assert_roster_unchanged, roster_fingerprint,
 )
+from core import config as CFG
+from core import model_sync
+from core.logging_setup import setup_logging
+from core.pipeline_source import PipelineSource
 from core.stage_timing import StageTimer
 from core.unified_wagon_state import UnifiedWagonState, summarize_wagons
 
@@ -63,6 +67,7 @@ from fusion import wagon_state_builder
 from reporting import combined_train_report, camera_reports
 from rendering import feature_overlay_renderer
 from delivery import s3_upload, notification
+from delivery import dashboard_ingest, ml_api
 
 
 # Default per-batch paths (relative to a workspace root)
@@ -91,6 +96,9 @@ class BatchOutcome:
     camera_pdf_urls:  Dict[str, str] = field(default_factory=dict)
     processed_video_paths: Dict[str, str] = field(default_factory=dict)
     processed_video_urls:  Dict[str, str] = field(default_factory=dict)
+    # Stage-6 external delivery (dashboard per-camera feed + ML API callback).
+    dashboard_result: Dict[str, Any] = field(default_factory=dict)
+    ml_api_result: Dict[str, Any] = field(default_factory=dict)
     final_status: str = "unknown"
     error: Optional[str] = None
     elapsed_seconds: float = 0.0
@@ -626,6 +634,67 @@ def process_batch(
           f"wagon_states={n_states} files, reports={n_reports} files, "
           f"evidence={n_evidence} files, processed_videos={n_videos} files")
 
+    # ---- Stage 6b: the V4 dashboard feed + ML API callback ----
+    # Four exact-V4 `{camera_id, version, inspection_data}` documents, uploaded
+    # and POSTed to the V4 ingest receivers.  Runs AFTER the archive upload so
+    # the evidence URLs each document references already resolve in S3.
+    # Both calls are failure-isolated: a receiver outage cannot fail a batch
+    # whose reports are already built and uploaded.
+    print(f"\n--- STAGE 6b  Dashboard feed (V4 inspection JSON) ---")
+    # Seed the finalization marker with the URLs Stage 6 just produced.
+    #
+    # `dashboard_ingest` reads each document's `pdf_report_url` out of the
+    # marker's `upload_urls` (that is where the per-camera PDF links live in the
+    # V4 contract).  Nothing else in this package writes that marker, so without
+    # this every document reached the dashboard with `pdf_report_url` EMPTY --
+    # the report was ingested but had no link back to the PDF.
+    #
+    # An existing marker is never overwritten: if some other step already
+    # recorded what it delivered, that record wins.
+    try:
+        from delivery import finalization as _FIN
+        _urls = {f"camera_{cam}": u
+                 for cam, u in (out.camera_pdf_urls or {}).items() if u}
+        if out.report_pdf_url:
+            _urls["pdf"] = out.report_pdf_url
+        if out.report_json_url:
+            _urls["json"] = out.report_json_url
+        if _urls and _FIN.load(batch_root) is None:
+            _FIN.write(batch_root, {
+                "batch_key": batch.batch_key,
+                "terminal_status": out.final_status,
+                "upload_urls": _urls,
+                "uploaded": True,
+            })
+    except Exception as e:  # noqa: BLE001 - a marker failure must not fail delivery
+        print(f"[STAGE6b] could not seed the finalization marker: {e}",
+              file=sys.stderr)
+
+    out.dashboard_result = dashboard_ingest.run(
+        batch_root=batch_root, s3_client=s3_client, skip_upload=skip_upload,
+    )
+    if out.dashboard_result.get("enabled"):
+        for cam, info in (out.dashboard_result.get("cameras") or {}).items():
+            print(f"  [dashboard/{cam}] {info.get('status')}"
+                  + (f"  run_id={info['run_id']}" if info.get("run_id") else ""))
+    else:
+        print("  dashboard ingest disabled "
+              "(WAGONEYE_DASHBOARD_INGEST_ENABLED=false)")
+
+    out.ml_api_result = ml_api.submit_batch(
+        batch_key=batch.batch_key,
+        cameras=list(batch.present_cameras()),
+        source_video_urls={
+            cam: (batch.videos[cam].s3_url
+                  if cam in batch.videos and batch.videos[cam].bucket != "__local__"
+                  else "")
+            for cam in C.ALL_CAMERAS if cam in batch.videos
+        },
+        processed_video_urls=out.processed_video_urls,
+        camera_pdf_urls=out.camera_pdf_urls,
+        combined_pdf_url=out.report_pdf_url,
+    )
+
     if not skip_email:
         summary = summarize_wagons(list(out.unified.values()))
         notification.send_email(
@@ -650,29 +719,23 @@ def process_batch(
 # -----------------------------------------------------------------------------
 
 def run_auto(*args, **kwargs):
-    """Continuous S3 polling loop.  Lifts polling from the legacy
-    train_batch_manager + processed_batches state file convention."""
-    try:
-        # legacy module sits at the repo root; not part of wagon_eye_v4/
-        sys.path.insert(0, os.path.dirname(_REPO_ROOT))
-        from train_batch_manager import (                        # type: ignore
-            poll_for_batches, select_runnable_batch,
-            load_batch_state, save_batch_state,
-            DEFAULT_BATCH_TOLERANCE_SEC,
-        )
-    except Exception as e:
-        print(f"[ORCH] continuous polling unavailable -- "
-              f"train_batch_manager.py not importable: {e}", file=sys.stderr)
-        return 3
+    """Continuous S3 polling loop -- the production auto pipeline.
 
-    import boto3
-    from datetime import datetime, timezone
+    Two halves, decoupled through S3:
 
-    s3 = boto3.client("s3", region_name=C.S3_REGION)
-    state_loc = f"{C.S3_OUTPUT_BUCKET}/{C.S3_STATE_KEY}"
+      * PRODUCER (only when the pipeline source is `raw`): an ExtractionManager
+        thread discovers raw CCTV, detects a completed train pass, trims it and
+        uploads the clip to the trimmed bucket.
+      * CONSUMER (always): `orchestrator.train_batch_manager` discovers trimmed
+        clips, clusters the four cameras into one TrainBatch, and hands each
+        runnable batch to `process_batch` -- which is UNCHANGED.
 
-    workspace_root = kwargs.get("workspace") or tempfile.mkdtemp(prefix="wagon_eye_v4_")
-    os.makedirs(workspace_root, exist_ok=True)
+    The producer writes to exactly the location the consumer reads, so one
+    process can own both without the two being coupled in code.  With
+    `--source trimmed` (the default) no producer is started and this is the pure
+    consumer it always was.
+    """
+    workspace_root = kwargs.get("workspace") or CFG.WORKSPACE_ROOT
     recon_models_dir = kwargs.get("recon_models_dir") or DEFAULT_RECON_MODELS_DIR
     feat_models_dir  = kwargs.get("feat_models_dir")  or DEFAULT_FEAT_MODELS_DIR
     poll_interval    = kwargs.get("poll_interval", 60)
@@ -682,52 +745,121 @@ def run_auto(*args, **kwargs):
     skip_upload      = kwargs.get("skip_upload", False)
     skip_email       = kwargs.get("skip_email", False)
     feature_config   = kwargs.get("feature_config") or FeatureConfig.all_on()
+    source           = kwargs.get("source") or CFG.PIPELINE_SOURCE
+    skip_model_sync  = kwargs.get("skip_model_sync", False)
+    mode             = "once" if run_once else "auto"
 
-    start = datetime.now(timezone.utc)
-    processed = load_batch_state(s3, state_loc)
+    # ---- fail fast on a misconfiguration instead of polling forever ----
+    errors = CFG.validate_config(mode=mode, skip_upload=skip_upload,
+                                 skip_email=skip_email, source=source)
+    if errors:
+        print("[ORCH] refusing to start -- configuration errors:", file=sys.stderr)
+        for e in errors:
+            print(f"  * {e}", file=sys.stderr)
+        return 2
+    print(CFG.startup_summary(mode=mode, source=source))
+
+    # ---- every model this run needs must exist before the first batch ----
+    if not skip_model_sync:
+        # `include_extraction` follows the source: the extraction classifiers
+        # are only required when THIS process produces its own trimmed clips.
+        report = model_sync.ensure_models_or_report(
+            enabled_features=feature_config.enabled_keys(),
+            include_extraction=source.requires_extraction,
+        )
+        if not report.ok:
+            print("[ORCH] refusing to start -- required model(s) unavailable",
+                  file=sys.stderr)
+            return 2
+
+    from orchestrator import train_batch_manager as TBM
+
+    try:
+        import boto3
+    except ImportError:
+        print("[ORCH] boto3 is required for --auto (pip install boto3)",
+              file=sys.stderr)
+        return 2
+
+    s3 = boto3.client("s3", region_name=C.S3_REGION)
+    state_loc = f"{C.S3_OUTPUT_BUCKET}/{C.S3_STATE_KEY}"
+
+    os.makedirs(workspace_root, exist_ok=True)
+
+    # ---- PRODUCER: only when this deployment has raw CCTV, not clips ----
+    extractor = None
+    if source.requires_extraction:
+        from orchestrator.extraction_manager import ExtractionManager
+        extractor = ExtractionManager(poll_interval=CFG.EXTRACTION_POLL_INTERVAL)
+        if run_once:
+            counts = extractor.run_once()
+            print(f"[ORCH] extraction sweep: {counts}")
+        else:
+            extractor.start()
+
+    processed = TBM.load_batch_state(s3, state_loc)
+    start = CFG.discovery_cutoff_utc()
     print(f"[ORCH] workspace: {workspace_root}")
+    print(f"[ORCH] source   : {source.value}"
+          + ("  (extraction owned by this process)"
+             if source.requires_extraction else "  (pure consumer)"))
+    print(f"[ORCH] discovery cutoff: {start.isoformat()}")
     print(f"[ORCH] processed batches so far: {len(processed)}")
 
-    while True:
-        try:
-            batches = poll_for_batches(
-                s3_client=s3, processed_batches=processed,
-                start_time=start,
-                tolerance_sec=DEFAULT_BATCH_TOLERANCE_SEC,
-            )
-            if force_key:
-                batch = next((b for b in batches if b.batch_key == force_key), None)
-                if batch is None and run_once:
-                    return 0
-            else:
-                batch = select_runnable_batch(batches, partial_wait_minutes=partial_wait)
-            if batch is None:
+    try:
+        while True:
+            try:
+                batches = TBM.poll_for_batches(
+                    s3_client=s3, processed_batches=processed,
+                    start_time=start,
+                    tolerance_sec=TBM.DEFAULT_BATCH_TOLERANCE_SEC,
+                    # An explicit `--batch <key>` replay is allowed to reach
+                    # past the discovery window; continuous polling is not.
+                    apply_cutoff=not bool(force_key),
+                )
+                if force_key:
+                    batch = next((b for b in batches
+                                  if b.batch_key == force_key), None)
+                    if batch is None and run_once:
+                        print(f"[ORCH] batch {force_key} not found")
+                        return 0
+                else:
+                    batch = TBM.select_runnable_batch(
+                        batches, partial_wait_minutes=partial_wait)
+                if batch is None:
+                    if run_once:
+                        return 0
+                    print(f"[ORCH] no runnable batch; sleeping {poll_interval}s")
+                    time.sleep(poll_interval)
+                    continue
+
+                outcome = process_batch(
+                    batch=batch, workspace_root=workspace_root,
+                    recon_models_dir=recon_models_dir,
+                    feat_models_dir=feat_models_dir,
+                    s3_client=s3, skip_upload=skip_upload,
+                    skip_email=skip_email,
+                    feature_config=feature_config,
+                    **(kwargs.get("inference_opts") or {}),
+                )
+                processed[batch.batch_key] = outcome.final_status
+                TBM.save_batch_state(s3, state_loc, processed)
                 if run_once:
                     return 0
-                print(f"[ORCH] no runnable batch; sleeping {poll_interval}s")
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                traceback.print_exc()
+                print(f"[ORCH] unhandled error: {e}", file=sys.stderr)
+                if run_once:
+                    return 3
                 time.sleep(poll_interval)
-                continue
-
-            outcome = process_batch(
-                batch=batch, workspace_root=workspace_root,
-                recon_models_dir=recon_models_dir, feat_models_dir=feat_models_dir,
-                s3_client=s3, skip_upload=skip_upload, skip_email=skip_email,
-                feature_config=feature_config,
-                **(kwargs.get("inference_opts") or {}),
-            )
-            processed[batch.batch_key] = outcome.final_status
-            save_batch_state(s3, state_loc, processed)
-            if run_once:
-                return 0
-        except KeyboardInterrupt:
-            print("\n[ORCH] interrupted")
-            return 0
-        except Exception as e:
-            traceback.print_exc()
-            print(f"[ORCH] unhandled error: {e}", file=sys.stderr)
-            if run_once:
-                return 3
-            time.sleep(poll_interval)
+    except KeyboardInterrupt:
+        print("\n[ORCH] interrupted")
+        return 0
+    finally:
+        if extractor is not None and extractor.is_running():
+            extractor.stop()
 
 
 # -----------------------------------------------------------------------------
@@ -862,6 +994,94 @@ def run_sequential(
 
 
 # -----------------------------------------------------------------------------
+# HISTORICAL MODE (opt-in) -- input selection only; reuses process_batch
+# -----------------------------------------------------------------------------
+
+def run_historical(args, *, feature_config=None, inference_opts=None) -> int:
+    """CLI adapter for `--historical`.
+
+    Resolves the requested window, opens an S3 client, and delegates to
+    `historical_runner.run`, which selects the matching already-trimmed clips and
+    feeds each discovered train to the SAME `process_batch` the live path uses.
+
+    Nothing in `run_auto` is entered: no polling loop, no live discovery cutoff,
+    and `processed_batches.json` is neither read nor written -- so a historical
+    run can neither be blocked by a live batch nor mark one terminal.
+    """
+    from orchestrator import historical_runner as HR
+    from orchestrator import train_batch_manager as TBM
+
+    # The requested window is parsed FIRST: it is pure and instant, so a typo in
+    # --date / --start-time is reported immediately rather than after a
+    # multi-second S3 model check.
+    try:
+        window = HR.resolve_window(
+            date=args.date, start_time=args.start_time, end_time=args.end_time,
+            timezone_name=args.timezone, start_iso=args.start, end_iso=args.end,
+        )
+    except ValueError as e:
+        print(f"[HISTORICAL] {e}", file=sys.stderr)
+        return 2
+
+    # Same fail-fast discipline the live path gets, with the historical branch
+    # (discovery config required, email endpoint not -- delivery is opt-in).
+    errors = CFG.validate_config(mode="historical",
+                                 skip_upload=not args.historical_deliver,
+                                 skip_email=not args.historical_deliver,
+                                 source=PipelineSource.TRIMMED)
+    if errors:
+        print("[HISTORICAL] refusing to start -- configuration errors:",
+              file=sys.stderr)
+        for e in errors:
+            print(f"  * {e}", file=sys.stderr)
+        return 2
+
+    # A --dry-run only lists S3 and prints the manifest, so it must not require
+    # weights.  A real run does: without them every batch would fail inside
+    # Stage 1 with a per-batch error instead of one clear message up front.
+    if not args.dry_run and not args.skip_model_sync:
+        report = model_sync.ensure_models_or_report(
+            enabled_features=(feature_config or FeatureConfig.all_on()).enabled_keys(),
+            # Historical mode is ALWAYS a pure consumer of already-trimmed clips,
+            # so the extraction classifiers are irrelevant to it.
+            include_extraction=False,
+        )
+        if not report.ok:
+            print("[HISTORICAL] refusing to start -- required model(s) "
+                  "unavailable", file=sys.stderr)
+            return 2
+
+    try:
+        import boto3
+        s3 = boto3.client("s3", region_name=C.S3_REGION)
+    except Exception as e:  # noqa: BLE001
+        print(f"[HISTORICAL] could not create an S3 client: {e}", file=sys.stderr)
+        return 2
+
+    return HR.run(
+        s3_client=s3,
+        window=window,
+        workspace_root=args.workspace or DEFAULT_WORKSPACE_PARENT,
+        recon_models_dir=args.recon_models_dir or DEFAULT_RECON_MODELS_DIR,
+        feat_models_dir=args.feat_models_dir or DEFAULT_FEAT_MODELS_DIR,
+        feature_config=feature_config,
+        pad_minutes=(HR.DEFAULT_PAD_MINUTES if args.pad_minutes is None
+                     else args.pad_minutes),
+        tolerance_sec=(TBM.DEFAULT_BATCH_TOLERANCE_SEC
+                       if args.tolerance_sec is None else args.tolerance_sec),
+        dry_run=args.dry_run,
+        keep_inputs=args.keep_inputs,
+        deliver=args.historical_deliver,
+        # --historical-deliver turns on upload + dashboard ingest; email stays
+        # separately suppressible with the existing --skip-email, so a bulk
+        # re-run can reach the dashboard without mailing the operators N times.
+        send_email=not args.skip_email,
+        manifest_out=args.manifest_out,
+        inference_opts=inference_opts,
+    )
+
+
+# -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 
@@ -926,11 +1146,79 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--legacy-inference", action="store_true",
                    help="shorthand: force BOTH Door and Damage to legacy "
                         "every-frame tracking (pre-optimization behaviour)")
+
+    # ---- historical (time-range) mode --------------------------------------
+    # Purely an INPUT-SELECTION layer: it resolves which already-trimmed S3 clips
+    # fall in a requested time range and hands each resulting TrainBatch to the
+    # SAME `process_batch` the live path uses.  None of these flags is read by
+    # --auto / --once / --batch / --local-only; see historical_runner.py.
+    hist = p.add_argument_group("historical mode (--historical)")
+    hist.add_argument("--historical", action="store_true",
+                      help="process already-trimmed S3 clips from a time range")
+    hist.add_argument("--date", default=None, help="YYYY-MM-DD")
+    hist.add_argument("--start-time", default=None, help="HH:MM[:SS]")
+    hist.add_argument("--end-time", default=None, help="HH:MM[:SS]")
+    hist.add_argument("--timezone", default=None,
+                      help="IANA zone for --date/--start-time/--end-time "
+                           "(default Asia/Kolkata)")
+    hist.add_argument("--start", default=None,
+                      help="ISO-8601 start, e.g. 2026-08-08T10:00:00+05:30 "
+                           "(alternative to --date/--start-time)")
+    hist.add_argument("--end", default=None, help="ISO-8601 end")
+    hist.add_argument("--tolerance-sec", type=int, default=None,
+                      help="seconds between two cameras' clips for them to be "
+                           "the same train (default 120, the live value).  Some "
+                           "days stamp the four cameras minutes apart -- check "
+                           "--dry-run and widen if batches come out partial")
+    hist.add_argument("--pad-minutes", type=float, default=None,
+                      help="how far past its filename timestamp a clip may still "
+                           "hold its train (default 15)")
+    hist.add_argument("--dry-run", action="store_true",
+                      help="discover + print the manifest; download nothing, "
+                           "run no inference")
+    hist.add_argument("--keep-inputs", action="store_true",
+                      help="keep staged clips after a successful batch")
+    hist.add_argument("--historical-deliver", action="store_true",
+                      help="enable S3 upload + dashboard ingest + email for "
+                           "historical batches (OFF by default so a re-run "
+                           "cannot overwrite or re-notify the live delivery)")
+    hist.add_argument("--manifest-out", default=None,
+                      help="path for the JSON manifest (default: "
+                           "<workspace>/historical/historical_manifest.json)")
+
+    # ---- pipeline source: WHAT this deployment consumes --------------------
+    p.add_argument("--source", dest="source", choices=("trimmed", "raw"),
+                   default=None,
+                   help="Input the pipeline consumes. 'trimmed' (DEFAULT) = the "
+                        "input prefixes already hold trimmed train clips and "
+                        "this process is a pure consumer. 'raw' = only raw CCTV "
+                        "exists, so this process also runs train extraction "
+                        "(raw -> trimmed) before consuming. Defaults to "
+                        "WAGONEYE_PIPELINE_SOURCE, else 'trimmed'.")
+    p.add_argument("--skip-model-sync", action="store_true",
+                   help="skip the startup model availability check / S3 sync "
+                        "(models must already be present locally)")
+    p.add_argument("--ocr-engine", choices=("rekognition", "easyocr"),
+                   default=None,
+                   help="Wagon-number OCR engine. 'rekognition' (DEFAULT, V4 "
+                        "parity: AWS DetectText on a 3-frame sheet) | 'easyocr' "
+                        "(local, no network). Sets WAGONEYE_OCR_ENGINE.")
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
+
+    # File + stdout logging for the long-running service (idempotent).
+    setup_logging()
+
+    # The OCR engine is read from the environment by the processor itself, so an
+    # explicit flag is expressed as an env override -- one authority, no drift.
+    if args.ocr_engine:
+        os.environ["WAGONEYE_OCR_ENGINE"] = args.ocr_engine
+
+    # Pipeline source: explicit flag wins over WAGONEYE_PIPELINE_SOURCE.
+    source = PipelineSource.resolve(args.source)
 
     # Continuous --auto polling is a daemon: never prompt there.  Interactive
     # toggling is only offered for --local-only / --once / --batch foreground
@@ -957,6 +1245,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Stage-3 inference: door={_door_mode}/stride={args.door_sample_stride}"
           f"  damage={_dmg_mode}/stride={args.damage_sample_stride}"
           f"  load={_load_mode}/stride={args.load_sample_stride}")
+
+    # Historical is opt-in and dispatches FIRST, so it can never fall through
+    # into the live polling loop.  It returns unconditionally.
+    if args.historical:
+        # Reject a combination that would otherwise be silently ignored: both
+        # flags name an execution architecture, and historical wins by dispatch
+        # order.  Saying so beats letting an operator believe their historical
+        # window ran through the sequential path.
+        if args.mode == "sequential":
+            print("ERROR: --historical and --mode sequential are different "
+                  "execution paths and cannot be combined.  Historical mode "
+                  "feeds the batch pipeline (process_batch); drop --mode "
+                  "sequential.", file=sys.stderr)
+            return 2
+        if args.auto:
+            print("ERROR: --historical and --auto are mutually exclusive "
+                  "(one processes a past window once, the other polls for live "
+                  "batches forever).  Pick one.", file=sys.stderr)
+            return 2
+        return run_historical(args, feature_config=feature_config,
+                              inference_opts=inference_opts)
 
     # Sequential is opt-in and dispatches BEFORE the batch path; batch mode
     # continues to reach the unchanged process_batch() exactly as before.
@@ -995,6 +1304,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         skip_email=args.skip_email,
         feature_config=feature_config,
         inference_opts=inference_opts,
+        source=source,
+        skip_model_sync=args.skip_model_sync,
     )
 
 

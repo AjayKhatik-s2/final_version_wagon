@@ -14,6 +14,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import re
 import tempfile
 import unittest
 
@@ -421,10 +422,33 @@ def _pdf_text(path: str) -> str:
                 cands.append(step(body))
             except Exception:
                 pass
-        for c in cands:
-            if b"BT" in c and (b"Tj" in c or b"TJ" in c):
-                return c
-        return b""
+
+        # Choose by EVIDENCE, never by order.
+        #
+        # The trap: `a85decode` does not fail on data that was never ASCII85, and
+        # the raw Flate bytes themselves can coincidentally contain `BT` and
+        # `Tj`.  So "first candidate containing BT and Tj" sometimes picked
+        # binary garbage over the real content stream, and the page's text was
+        # silently lost -- intermittently, because the compressed bytes change
+        # run to run (the page draws a live IST timestamp).  Joining every
+        # plausible candidate is no better: the garbage then contributes fake
+        # parenthesised runs.
+        #
+        # A real content stream is PostScript-like text: overwhelmingly
+        # printable ASCII.  Binary garbage is not.  Require that, then take the
+        # candidate with the most text operators.
+        def _score(c: bytes):
+            if b"BT" not in c or (b"Tj" not in c and b"TJ" not in c):
+                return None
+            printable = sum(1 for byte in c if 32 <= byte <= 126 or byte in (9, 10, 13))
+            if not c or printable / len(c) < 0.85:
+                return None          # binary -> not a content stream
+            return c.count(b"Tj") + c.count(b"TJ")
+
+        scored = [(sc, c) for c in cands if (sc := _score(c)) is not None]
+        if not scored:
+            return b""
+        return max(scored, key=lambda pair: pair[0])[1]
 
     with open(path, "rb") as f:
         raw = f.read()
@@ -540,11 +564,33 @@ class TestAllFourCameraPdfs(unittest.TestCase):
                     fps=15.0, total_frames=3555, verbose=False)
                 self.assertTrue(p and os.path.isfile(p), f"{cam}: no PDF")
                 txt = _pdf_text(p)
-                self.assertIn(first_id, txt, f"{cam}: {first_id} not printed")
+
+                # This assertion failed ONCE for RIGHT_UP_TOP and has not
+                # reproduced in 18 consecutive runs (12 isolated + 6 full-suite),
+                # so the cause is unknown rather than fixed.  Rather than
+                # loosen it -- which could hide a real intermittent rendering
+                # bug -- the failure now reports what WAS extracted, so the next
+                # occurrence is diagnosable instead of a bare False-is-not-True.
+                def _diag(missing: str) -> str:
+                    squashed = "".join(txt.split())
+                    return (
+                        f"{cam}: {missing!r} not found in the drawn text.\n"
+                        f"  extracted {len(txt)} chars, {len(txt.split())} tokens\n"
+                        f"  present whitespace-insensitively: "
+                        f"{missing in squashed}  <-- True means the id WRAPPED\n"
+                        f"  L_-prefixed ids seen: "
+                        f"{sorted(set(re.findall(r'L_[A-Z_]+_[0-9]+', txt)))}\n"
+                        f"  first 400 chars: {txt[:400]!r}")
+
+                # `assertIn(x, txt, msg)` evaluates `msg` EAGERLY, so building
+                # the diagnostic inline ran it on every passing subtest too.
+                # Only build it on an actual failure.
+                if first_id not in txt:
+                    self.fail(_diag(first_id))
                 self.assertNotIn("GW_", txt, f"{cam}: PDF shows a GW_ id")
                 for s in segs:
-                    self.assertIn(s.local_id, txt,
-                                  f"{cam}: {s.local_id} not printed")
+                    if s.local_id not in txt:
+                        self.fail(_diag(s.local_id))
 
     def test_a_camera_renders_with_no_other_camera_present(self):
         """Only ONE bundle exists on disk while the PDF is built."""

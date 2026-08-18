@@ -12,6 +12,12 @@
 local_inputs/
 batch_outputs/
 
+# --- Runtime logs --------------------------------------------------------
+# core/logging_setup.py writes a rotating wagon_eye.log here, and the
+# extraction service keeps its per-camera dedup ledger under
+# logs/extraction_state/.  Both are runtime state, not source.
+logs/
+
 # --- Reference copy of the counting engine -------------------------------
 # Source material the wagon_count/ engine was adopted from, byte-for-byte.
 # It carries its own .git, its own input videos and its own weights (~229 MB).

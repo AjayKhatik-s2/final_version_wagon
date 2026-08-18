@@ -31,7 +31,8 @@ never re-runs gap detection.
             (damage reads the load JSON to drop floor_damage on LOADED
              wagons; running it first makes that read deterministic)
           then features.{door,ocr,damage} in parallel
-            pure YOLO inference on cached frames
+            pure YOLO inference on cached frames (OCR additionally calls
+            AWS Rekognition DetectText -- see AUTOPIPELINE.md)
             persists evidence snapshots + metadata under evidence/
             → wagon_states/<feature>/<GW_n>.json
             → evidence/<GW_n>/<feature>/{*.jpg,metadata.json}
@@ -79,7 +80,20 @@ never re-runs gap detection.
 [Stage 6] delivery.s3_upload + delivery.notification
             S3 archive (incl. evidence + processed_videos) +
             one email per batch
+    │
+    ▼
+[Stage 6b] delivery.dashboard_ingest + delivery.ml_api
+            4 exact-V4 per-camera inspection_data.json -> the V4 ingest
+            receivers (UAT + PROD) + the V4 ML API callback.  version="v1"
+            so the report renders in the dashboard's V1 tab.
+            -> delivery/dashboard/<CAMERA>_*_inspection.json  (local copy)
 ```
+
+There is also a **producer** half, in front of Stage 1, for deployments that
+have only raw CCTV: `--source raw` makes the orchestrator own an
+`ExtractionManager` that detects a train pass in the raw feed, trims it, and
+uploads the clip to the trimmed bucket the consumer reads.  See
+[AUTOPIPELINE.md](AUTOPIPELINE.md) for the full runbook.
 
 ## Package layout
 
@@ -270,8 +284,7 @@ python -m orchestrator.master_runner --batch 20260408_032134
 
 ```bash
 cd wagon_eye_v4
-python -m pytest -q                      # 353 tests (v4 + counting engine)
-python -m unittest discover -s tests     # 70 tests (v4 only, stdlib runner)
+python -m pytest -q       # 674 passed, 2 skipped (v4 + counting engine)
 ```
 
 No model weights, no video decode and no GPU are needed: the counting modules
@@ -285,7 +298,10 @@ Nothing here runs production inference.
 | `tests/test_roster_immutability.py` | inspection cannot append / remove / reorder / renumber / re-time the roster |
 | `tests/test_downstream_contract.py` | door/load/damage/OCR + fusion + reporting still receive the expected structure |
 | `tests/test_counting_integration.py` | four-camera input → engine → JSON → adapter → inspection; camera offsets reach materialization |
-| `wagon_count/tests/` | the counting engine's own 283-test suite, adopted with it |
+| `tests/test_v4_dashboard_feed.py` | the V4 delivery contract: exact endpoints, the 3-field ingest payload, dual receivers, `version`/dialect rules, V4's S3 key layout, per-camera narrowing of this package's fused feature files, flat/nested evidence, idempotency |
+| `tests/test_v4_rekognition_ocr.py` | Rekognition OCR: digit reading, two-row plates, sheet assembly, loaded/empty triplet order, banding, per-wagon call budget, engine selection |
+| `tests/test_auto_pipeline_wiring.py` | `--source` resolution, the batch-manager call contract, the 05:00 IST discovery anchor, config validation, ExtractionManager lifecycle |
+| `wagon_count/tests/` | the counting engine's own suite, adopted with it |
 
 Tests that compare the engine against its source folder skip cleanly when
 `wagon_count - Copy_correct_count/` is absent (it is gitignored).
@@ -306,6 +322,9 @@ Tests that compare the engine against its source folder skip cleanly when
 | `--skip-email`              | Don't send the combined email.                        |
 | `--poll-interval N`         | Continuous-mode S3 poll interval (seconds).           |
 | `--partial-wait N`          | Wait this many minutes for missing cameras.           |
+| `--source trimmed\|raw`     | What this deployment consumes.  `trimmed` (default) = the input prefixes already hold trimmed clips and this process is a pure consumer.  `raw` = only raw CCTV exists, so this process also runs train extraction first. |
+| `--ocr-engine rekognition\|easyocr` | Wagon-number reader.  `rekognition` (default) is V4 parity (AWS DetectText on a 3-frame sheet); `easyocr` is the local, no-network engine. |
+| `--skip-model-sync`         | Skip the startup model-availability check / S3 sync. |
 | `--disable-features LIST`   | Comma-separated feature keys to turn OFF (`door,ocr,load,damage`); skips the interactive prompt. |
 | `--no-interactive`          | Never prompt for feature config (force all features ON unless `--disable-features` is given). |
 

@@ -25,3 +25,13 @@ requests>=2.31.0
 
 # imageio for the wagon_count overlay path (kept by Stage 1)
 imageio-ffmpeg>=0.4.9
+
+# --- System dependency, NOT pip-installable -------------------------------
+# `--source raw` (train extraction) trims and concatenates clips by invoking the
+# `ffmpeg` BINARY directly (train_extraction/video_io.py), preferring NVENC and
+# falling back to libx264.  imageio-ffmpeg above does NOT satisfy this -- it
+# bundles a wheel-local binary that is not on PATH.  Install ffmpeg itself:
+#     Amazon Linux / RHEL:  sudo dnf install -y ffmpeg
+#     Debian / Ubuntu:      sudo apt-get install -y ffmpeg
+#     macOS:                brew install ffmpeg
+# Not needed for `--source trimmed` (the default).
