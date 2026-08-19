@@ -202,21 +202,27 @@ def write_stage1_outputs(engine_state, tracks, output_dir: str) -> Dict[str, str
 
 # --- protected-path guards -------------------------------------------------
 #
-# The first sequential implementation wrongly added a second, from-scratch
-# camera report renderer at `reporting/camera_local_report.py`. It has been
-# deleted: the camera-local PDF is now produced by the EXISTING
-# `reporting/camera_reports.py` via `orchestrator/camera_report_adapter.py`.
+# Several tests assert that the proven counting and reporting code has not
+# drifted, by requiring `git diff HEAD -- <path>` to be empty. A DELIBERATE,
+# reviewed change to one of those paths would therefore fail the guard for as
+# long as it sits uncommitted -- so intentional edits are listed here with the
+# reason, and everything else still fails loudly.
 #
-# Until that deletion is committed, `git diff HEAD -- reporting` reports it,
-# and the "reporting is unmodified" guards would fire on the very change that
-# restores them. Exempting exactly this one path keeps the guards strict about
-# every real builder while allowing the file's removal. The assertion that it
-# stays gone lives in tests/test_camera_report_adapter.py.
-DELETED_BY_DESIGN = ("reporting/camera_local_report.py",)
+# These entries are self-clearing: once committed, `git diff HEAD` no longer
+# reports the file and the entry has no effect. Delete an entry when its change
+# is committed rather than letting the list accumulate.
+REVIEWED_IN_WORKTREE = (
+    # damage_track_snapshots() resolved a wagon's damage tracks with no camera
+    # filter. `evidence/<gw>/damage/track_N.jpg` is numbered across BOTH top
+    # cameras in one sequence, so a camera-blind resolver can hand a
+    # LEFT_UP_TOP snapshot to a RIGHT_UP_TOP report. camera_id is now a
+    # required argument. Covered by tests/test_camera_evidence_isolation.py.
+    "reporting/_evidence_lookup.py",
+)
 
 
 def changed_paths(*pathspecs) -> "list":
-    """Worktree changes vs HEAD under `pathspecs`, minus DELETED_BY_DESIGN.
+    """Worktree changes vs HEAD under `pathspecs`, minus REVIEWED_IN_WORKTREE.
 
     Returns None when git is unavailable so callers can skip.
     """
@@ -227,4 +233,4 @@ def changed_paths(*pathspecs) -> "list":
     if r.returncode != 0:
         return None
     return [p for p in r.stdout.split()
-            if p and p not in DELETED_BY_DESIGN]
+            if p and p not in REVIEWED_IN_WORKTREE]

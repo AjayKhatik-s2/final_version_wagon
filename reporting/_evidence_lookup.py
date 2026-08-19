@@ -188,13 +188,26 @@ def evidence_metadata(
 
 
 def damage_track_snapshots(
-    evidence_root: Optional[str], gw_id: str, max_tracks: int = 3,
+    evidence_root: Optional[str], gw_id: str, camera_id: str,
+    max_tracks: int = 3,
 ) -> List[Tuple[str, Dict[str, Any]]]:
-    """Resolve up to `max_tracks` damage track snapshots for one wagon.
+    """Resolve up to `max_tracks` damage track snapshots for ONE camera.
 
-    Returns a list of (path, track_metadata) tuples sorted by
-    `best_confidence` descending so the report shows the most certain
-    damages first.  Missing files / missing metadata yield an empty list.
+    `camera_id` is required, and that is deliberate. A wagon's
+    `evidence/<gw>/damage/` directory holds the tracks of BOTH top cameras
+    side by side -- `track_1..track_N` is a single sequence numbered across
+    RIGHT_UP_TOP and LEFT_UP_TOP together, and the only thing that says which
+    camera a track came from is `camera_id` in `metadata.json`. A resolver
+    that skips that filter will happily hand a LEFT_UP_TOP snapshot to a
+    RIGHT_UP_TOP report; the two top cameras can look near-identical, so the
+    mistake is invisible on inspection.
+
+    Camera identity is therefore part of the lookup, not an optional refinement
+    the caller may forget. `camera_reports._camera_damage_tracks` and
+    `combined_train_report._top_damage_snapshot` apply the same filter.
+
+    Returns (path, track_metadata) sorted by `best_confidence` descending, so
+    the most certain damage shows first. Missing files or metadata yield [].
     """
     meta = evidence_metadata(evidence_root, gw_id, "damage")
     tracks = meta.get("tracks") or []
@@ -202,6 +215,8 @@ def damage_track_snapshots(
     for tr in tracks:
         if not isinstance(tr, dict):
             continue
+        if tr.get("camera_id") != camera_id:
+            continue                    # another camera's track -- never ours
         idx = tr.get("track_idx")
         if not idx:
             continue
