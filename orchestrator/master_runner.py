@@ -1011,7 +1011,8 @@ def run_sequential(
 # HISTORICAL MODE (opt-in) -- input selection only; reuses process_batch
 # -----------------------------------------------------------------------------
 
-def run_historical(args, *, feature_config=None, inference_opts=None) -> int:
+def run_historical(args, *, feature_config=None, inference_opts=None,
+                   mode_explicit: bool = False) -> int:
     """CLI adapter for `--historical`.
 
     Resolves the requested window, opens an S3 client, and delegates to
@@ -1024,6 +1025,16 @@ def run_historical(args, *, feature_config=None, inference_opts=None) -> int:
     """
     from orchestrator import historical_runner as HR
     from orchestrator import train_batch_manager as TBM
+
+    # Only an explicit `--mode sequential` switches architecture (see the
+    # dispatch comment): a bare `--historical` stays on the validated batch path
+    # even though --mode now defaults to sequential for foreground runs.
+    hist_mode = ("sequential" if (mode_explicit and args.mode == "sequential")
+                 else "batch")
+    if hist_mode == "sequential":
+        print("[HISTORICAL] architecture: SEQUENTIAL (per-camera -> assembly)"
+              + ("  + per-camera dashboard posts"
+                 if args.deliver_per_camera else ""))
 
     # The requested window is parsed FIRST: it is pure and instant, so a typo in
     # --date / --start-time is reported immediately rather than after a
@@ -1092,6 +1103,8 @@ def run_historical(args, *, feature_config=None, inference_opts=None) -> int:
         send_email=not args.skip_email,
         manifest_out=args.manifest_out,
         inference_opts=inference_opts,
+        mode=hist_mode,
+        deliver_per_camera=args.deliver_per_camera,
     )
 
 
@@ -1316,28 +1329,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Historical is opt-in and dispatches FIRST, so it can never fall through
     # into the live polling loop.  It returns unconditionally.
     if args.historical:
-        # Reject a combination that would otherwise be silently ignored: both
-        # flags name an execution architecture, and historical wins by dispatch
-        # order.  Saying so beats letting an operator believe their historical
-        # window ran through the sequential path.
+        # `--historical --mode sequential` is now SUPPORTED: historical stages
+        # each discovered batch's clips out of S3 and then runs the same
+        # per-camera -> assembly path the foreground sequential mode uses.  It
+        # used to be rejected only because historical knew how to call nothing
+        # but `process_batch`.
         #
-        # Only an EXPLICIT --mode sequential is a conflict. Since --mode now
-        # defaults to sequential, testing args.mode alone would reject every
-        # historical run, including the plain `--historical --historical-from
-        # ... --historical-to ...` an operator actually types.
-        if args.mode == "sequential" and mode_explicit:
-            print("ERROR: --historical and --mode sequential are different "
-                  "execution paths and cannot be combined.  Historical mode "
-                  "feeds the batch pipeline (process_batch); drop --mode "
-                  "sequential.", file=sys.stderr)
-            return 2
+        # An EXPLICIT --mode still decides.  Since --mode defaults to sequential,
+        # a bare `--historical` must NOT silently switch architecture: it stays
+        # on the batch path, which is the one validated end to end (2026-07-29:
+        # 2 trains, 58 wagons, 4/4 cameras ingested).
         if args.auto:
             print("ERROR: --historical and --auto are mutually exclusive "
                   "(one processes a past window once, the other polls for live "
                   "batches forever).  Pick one.", file=sys.stderr)
             return 2
         return run_historical(args, feature_config=feature_config,
-                              inference_opts=inference_opts)
+                              inference_opts=inference_opts,
+                              mode_explicit=mode_explicit)
 
     # --mode selects the architecture for FOREGROUND runs only.
     #

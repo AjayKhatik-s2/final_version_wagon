@@ -649,20 +649,25 @@ class TestLivePathUnchanged(unittest.TestCase):
                          "plain --historical must still reach run_historical")
         self.assertEqual(rc, 0)
 
-    def test_explicit_sequential_with_historical_is_still_rejected(self):
-        """The branch's guard must keep working when it IS explicit."""
-        entered = []
+    def test_explicit_sequential_with_historical_now_runs_sequential(self):
+        """This combination used to be REJECTED, because historical could only
+        call `process_batch`.  It is now supported: historical stages each
+        discovered batch's clips and runs the per-camera -> assembly path.
+
+        What still matters, and is asserted here, is that the explicit request
+        REACHES historical rather than being swallowed."""
+        seen = {}
         real_hist = MR.run_historical
-        MR.run_historical = lambda *a, **k: entered.append("hist") or 0
+        MR.run_historical = lambda *a, **k: seen.update(k) or 0
         try:
             rc = MR.main(["--historical", "--mode", "sequential",
                           "--date", "2026-08-08", "--start-time", "10:00",
                           "--end-time", "12:00", "--no-interactive"])
         finally:
             MR.run_historical = real_hist
-        self.assertEqual(rc, 2)
-        self.assertEqual(entered, [],
-                         "an explicit --mode sequential must not run historical")
+        self.assertEqual(rc, 0)
+        self.assertTrue(seen.get("mode_explicit"),
+                        "the explicit --mode must reach run_historical")
 
     def test_explicit_mode_is_detected_in_both_spellings(self):
         """`--mode sequential` and `--mode=sequential` are the same request."""
@@ -670,7 +675,8 @@ class TestLivePathUnchanged(unittest.TestCase):
                      ["--historical", "--mode=sequential"]):
             with self.subTest(argv=argv):
                 real_hist = MR.run_historical
-                MR.run_historical = lambda *a, **k: 0
+                seen = {}
+                MR.run_historical = lambda *a, **k: seen.update(k) or 0
                 try:
                     rc = MR.main(argv + ["--date", "2026-08-08",
                                          "--start-time", "10:00",
@@ -678,7 +684,11 @@ class TestLivePathUnchanged(unittest.TestCase):
                                          "--no-interactive"])
                 finally:
                     MR.run_historical = real_hist
-                self.assertEqual(rc, 2)
+                # Formerly rc == 2 (rejected).  Both spellings must now be
+                # DETECTED as explicit and accepted; what is asserted is that
+                # neither is silently ignored.
+                self.assertEqual(rc, 0)
+                self.assertTrue(seen.get("mode_explicit"), argv)
 
     def test_explicit_batch_with_historical_is_accepted(self):
         """Historical feeds process_batch, so --mode batch is consistent."""
@@ -790,14 +800,20 @@ class TestHistoricalFlagConflicts(unittest.TestCase):
     silently -- historical wins by dispatch order, so an operator could believe
     their window ran through a path it never touched."""
 
-    def test_historical_plus_sequential_is_rejected(self):
-        buf = io.StringIO()
-        with redirect_stderr(buf):
-            rc = MR.main(["--historical", "--mode", "sequential",
-                          "--date", "2026-08-08", "--start-time", "10:00",
-                          "--end-time", "12:00", "--no-interactive"])
-        self.assertEqual(rc, 2)
-        self.assertIn("cannot be combined", buf.getvalue())
+    def test_historical_plus_sequential_is_supported(self):
+        """Was rejected; now runs the per-camera -> assembly path."""
+        real = MR.run_historical
+        MR.run_historical = lambda *a, **k: 0
+        try:
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                rc = MR.main(["--historical", "--mode", "sequential",
+                              "--date", "2026-08-08", "--start-time", "10:00",
+                              "--end-time", "12:00", "--no-interactive"])
+        finally:
+            MR.run_historical = real
+        self.assertEqual(rc, 0)
+        self.assertNotIn("cannot be combined", buf.getvalue())
 
     def test_historical_plus_auto_is_rejected(self):
         buf = io.StringIO()
@@ -892,3 +908,188 @@ class TestFilenameTimestampConsistency(unittest.TestCase):
         age = TrainBatch(batch_key=ts, train_timestamp=ts, videos={}).age_seconds()
         self.assertGreater(age, 0)
         self.assertLess(age, 900)
+
+
+class TestHistoricalSequential(unittest.TestCase):
+    """`--historical --mode sequential`: stage the clips, then per-camera ->
+    assembly, using the SAME two entry points the foreground sequential path
+    uses so the two architectures cannot diverge."""
+
+    def setUp(self):
+        self._real = MR.process_batch
+        self.calls = []
+        MR.process_batch = lambda **kw: (_ for _ in ()).throw(
+            AssertionError("sequential mode must NOT call process_batch"))
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ws = self._tmp.name
+
+    def tearDown(self):
+        MR.process_batch = self._real
+        self._tmp.cleanup()
+
+    def test_staging_downloads_each_camera_once(self):
+        from core.batch import CameraVideo, TrainBatch
+        got = []
+
+        class S3:
+            def download_file(self, bucket, key, dest):
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                open(dest, "wb").write(b"\x00")
+                got.append((bucket, key))
+
+        b = TrainBatch(batch_key="20260729_103722",
+                       train_timestamp="20260729_103722",
+                       videos={cam: CameraVideo(
+                           camera_id=cam, bucket="bkt",
+                           s3_key=_key(cam, "20260729_103722"),
+                           filename=f"{cam}.mp4", s3_url="",
+                           train_timestamp="20260729_103722")
+                           for cam in C.ALL_CAMERAS})
+        root = os.path.join(self.ws, b.batch_key)
+        paths = HR.stage_clips(b, root, S3(), verbose=False)
+        self.assertEqual(set(paths), set(C.ALL_CAMERAS))
+        self.assertEqual(len(got), 4)
+        for p in paths.values():
+            self.assertTrue(os.path.isfile(p))
+
+    def test_staging_reuses_an_already_staged_clip(self):
+        """A resumed run must not re-download what is already on disk."""
+        from core.batch import CameraVideo, TrainBatch
+        calls = []
+
+        class S3:
+            def download_file(self, bucket, key, dest):
+                calls.append(key)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                open(dest, "wb").write(b"\x00")
+
+        b = TrainBatch(batch_key="k", train_timestamp="k", videos={
+            C.CAMERA_RIGHT_UP: CameraVideo(
+                camera_id=C.CAMERA_RIGHT_UP, bucket="bkt", s3_key="a.mp4",
+                filename="a.mp4", s3_url="", train_timestamp="k")})
+        root = os.path.join(self.ws, "k")
+        HR.stage_clips(b, root, S3(), verbose=False)
+        HR.stage_clips(b, root, S3(), verbose=False)
+        self.assertEqual(len(calls), 1, "second staging should be a no-op")
+
+    def test_a_camera_that_fails_to_stage_does_not_stop_the_others(self):
+        from core.batch import CameraVideo, TrainBatch
+
+        class S3:
+            def download_file(self, bucket, key, dest):
+                # The site's folder for LEFT_UP_TOP is `..._6_LEFT_TOP` -- there
+                # is no "LEFT_UP_TOP" substring in the key.  Match the real
+                # folder, which is the whole point of CAMERA_S3_FOLDER.
+                if C.CAMERA_S3_FOLDER[C.CAMERA_LEFT_UP_TOP] in key:
+                    raise RuntimeError("403")
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                open(dest, "wb").write(b"\x00")
+
+        b = TrainBatch(batch_key="k", train_timestamp="k", videos={
+            cam: CameraVideo(camera_id=cam, bucket="bkt",
+                             s3_key=_key(cam, "20260729_103722"),
+                             filename=f"{cam}.mp4", s3_url="",
+                             train_timestamp="k")
+            for cam in C.ALL_CAMERAS})
+        paths = HR.stage_clips(b, os.path.join(self.ws, "k"), S3(), verbose=False)
+        self.assertEqual(len(paths), 3)
+        self.assertNotIn(C.CAMERA_LEFT_UP_TOP, paths)
+
+    def test_sequential_calls_run_camera_per_camera_then_assemble_once(self):
+        from core.batch import CameraVideo, TrainBatch
+        from orchestrator import camera_runner, global_assembler
+
+        cams_run, assembled = [], []
+
+        class _Res:
+            def __init__(self, cam):
+                self.camera_id, self.state = cam, "SEALED"
+                self.local_segments, self.per_camera_ingest = 3, None
+
+        class _Asm:
+            total_wagons = 58
+
+        real_rc, real_as = camera_runner.run_camera, global_assembler.assemble
+        camera_runner.run_camera = lambda **kw: (
+            cams_run.append(kw["camera_id"]) or _Res(kw["camera_id"]))
+        global_assembler.assemble = lambda **kw: (
+            assembled.append(kw) or _Asm())
+
+        class S3:
+            def download_file(self, bucket, key, dest):
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                open(dest, "wb").write(b"\x00")
+
+        try:
+            b = TrainBatch(batch_key="20260729_103722",
+                           train_timestamp="20260729_103722",
+                           videos={cam: CameraVideo(
+                               camera_id=cam, bucket="bkt",
+                               s3_key=_key(cam, "20260729_103722"),
+                               filename=f"{cam}.mp4", s3_url="",
+                               train_timestamp="20260729_103722")
+                               for cam in C.ALL_CAMERAS})
+            asm = HR.process_batch_sequential(
+                b, hist_root=self.ws, s3_client=S3(),
+                recon_models_dir="/m/r", feat_models_dir="/m/f",
+                deliver=True, deliver_per_camera=True, verbose=False)
+        finally:
+            camera_runner.run_camera = real_rc
+            global_assembler.assemble = real_as
+
+        self.assertEqual(cams_run, list(C.ALL_CAMERAS),
+                         "each camera runs once, in canonical order")
+        self.assertEqual(len(assembled), 1, "assembly runs exactly once")
+        self.assertTrue(assembled[0]["deliver"])
+        self.assertEqual(assembled[0]["batch_key"], "20260729_103722")
+        self.assertEqual(asm.total_wagons, 58)
+
+    def test_run_forwards_the_mode(self):
+        import inspect
+        params = inspect.signature(HR.run).parameters
+        self.assertIn("mode", params)
+        self.assertEqual(params["mode"].default, "batch",
+                         "historical must default to the validated batch path")
+        self.assertIn("deliver_per_camera", params)
+
+
+class TestHistoricalModeSelection(unittest.TestCase):
+    """`--mode` defaults to sequential for foreground runs, so a BARE
+    `--historical` must not silently change architecture."""
+
+    def test_bare_historical_is_no_longer_rejected(self):
+        buf = io.StringIO()
+        real = MR.run_historical
+        MR.run_historical = lambda *a, **k: 0
+        try:
+            with redirect_stderr(buf):
+                rc = MR.main(["--historical", "--date", "2026-08-08",
+                              "--start-time", "10:00", "--end-time", "12:00",
+                              "--no-interactive"])
+        finally:
+            MR.run_historical = real
+        self.assertEqual(rc, 0)
+        self.assertNotIn("cannot be combined", buf.getvalue())
+
+    def test_explicit_sequential_is_accepted(self):
+        real = MR.run_historical
+        seen = {}
+        MR.run_historical = lambda *a, **k: seen.update(k) or 0
+        try:
+            rc = MR.main(["--historical", "--mode", "sequential",
+                          "--date", "2026-08-08", "--start-time", "10:00",
+                          "--end-time", "12:00", "--no-interactive"])
+        finally:
+            MR.run_historical = real
+        self.assertEqual(rc, 0)
+        self.assertTrue(seen.get("mode_explicit"),
+                        "an explicit --mode must reach run_historical")
+
+    def test_historical_plus_auto_is_still_rejected(self):
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            rc = MR.main(["--historical", "--auto", "--date", "2026-08-08",
+                          "--start-time", "10:00", "--end-time", "12:00",
+                          "--no-interactive"])
+        self.assertEqual(rc, 2)
+        self.assertIn("mutually exclusive", buf.getvalue())

@@ -534,6 +534,115 @@ def _no_match_message(res: DiscoveryResult) -> str:
     )
 
 
+def stage_clips(batch: TrainBatch, batch_root: str, s3_client,
+                *, verbose: bool = True) -> Dict[str, str]:
+    """Download this batch's clips into `<batch_root>/downloads/`.
+
+    The batch path gets this for free -- `process_batch` downloads inline -- but
+    the sequential path needs real local files before a camera can run, so
+    staging is explicit here.  Mirrors `process_batch`'s naming
+    (`<CAMERA>_<filename>`) so the two trees are interchangeable when debugging.
+    """
+    dl = os.path.join(batch_root, CFG.DIR_DOWNLOADS)
+    os.makedirs(dl, exist_ok=True)
+    out: Dict[str, str] = {}
+    for cam in C.ALL_CAMERAS:
+        cv = batch.videos.get(cam)
+        if cv is None:
+            continue
+        dest = os.path.join(dl, f"{cam}_{cv.filename}")
+        if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+            out[cam] = dest          # already staged: a resumed run re-uses it
+            continue
+        try:
+            s3_client.download_file(cv.bucket, cv.s3_key, dest)
+            out[cam] = dest
+            if verbose:
+                log.info("[HISTORICAL] staged %s -> %s", cam, dest)
+        except Exception as e:  # noqa: BLE001 - one camera must not stop the rest
+            log.error("[HISTORICAL] could not stage %s (%s): %s",
+                      cam, cv.s3_key, e)
+    return out
+
+
+def process_batch_sequential(
+    batch: TrainBatch,
+    *,
+    hist_root: str,
+    s3_client,
+    recon_models_dir: str,
+    feat_models_dir: str,
+    feature_config=None,
+    deliver: bool = False,
+    deliver_per_camera: bool = False,
+    send_email: bool = False,
+    verbose: bool = True,
+):
+    """Run ONE historical batch through the SEQUENTIAL architecture.
+
+    Each camera is processed and sealed independently -- and, with
+    `deliver_per_camera`, publishes to the dashboard the moment it seals -- then
+    global assembly fuses the persisted evidence and delivers the canonical
+    documents.
+
+    This calls exactly the same two entry points `run_sequential` calls, in the
+    same order and with the same arguments, so historical and foreground
+    sequential runs cannot diverge:
+
+        orchestrator.camera_runner.run_camera(...)   per camera
+        orchestrator.global_assembler.assemble(...)  once
+
+    The only thing added is staging the clips out of S3 first, because a
+    historical window's inputs are not already on disk.
+    """
+    from orchestrator import camera_runner, global_assembler
+
+    batch_root = os.path.join(hist_root, batch.batch_key)
+    evidence_root = os.path.join(batch_root, "camera_evidence")
+    os.makedirs(evidence_root, exist_ok=True)
+
+    videos = stage_clips(batch, batch_root, s3_client, verbose=verbose)
+    if not videos:
+        log.error("[HISTORICAL] %s: no clip could be staged -- skipping",
+                  batch.batch_key)
+        return None
+
+    from core.feature_config import FeatureConfig
+    enabled = (feature_config or FeatureConfig.all_on()).enabled_keys()
+
+    results = []
+    for cam in C.ALL_CAMERAS:
+        vp = videos.get(cam)
+        if not vp:
+            log.info("[HISTORICAL/%s] no clip staged -- camera skipped", cam)
+            continue
+        log.info("[HISTORICAL/%s] --- ARRIVAL (sequential) ---", cam)
+        results.append(camera_runner.run_camera(
+            camera_id=cam, video_path=vp,
+            recon_models_dir=recon_models_dir,
+            feat_models_dir=feat_models_dir,
+            evidence_root=evidence_root,
+            enabled_features=enabled,
+            deliver_per_camera=deliver_per_camera,
+            s3_client=s3_client,
+            verbose=verbose))
+
+    for r in results:
+        line = f"[HISTORICAL/{r.camera_id}] {r.state} segments={r.local_segments}"
+        pci = getattr(r, "per_camera_ingest", None)
+        if pci is not None:
+            line += f"  {pci.render()}"
+        log.info("%s", line)
+
+    log.info("[HISTORICAL] --- GLOBAL ASSEMBLY %s ---", batch.batch_key)
+    asm = global_assembler.assemble(
+        evidence_root=evidence_root, output_root=hist_root,
+        batch_key=batch.batch_key, feat_models_dir=feat_models_dir,
+        deliver=deliver, send_email=send_email, s3_client=s3_client,
+        verbose=verbose)
+    return asm
+
+
 def run(
     *,
     s3_client,
@@ -550,6 +659,8 @@ def run(
     send_email: bool = True,
     manifest_out: Optional[str] = None,
     inference_opts: Optional[Dict[str, Any]] = None,
+    mode: str = "batch",
+    deliver_per_camera: bool = False,
     verbose: bool = True,
 ) -> int:
     """Discover, stage and process every train batch in `window`.
@@ -593,6 +704,41 @@ def run(
         batch_root = os.path.join(hist_root, batch.batch_key)
         log.info("[HISTORICAL] staging inputs -> %s",
                  os.path.join(batch_root, CFG.DIR_DOWNLOADS))
+        # ---- sequential architecture ---------------------------------------
+        # Same two entry points the foreground sequential path uses; the only
+        # difference is that the clips are staged out of S3 first.
+        if mode == "sequential":
+            log.info("[HISTORICAL] invoking SEQUENTIAL pipeline "
+                     "(per-camera -> assembly)")
+            t0 = time.time()
+            try:
+                asm = process_batch_sequential(
+                    batch,
+                    hist_root=hist_root,
+                    s3_client=s3_client,
+                    recon_models_dir=recon_models_dir,
+                    feat_models_dir=feat_models_dir,
+                    feature_config=feature_config,
+                    deliver=deliver,
+                    deliver_per_camera=deliver_per_camera,
+                    send_email=send_email,
+                    verbose=verbose,
+                )
+            except Exception as e:  # noqa: BLE001 - one batch must not stop the rest
+                log.error("[HISTORICAL] batch %s raised %s: %s",
+                          batch.batch_key, type(e).__name__, e, exc_info=True)
+                failures.append(batch.batch_key)
+                continue
+            ok = bool(asm is not None and asm.total_wagons > 0)
+            log.info("[HISTORICAL] batch %d/%d %s: wagons=%s (%.1fs)",
+                     i, total, "completed" if ok else "FAILED",
+                     getattr(asm, "total_wagons", 0), time.time() - t0)
+            if ok:
+                _cleanup_inputs(batch_root, keep_inputs=keep_inputs)
+            else:
+                failures.append(batch.batch_key)
+            continue
+
         log.info("[HISTORICAL] invoking existing pipeline (process_batch)")
         t0 = time.time()
         try:
