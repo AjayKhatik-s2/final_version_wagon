@@ -536,3 +536,70 @@ class TestOperatorStoreNames(unittest.TestCase):
         from core import model_sync as MS
         reqs = MS.required_models(["door", "load", "damage"])   # ocr OFF
         self.assertNotIn(C.MODEL_WAGON_NUMBER, [r.filename for r in reqs])
+
+
+class TestEveryProcessorResolvesModelsTheSameWay(unittest.TestCase):
+    """A feature must find its model under the store's own filename too.
+
+    `model_sync` fetches by accepted alias and validates presence through
+    `constants.feature_model_path`.  Three processors bypassed that resolver and
+    joined the CANONICAL name directly, so on a store holding `load.pt` /
+    `top_damage.pt` the sync reported the models present while Load and Damage
+    found nothing and wrote NO_DATA for EVERY wagon -- two whole features silently
+    missing from the reports, and both TOP cameras absent from the dashboard
+    because no wagon listed them in `supporting_cameras`.
+
+    Observed on the 2026-07-29 run: 58 wagons, load NO_DATA x58, damage
+    NO_DATA x58, only RIGHT_UP and LEFT_UP ingested.
+    """
+
+    FEATURES = ("door", "load", "damage", "ocr")
+
+    def _src(self, feat):
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "features", feat, "processor.py"),
+                  encoding="utf-8") as f:
+            return f.read()
+
+    def test_no_processor_joins_the_canonical_name_directly(self):
+        for feat in self.FEATURES:
+            self.assertNotRegex(
+                self._src(feat), r"os\.path\.join\(feature_models_dir,\s*C\.MODEL",
+                f"{feat} bypasses constants.feature_model_path")
+
+    def test_every_processor_uses_the_shared_resolver(self):
+        for feat in self.FEATURES:
+            self.assertIn("feature_model_path", self._src(feat),
+                          f"{feat} must resolve through feature_model_path")
+
+    def test_resolver_finds_the_store_name_for_every_feature_model(self):
+        """The end-to-end property: a store that uses its own names still works."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            # Exactly what model_sync leaves on disk from complete-train/new_local
+            for name in ("door_state.pt", "load.pt", "top_damage.pt"):
+                open(os.path.join(d, name), "wb").close()
+            self.assertTrue(os.path.isfile(
+                C.feature_model_path(d, C.MODEL_DOOR_STATE)))
+            self.assertEqual(os.path.basename(
+                C.feature_model_path(d, C.MODEL_LOADED)), "load.pt")
+            self.assertEqual(os.path.basename(
+                C.feature_model_path(d, C.MODEL_DAMAGE)), "top_damage.pt")
+
+    def test_sync_validation_and_runtime_resolution_agree(self):
+        """model_sync must never report a model present that a processor cannot
+        open -- that inconsistency is what hid the failure for a whole run."""
+        import tempfile
+        from core import model_sync as MS
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("door_state.pt", "load.pt", "top_damage.pt"):
+                open(os.path.join(d, name), "wb").close()
+            feature_reqs = [r for r in MS.required_models(["door", "load", "damage"])
+                            if r.category == "features"]
+            self.assertEqual(len(feature_reqs), 3, "expected door/load/damage")
+            for req in feature_reqs:
+                resolved = C.feature_model_path(d, req.filename)
+                self.assertTrue(
+                    os.path.isfile(resolved),
+                    f"{req.filename}: sync would call this present, but the "
+                    f"processor would open {resolved}")

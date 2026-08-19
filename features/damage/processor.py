@@ -444,7 +444,13 @@ def run(
         raise ValueError(
             f"damage inference_mode must be 'legacy' or 'sampled', got {mode!r}")
 
-    model_path = os.path.join(feature_models_dir, C.MODEL_DAMAGE)
+    # Resolve through the SHARED resolver, which accepts the store's own
+    # filename for this model (core.constants.FEATURE_MODEL_LEGACY).  Building
+    # the path directly bypassed that: `model_sync` fetched the alias and
+    # reported the model present, while this processor looked only for the
+    # canonical name, found nothing, and wrote NO_DATA for EVERY wagon -- a
+    # whole feature silently absent from the reports and the dashboard.
+    model_path = C.feature_model_path(feature_models_dir, C.MODEL_DAMAGE)
     yolo_model = load_yolo(model_path)
 
     feature_out = os.path.join(output_dir, FEATURE_NAME)
