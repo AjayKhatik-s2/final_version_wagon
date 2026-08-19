@@ -929,6 +929,8 @@ def run_sequential(
     batch_key: Optional[str] = None,
     feature_config: Optional[FeatureConfig] = None,
     arrival_order: Optional[List[str]] = None,
+    deliver: bool = False,
+    send_email: bool = False,
     verbose: bool = True,
 ) -> int:
     """Process each camera independently, then assemble.
@@ -975,7 +977,8 @@ def run_sequential(
     print("--- GLOBAL ASSEMBLY ---")
     asm = global_assembler.assemble(
         evidence_root=evidence_root, output_root=workspace,
-        batch_key=key, feat_models_dir=feat_models_dir, verbose=verbose)
+        batch_key=key, feat_models_dir=feat_models_dir,
+        deliver=deliver, send_email=send_email, verbose=verbose)
 
     elapsed = time.time() - t0
     print("=" * 78)
@@ -989,6 +992,8 @@ def run_sequential(
     for cam, sm in asm.mapping_by_camera.items():
         print(f"  mapping {cam:<13} {sm['by_kind']}")
     print(f"  combined pdf  : {asm.report_pdf_path or '(none)'}")
+    if getattr(asm, "delivery", None) is not None:
+        print(asm.delivery.render())
     print(f"  TOTAL         : {elapsed:.1f}s")
     return 0 if asm.ready and asm.total_wagons > 0 else 3
 
@@ -1150,6 +1155,19 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="shorthand: force BOTH Door and Damage to legacy "
                         "every-frame tracking (pre-optimization behaviour)")
 
+    # ---- republish a FINISHED batch, with no inference re-run --------------
+    p.add_argument("--deliver-only", default=None, metavar="BATCH_DIR",
+                   help="deliver an already-finished batch directory: upload its "
+                        "reports/evidence/videos, post the 4 per-camera dashboard "
+                        "documents and call the ML API, running NO inference.  "
+                        "Use it when a delivery failed, or was left off, and "
+                        "re-running the pipeline would cost ~30 min per train.")
+    p.add_argument("--deliver", action="store_true",
+                   help="in --mode sequential, publish after assembly (S3 upload "
+                        "+ dashboard ingest + ML API).  OFF by default so a "
+                        "sequential run under validation cannot reach the live "
+                        "dashboard.")
+
     # ---- historical (time-range) mode --------------------------------------
     # Purely an INPUT-SELECTION layer: it resolves which already-trimmed S3 clips
     # fall in a requested time range and hands each resulting TrainBatch to the
@@ -1257,6 +1275,20 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"  damage={_dmg_mode}/stride={args.damage_sample_stride}"
           f"  load={_load_mode}/stride={args.load_sample_stride}")
 
+    # --deliver-only dispatches before everything: it runs no inference, touches
+    # no discovery and returns unconditionally, so it can never fall through into
+    # a processing mode.
+    if args.deliver_only:
+        from delivery import finalize
+        res = finalize.deliver(
+            batch_root=args.deliver_only,
+            send_email=not args.skip_email,
+            dry_run=args.dry_run,
+            verbose=True,
+        )
+        print(res.render())
+        return 0 if (res.ok or args.dry_run) else 3
+
     # Historical is opt-in and dispatches FIRST, so it can never fall through
     # into the live polling loop.  It returns unconditionally.
     if args.historical:
@@ -1302,7 +1334,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             local_inputs=args.local_inputs, workspace=args.workspace,
             recon_models_dir=args.recon_models_dir,
             feat_models_dir=args.feat_models_dir,
-            batch_key=args.batch, feature_config=feature_config)
+            batch_key=args.batch, feature_config=feature_config,
+            deliver=args.deliver, send_email=not args.skip_email)
 
     if args.local_only:
         return run_local(

@@ -73,6 +73,7 @@ class AssemblyResult:
     report_pdf_path: str = ""
     report_json_path: str = ""
     yolo_calls_during_assembly: int = 0     # must stay 0
+    delivery: Any = None                   # delivery.finalize.DeliveryResult
 
 
 def _load_master_classifications(bundle: CameraEvidenceBundle) -> List[Any]:
@@ -165,6 +166,11 @@ def assemble(
     feat_models_dir: str = "",
     master_camera: str = C.MASTER_CAMERA,
     all_cameras: Tuple[str, ...] = C.ALL_CAMERAS,
+    # Delivery is OFF by default so an assembly under validation cannot publish
+    # to the live dashboard.  Existing callers keep their exact behaviour.
+    deliver: bool = False,
+    send_email: bool = False,
+    s3_client=None,
     verbose: bool = True,
 ) -> AssemblyResult:
     """Fuse sealed camera bundles into the global train + combined report."""
@@ -364,6 +370,36 @@ def assemble(
     except Exception as e:
         print(f"[ASSEMBLY] combined report failed: {e}")
     res.timings["combined_report"] = round(time.perf_counter() - t0, 3)
+
+    # ---- Stage 6: deliver (S3 archive + dashboard feed + ML API) -----------
+    # Sequential mode used to END here.  It uploaded nothing, posted nothing and
+    # emailed nothing, so a sequential run produced ZERO dashboard entries --
+    # which became a production hole the moment sequential became the default
+    # foreground mode.  Delivery is the SAME disk-based implementation the
+    # `--deliver-only` republish path uses, so there is one place that talks to
+    # S3 and the receivers from a finished batch tree.
+    #
+    # Opt-in, and off by default: an assembly run that is being validated must
+    # not publish to the live dashboard until asked.  `deliver=True` turns it on.
+    if deliver:
+        t0 = time.perf_counter()
+        try:
+            from delivery import finalize
+            res.delivery = finalize.deliver(
+                batch_root=batch_root,
+                s3_client=s3_client,
+                batch_key=batch_key,
+                missing_cameras=sorted(set(res.failed_cameras)
+                                       | set(res.missing_cameras)),
+                send_email=send_email,
+                verbose=verbose,
+            )
+        except Exception as e:  # noqa: BLE001 - delivery must not fail assembly
+            print(f"[ASSEMBLY] delivery failed (non-fatal): {e}")
+        res.timings["delivery"] = round(time.perf_counter() - t0, 3)
+    elif verbose:
+        print("[ASSEMBLY] delivery DISABLED (no S3 upload, no dashboard ingest, "
+              "no email) -- pass deliver=True / --historical-deliver to enable")
 
     res.timings["total"] = round(time.perf_counter() - t_all, 3)
     if verbose:
