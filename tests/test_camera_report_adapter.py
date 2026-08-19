@@ -411,7 +411,13 @@ def _pdf_text(path: str) -> str:
         keep the candidate that actually looks like a content stream.
         """
         body = body.strip()
-        cands = [body]
+        # DECODED candidates first, raw last. ReportLab stamps a creation
+        # timestamp and document id, so the encoded bytes differ on every run;
+        # an ASCII85 payload occasionally contains the literal bytes "BT" and
+        # "Tj" by coincidence. With the raw body tried first that coincidence
+        # wins over the correctly decoded stream and the real text is never
+        # extracted -- an intermittent failure, roughly one run in fifty.
+        cands = []
         for step in (
             lambda d: base64.a85decode(d, adobe=True),
             lambda d: zlib.decompress(d),
@@ -421,6 +427,7 @@ def _pdf_text(path: str) -> str:
                 cands.append(step(body))
             except Exception:
                 pass
+        cands.append(body)                      # last resort: uncompressed
         for c in cands:
             if b"BT" in c and (b"Tj" in c or b"TJ" in c):
                 return c

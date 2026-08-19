@@ -211,14 +211,7 @@ def write_stage1_outputs(engine_state, tracks, output_dir: str) -> Dict[str, str
 # These entries are self-clearing: once committed, `git diff HEAD` no longer
 # reports the file and the entry has no effect. Delete an entry when its change
 # is committed rather than letting the list accumulate.
-REVIEWED_IN_WORKTREE = (
-    # damage_track_snapshots() resolved a wagon's damage tracks with no camera
-    # filter. `evidence/<gw>/damage/track_N.jpg` is numbered across BOTH top
-    # cameras in one sequence, so a camera-blind resolver can hand a
-    # LEFT_UP_TOP snapshot to a RIGHT_UP_TOP report. camera_id is now a
-    # required argument. Covered by tests/test_camera_evidence_isolation.py.
-    "reporting/_evidence_lookup.py",
-)
+REVIEWED_IN_WORKTREE = ()
 
 
 def changed_paths(*pathspecs) -> "list":
