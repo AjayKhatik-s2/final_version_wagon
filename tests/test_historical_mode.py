@@ -586,7 +586,10 @@ class TestLivePathUnchanged(unittest.TestCase):
 
     def test_existing_defaults_are_unchanged(self):
         args = self._parse([])
-        self.assertEqual(args.mode, "batch")
+        # --mode now defaults to sequential (b0905a0). Everything else here is
+        # untouched; historical dispatches before --mode is consulted, and the
+        # sequential/historical conflict is only raised for an EXPLICIT --mode.
+        self.assertEqual(args.mode, "sequential")
         self.assertEqual(args.poll_interval, 60)
         self.assertEqual(args.partial_wait, 30.0)
         self.assertEqual(args.door_inference_mode, "sampled")
@@ -623,6 +626,73 @@ class TestLivePathUnchanged(unittest.TestCase):
             MR.run_auto, MR.run_historical = real_auto, real_hist
         self.assertEqual(rc, 0)
         self.assertEqual(entered, [], "historical must not reach run_auto")
+
+    def test_historical_still_dispatches_under_the_sequential_default(self):
+        """--mode now defaults to sequential; historical must survive that.
+
+        The historical branch rejects `--mode sequential` because the two name
+        different execution paths. Once sequential became the DEFAULT, testing
+        args.mode alone would have rejected every historical run -- including
+        the plain invocation an operator actually types, where --mode was never
+        passed at all. The check therefore keys on an EXPLICIT --mode.
+        """
+        entered = []
+        real_hist = MR.run_historical
+        MR.run_historical = lambda *a, **k: entered.append("hist") or 0
+        try:
+            rc = MR.main(["--historical", "--date", "2026-08-08",
+                          "--start-time", "10:00", "--end-time", "12:00",
+                          "--no-interactive"])
+        finally:
+            MR.run_historical = real_hist
+        self.assertEqual(entered, ["hist"],
+                         "plain --historical must still reach run_historical")
+        self.assertEqual(rc, 0)
+
+    def test_explicit_sequential_with_historical_is_still_rejected(self):
+        """The branch's guard must keep working when it IS explicit."""
+        entered = []
+        real_hist = MR.run_historical
+        MR.run_historical = lambda *a, **k: entered.append("hist") or 0
+        try:
+            rc = MR.main(["--historical", "--mode", "sequential",
+                          "--date", "2026-08-08", "--start-time", "10:00",
+                          "--end-time", "12:00", "--no-interactive"])
+        finally:
+            MR.run_historical = real_hist
+        self.assertEqual(rc, 2)
+        self.assertEqual(entered, [],
+                         "an explicit --mode sequential must not run historical")
+
+    def test_explicit_mode_is_detected_in_both_spellings(self):
+        """`--mode sequential` and `--mode=sequential` are the same request."""
+        for argv in (["--historical", "--mode", "sequential"],
+                     ["--historical", "--mode=sequential"]):
+            with self.subTest(argv=argv):
+                real_hist = MR.run_historical
+                MR.run_historical = lambda *a, **k: 0
+                try:
+                    rc = MR.main(argv + ["--date", "2026-08-08",
+                                         "--start-time", "10:00",
+                                         "--end-time", "12:00",
+                                         "--no-interactive"])
+                finally:
+                    MR.run_historical = real_hist
+                self.assertEqual(rc, 2)
+
+    def test_explicit_batch_with_historical_is_accepted(self):
+        """Historical feeds process_batch, so --mode batch is consistent."""
+        entered = []
+        real_hist = MR.run_historical
+        MR.run_historical = lambda *a, **k: entered.append("hist") or 0
+        try:
+            rc = MR.main(["--historical", "--mode", "batch",
+                          "--date", "2026-08-08", "--start-time", "10:00",
+                          "--end-time", "12:00", "--no-interactive"])
+        finally:
+            MR.run_historical = real_hist
+        self.assertEqual(entered, ["hist"])
+        self.assertEqual(rc, 0)
 
     def test_auto_never_enters_historical(self):
         entered = []

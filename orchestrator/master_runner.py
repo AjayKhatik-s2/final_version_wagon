@@ -1137,12 +1137,15 @@ def _build_parser() -> argparse.ArgumentParser:
                         "makes the stride explicit.")
     p.add_argument("--load-sample-stride", type=int, default=2,
                    help="Load frame stride when sampled (default: 2)")
-    p.add_argument("--mode", choices=("batch", "sequential"), default="batch",
-                   help="Pipeline architecture. 'batch' (DEFAULT) is the "
-                        "proven process_batch() path, unchanged. 'sequential' "
-                        "is EXPERIMENTAL: each camera is processed and sealed "
-                        "independently, then global assembly fuses the "
-                        "persisted evidence.")
+    p.add_argument("--mode", choices=("batch", "sequential"),
+                   default="sequential",
+                   help="Pipeline architecture for FOREGROUND runs. "
+                        "'sequential' (DEFAULT) processes and seals each "
+                        "camera independently, then assembles the persisted "
+                        "evidence. 'batch' is the original process_batch() "
+                        "path, unchanged and still fully supported. This flag "
+                        "does NOT affect --auto/--once/--batch, which always "
+                        "run the live S3 discovery path.")
     p.add_argument("--legacy-inference", action="store_true",
                    help="shorthand: force BOTH Door and Damage to legacy "
                         "every-frame tracking (pre-optimization behaviour)")
@@ -1209,6 +1212,14 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
 
+    # Did the operator actually type --mode, or is this the default?
+    # --mode now defaults to "sequential", so paths that must reject an
+    # explicit sequential request (historical) cannot infer intent from
+    # args.mode alone.
+    _raw_argv = list(sys.argv[1:] if argv is None else argv)
+    mode_explicit = any(a == "--mode" or a.startswith("--mode=")
+                        for a in _raw_argv)
+
     # File + stdout logging for the long-running service (idempotent).
     setup_logging()
 
@@ -1253,7 +1264,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         # flags name an execution architecture, and historical wins by dispatch
         # order.  Saying so beats letting an operator believe their historical
         # window ran through the sequential path.
-        if args.mode == "sequential":
+        #
+        # Only an EXPLICIT --mode sequential is a conflict. Since --mode now
+        # defaults to sequential, testing args.mode alone would reject every
+        # historical run, including the plain `--historical --historical-from
+        # ... --historical-to ...` an operator actually types.
+        if args.mode == "sequential" and mode_explicit:
             print("ERROR: --historical and --mode sequential are different "
                   "execution paths and cannot be combined.  Historical mode "
                   "feeds the batch pipeline (process_batch); drop --mode "
@@ -1267,9 +1283,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         return run_historical(args, feature_config=feature_config,
                               inference_opts=inference_opts)
 
-    # Sequential is opt-in and dispatches BEFORE the batch path; batch mode
-    # continues to reach the unchanged process_batch() exactly as before.
-    if args.mode == "sequential":
+    # --mode selects the architecture for FOREGROUND runs only.
+    #
+    # The live S3 paths -- --auto (polling daemon), --once (one discovery
+    # cycle) and a bare --batch <key> (one discovered batch) -- have always
+    # been served by run_auto(), and they must keep reaching it. This branch
+    # returns unconditionally, so without the guard below, defaulting --mode to
+    # sequential would divert `--auto` into a local run and silently stop
+    # production polling. Live dispatch therefore wins over --mode.
+    #
+    # `--batch <key>` with --local-only is NOT a live invocation: there the key
+    # only names the output directory, exactly as it does for run_local().
+    live_dispatch = bool(args.auto or args.once
+                         or (args.batch and not args.local_only))
+
+    if args.mode == "sequential" and not live_dispatch:
         return run_sequential(
             local_inputs=args.local_inputs, workspace=args.workspace,
             recon_models_dir=args.recon_models_dir,
