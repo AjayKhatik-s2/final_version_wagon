@@ -20,7 +20,7 @@ import os
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from core import constants as C
 from core.camera_evidence import (
@@ -42,6 +42,7 @@ class CameraRunResult:
     state: str = "PENDING"
     sealed: bool = False
     failure_reason: str = ""
+    per_camera_ingest: Any = None       # delivery.camera_inspection result
     local_segments: int = 0
     accepted_gaps: int = 0
     rejected_gaps: int = 0
@@ -120,6 +121,8 @@ def run_camera(
     evidence_root: str,
     enabled_features: Optional[List[str]] = None,
     camera_local_features: bool = True,
+    deliver_per_camera: bool = False,
+    s3_client=None,
     verbose: bool = True,
 ) -> CameraRunResult:
     """Drive ONE camera PENDING -> SEALED.
@@ -301,6 +304,28 @@ def run_camera(
 
         bundle.advance("SEALED")
         res.state, res.sealed = "SEALED", True
+
+        # ---- publish THIS camera to the dashboard, immediately -------------
+        # Deliberately AFTER the seal: the camera's work is already persisted, so
+        # a receiver outage cannot un-seal it or fail the run.  The document uses
+        # this camera's OWN segment numbering -- see delivery.camera_inspection
+        # for what that means and does not mean.
+        if deliver_per_camera:
+            try:
+                from delivery import camera_inspection
+                res.per_camera_ingest = camera_inspection.publish(
+                    bundle,
+                    s3_client=s3_client,
+                    fps=out.tracks.fps,
+                    total_frames=out.tracks.total_frames,
+                    raw_video_name=os.path.basename(video_path),
+                    verbose=verbose,
+                )
+                if verbose and res.per_camera_ingest is not None:
+                    print(f"[SEQ/{camera_id}] {res.per_camera_ingest.render()}")
+            except Exception as e:  # noqa: BLE001 - never un-seal a camera
+                print(f"[SEQ/{camera_id}] per-camera ingest failed "
+                      f"(non-fatal): {type(e).__name__}: {e}")
 
     except Exception as e:
         res.failure_reason = f"{type(e).__name__}: {e}"

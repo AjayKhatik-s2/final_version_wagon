@@ -930,6 +930,7 @@ def run_sequential(
     feature_config: Optional[FeatureConfig] = None,
     arrival_order: Optional[List[str]] = None,
     deliver: bool = False,
+    deliver_per_camera: bool = False,
     send_email: bool = False,
     verbose: bool = True,
 ) -> int:
@@ -972,7 +973,9 @@ def run_sequential(
             recon_models_dir=recon_models_dir,
             feat_models_dir=feat_models_dir,
             evidence_root=evidence_root,
-            enabled_features=enabled, verbose=verbose))
+            enabled_features=enabled,
+            deliver_per_camera=deliver_per_camera,
+            verbose=verbose))
 
     print("--- GLOBAL ASSEMBLY ---")
     asm = global_assembler.assemble(
@@ -984,6 +987,12 @@ def run_sequential(
     print("=" * 78)
     print(f"  SEQUENTIAL SUMMARY  {key}")
     print("=" * 78)
+    if deliver_per_camera:
+        print("  per-camera dashboard posts (camera-local numbering, "
+              "superseded by assembly):")
+        for r in results:
+            if getattr(r, "per_camera_ingest", None) is not None:
+                print(f"    {r.per_camera_ingest.render()}")
     for r in results:
         print(f"  {r.camera_id:<13} {r.state:<8} segments={r.local_segments:<4} "
               f"gaps={r.accepted_gaps:<4} calls={r.feature_calls} "
@@ -1167,6 +1176,16 @@ def _build_parser() -> argparse.ArgumentParser:
                         "+ dashboard ingest + ML API).  OFF by default so a "
                         "sequential run under validation cannot reach the live "
                         "dashboard.")
+    p.add_argument("--deliver-per-camera", action="store_true",
+                   help="in --mode sequential, POST each camera's inspection to "
+                        "the dashboard THE MOMENT that camera seals, without "
+                        "waiting for the other three or for global assembly.  "
+                        "These documents use the camera's OWN segment numbering "
+                        "(wagon n is that camera's nth segment, NOT the fused "
+                        "GW_n), exactly as V4's independent per-camera pipelines "
+                        "do, and they are superseded by the canonical documents "
+                        "assembly publishes afterwards.  Written to a separate "
+                        "per_camera/ S3 prefix so the two never overwrite.")
 
     # ---- historical (time-range) mode --------------------------------------
     # Purely an INPUT-SELECTION layer: it resolves which already-trimmed S3 clips
@@ -1245,6 +1264,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     # explicit flag is expressed as an env override -- one authority, no drift.
     if args.ocr_engine:
         os.environ["WAGONEYE_OCR_ENGINE"] = args.ocr_engine
+
+    # The flag is the operator's intent; `camera_inspection.is_enabled()` is the
+    # runtime authority and reads this variable, so one place decides.
+    if getattr(args, "deliver_per_camera", False):
+        os.environ["WAGONEYE_PER_CAMERA_INGEST"] = "true"
 
     # Pipeline source: explicit flag wins over WAGONEYE_PIPELINE_SOURCE.
     source = PipelineSource.resolve(args.source)
@@ -1335,7 +1359,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             recon_models_dir=args.recon_models_dir,
             feat_models_dir=args.feat_models_dir,
             batch_key=args.batch, feature_config=feature_config,
-            deliver=args.deliver, send_email=not args.skip_email)
+            deliver=args.deliver,
+            deliver_per_camera=args.deliver_per_camera,
+            send_email=not args.skip_email)
 
     if args.local_only:
         return run_local(
