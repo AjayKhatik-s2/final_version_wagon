@@ -63,22 +63,41 @@ def _seal(root, cam, *, segments=None, features=None):
 
 
 class TestCliDispatch(unittest.TestCase):
-    def test_batch_is_the_default(self):
-        self.assertEqual(_parse(["--local-only"]).mode, "batch")
-        self.assertEqual(_parse([]).mode, "batch")
+    """Sequential is the DEFAULT architecture for foreground runs.
 
-    def test_sequential_parses(self):
+    Batch is not removed -- `--mode batch` still reaches the unchanged
+    process_batch() path.
+    """
+
+    def test_sequential_is_the_default(self):
+        self.assertEqual(_parse([]).mode, "sequential")
+        self.assertEqual(_parse(["--local-only"]).mode, "sequential")
+
+    def test_explicit_sequential_parses(self):
         self.assertEqual(_parse(["--mode", "sequential"]).mode, "sequential")
 
+    def test_explicit_batch_still_parses(self):
+        self.assertEqual(_parse(["--mode", "batch"]).mode, "batch")
+
     def test_only_two_modes_accepted(self):
-        with self.assertRaises(SystemExit):
-            _parse(["--mode", "turbo"])
+        for bad in ("turbo", "fast", "legacy"):
+            with self.subTest(mode=bad), self.assertRaises(SystemExit):
+                _parse(["--mode", bad])
+
+    def test_help_documents_sequential_as_the_default(self):
+        from orchestrator.master_runner import _build_parser
+        action = next(a for a in _build_parser()._actions
+                      if "--mode" in (a.option_strings or []))
+        self.assertEqual(action.default, "sequential")
+        self.assertEqual(tuple(action.choices), ("batch", "sequential"))
+        self.assertIn("DEFAULT", action.help)
 
     def test_sequential_dispatches_before_process_batch(self):
         from orchestrator import master_runner
         src = inspect.getsource(master_runner.main)
+        # anchor on the CALL -- the guard's comment mentions run_local() above
         self.assertLess(src.index('args.mode == "sequential"'),
-                        src.index("run_local("),
+                        src.index("return run_local("),
                         "sequential must be checked before the batch path")
 
     def test_sequential_path_does_not_call_process_batch(self):
@@ -96,6 +115,127 @@ class TestCliDispatch(unittest.TestCase):
         self.assertEqual(p["door_sample_stride"].default, 3)
         self.assertEqual(p["damage_sample_stride"].default, 3)
         self.assertEqual(p["load_sample_stride"].default, 2)
+
+
+class TestMainDispatchRouting(unittest.TestCase):
+    """Which entry point main() actually calls, per invocation.
+
+    Parsing the right value is not the same as dispatching to the right
+    function: the sequential branch returns unconditionally, so before the
+    live guard existed, defaulting to sequential would have swallowed --auto
+    and stopped production polling. These route the real main() with the three
+    entry points mocked.
+    """
+
+    ENTRIES = ("run_sequential", "run_local", "run_auto")
+
+    def _route(self, argv):
+        from unittest import mock
+        from orchestrator import master_runner as mr
+        with mock.patch.object(mr, "run_sequential", return_value=0) as seq, \
+             mock.patch.object(mr, "run_local", return_value=0) as loc, \
+             mock.patch.object(mr, "run_auto", return_value=0) as auto, \
+             mock.patch.object(mr, "resolve_feature_config",
+                               return_value=mr.FeatureConfig.all_on()):
+            rc = mr.main(list(argv))
+        called = [n for n, m in zip(self.ENTRIES, (seq, loc, auto)) if m.called]
+        self.assertLessEqual(len(called), 1, f"{argv} called {called}")
+        return (called[0] if called else None), rc
+
+    def test_no_mode_runs_sequential(self):
+        self.assertEqual(self._route([])[0], "run_sequential")
+
+    def test_local_only_runs_sequential(self):
+        self.assertEqual(self._route(["--local-only"])[0], "run_sequential")
+
+    def test_explicit_sequential_runs_sequential(self):
+        self.assertEqual(self._route(["--mode", "sequential"])[0],
+                         "run_sequential")
+
+    def test_explicit_batch_local_only_runs_the_batch_path(self):
+        self.assertEqual(self._route(["--mode", "batch", "--local-only"])[0],
+                         "run_local")
+
+    def test_explicit_batch_without_a_target_still_errors(self):
+        """Unchanged: bare --mode batch has never been a runnable invocation."""
+        who, rc = self._route(["--mode", "batch"])
+        self.assertIsNone(who)
+        self.assertEqual(rc, 2)
+
+    def test_local_only_batch_key_names_the_output_not_an_s3_batch(self):
+        self.assertEqual(self._route(["--local-only", "--batch", "k"])[0],
+                         "run_sequential")
+
+
+class TestLiveDispatchIsProtected(unittest.TestCase):
+    """--auto/--once/--batch must reach run_auto() whatever --mode says.
+
+    This is the regression that flipping the default could have caused: the
+    polling daemon silently replaced by a one-shot local run.
+    """
+
+    def _route(self, argv):
+        return TestMainDispatchRouting._route(self, argv)
+
+    ENTRIES = TestMainDispatchRouting.ENTRIES
+
+    def test_auto_still_reaches_run_auto(self):
+        self.assertEqual(self._route(["--auto"])[0], "run_auto")
+
+    def test_once_still_reaches_run_auto(self):
+        self.assertEqual(self._route(["--once"])[0], "run_auto")
+
+    def test_discovered_batch_still_reaches_run_auto(self):
+        self.assertEqual(self._route(["--batch", "20260408_032134"])[0],
+                         "run_auto")
+
+    def test_mode_cannot_divert_the_live_daemon(self):
+        for argv in (["--mode", "sequential", "--auto"],
+                     ["--mode", "batch", "--auto"],
+                     ["--mode", "sequential", "--once"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(self._route(argv)[0], "run_auto")
+
+    def test_the_guard_is_documented_at_the_branch(self):
+        from orchestrator import master_runner
+        src = inspect.getsource(master_runner.main)
+        self.assertIn("live_dispatch", src)
+        self.assertLess(src.index("live_dispatch = "),
+                        src.index('args.mode == "sequential"'),
+                        "the live guard must be computed before the branch")
+
+    def test_run_auto_is_still_called_with_the_same_arguments(self):
+        """The live contract is the CALL SITE.
+
+        run_auto() itself takes (*args, **kwargs) and forwards to the legacy
+        train_batch_manager, so its own signature asserts nothing. What must
+        not drift is what main() hands it.
+        """
+        import ast
+        from orchestrator import master_runner
+        fn = next(n for n in ast.walk(ast.parse(
+            inspect.getsource(master_runner.main)))
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "id", None) == "run_auto")
+        passed = {kw.arg for kw in fn.keywords}
+        for name in ("workspace", "recon_models_dir", "feat_models_dir",
+                     "poll_interval", "partial_wait_minutes", "run_once",
+                     "force_batch_key", "skip_upload", "skip_email",
+                     "feature_config", "inference_opts"):
+            self.assertIn(name, passed, f"run_auto no longer receives {name}")
+
+    def test_polling_arguments_keep_their_sources(self):
+        """--poll-interval / --partial-wait still feed the daemon unchanged."""
+        import ast
+        from orchestrator import master_runner
+        call = next(n for n in ast.walk(ast.parse(
+            inspect.getsource(master_runner.main)))
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "id", None) == "run_auto")
+        by_name = {kw.arg: ast.unparse(kw.value) for kw in call.keywords}
+        self.assertEqual(by_name["poll_interval"], "args.poll_interval")
+        self.assertEqual(by_name["partial_wait_minutes"], "args.partial_wait")
+        self.assertEqual(by_name["force_batch_key"], "args.batch")
 
 
 class TestStrideConfigUnchanged(unittest.TestCase):
