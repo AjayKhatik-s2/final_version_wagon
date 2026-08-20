@@ -46,7 +46,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from core import constants as C
 from core.logging_setup import get_logger
@@ -100,6 +100,8 @@ class CameraIngestResult:
     local_json: str = ""
     segments: int = 0
     key_mode: str = ""
+    assets_uploaded: int = 0
+    assets_failed: int = 0
     errors: List[str] = field(default_factory=list)
 
     def render(self) -> str:
@@ -108,6 +110,10 @@ class CameraIngestResult:
             bits.append(f"segments={self.segments}")
         if self.key_mode:
             bits.append(f"key={self.key_mode}")
+        if self.assets_uploaded or self.assets_failed:
+            bits.append(f"images={self.assets_uploaded}"
+                        + (f"/{self.assets_failed}failed"
+                           if self.assets_failed else ""))
         if self.run_id:
             bits.append(f"run_id={self.run_id}")
         if self.errors:
@@ -154,6 +160,34 @@ def source_video_name(raw_video_name: str, camera_id: str) -> str:
             if raw_video_name.startswith(prefix) else raw_video_name)
 
 
+def _upload_assets(s3_client, bucket: str,
+                   assets: Sequence[Tuple[str, str]]) -> Tuple[int, int]:
+    """Upload the evidence JPEGs a document references. Returns (ok, failed).
+
+    De-duplicated: the same frame is legitimately referenced from several places
+    in one document (a wagon gallery and a feature snapshot can be the same
+    file), and uploading it once is enough.
+
+    Never raises. A failed image costs one broken thumbnail; it must not stop
+    the document from being published, because the document still carries the
+    wagon data that is the point of the early post.
+    """
+    ok = failed = 0
+    # dict.fromkeys keeps first-seen order while dropping repeats.
+    for local, key in dict.fromkeys(assets):
+        if not os.path.isfile(local):
+            failed += 1
+            continue
+        try:
+            s3_client.upload_file(local, bucket, key,
+                                  ExtraArgs={"ContentType": "image/jpeg"})
+            ok += 1
+        except Exception as e:  # noqa: BLE001
+            log.warning("[PER-CAMERA] evidence upload failed %s: %s", key, e)
+            failed += 1
+    return ok, failed
+
+
 def _train_ts(batch_key: str, raw_video_name: str, bundle):
     """The train's timestamp, derived the way the FUSED path derives it.
 
@@ -185,8 +219,14 @@ def build_document(
     raw_video_name: str = "",
     direction: str = "unknown",
     batch_key: str = "",
+    assets: Optional[List[Tuple[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Build this camera's `{camera_id, version, inspection_data}` document.
+
+    `assets` -- when a list is passed, every (local_path, s3_key) pair this
+    document references is appended to it. `publish()` uses that to UPLOAD the
+    referenced images, because a document that names an object nobody created is
+    a document full of broken thumbnails.
 
     Uses the camera-scoped state + fused states from
     `orchestrator.camera_report_adapter.adapt()`, so the authority rules, anomaly
@@ -213,13 +253,19 @@ def build_document(
     def _url_for(*, gw_id: str, feature: str, camera: str, filename: str):
         # The camera-local evidence tree is flat per feature, exactly the layout
         # `evidence_rel_path` already resolves.  A URL is only produced for a
-        # file that EXISTS, so a document never references a missing frame.
+        # file that EXISTS LOCALLY -- but that is not enough on its own: the
+        # browser fetches these over HTTPS, so the file has to reach S3 too.
+        # Every minted URL is therefore recorded in `assets` for `publish()` to
+        # upload. Emitting the URL without uploading is what made a provisional
+        # document render as a page of broken thumbnails.
         rel = DASH.evidence_rel_path(evidence_root, gw_id, feature, camera,
                                      filename)
         if not rel:
             return None
         bucket = DASH.inspection_bucket()
         key = f"{folder}/{DASH.date_folder(ts)}/camera_evidence/{rel}"
+        if assets is not None:
+            assets.append((os.path.join(evidence_root, rel), key))
         return f"https://{bucket}.s3.{C.S3_REGION}.amazonaws.com/{key}"
 
     doc = IJ.build_inspection_json(
@@ -294,9 +340,10 @@ def publish(
         return res
 
     try:
+        assets: List[Tuple[str, str]] = []
         doc = build_document(bundle, fps=fps, total_frames=total_frames,
                              raw_video_name=raw_video_name, direction=direction,
-                             batch_key=batch_key)
+                             batch_key=batch_key, assets=assets)
         res.built = True
         res.segments = int(doc["inspection_data"].get("total_wagons") or 0)
     except Exception as e:  # noqa: BLE001
@@ -354,6 +401,15 @@ def publish(
             res.status = "no_s3_client"
             res.errors.append(str(e))
             return res
+
+    # Evidence FIRST, then the JSON. A reader that sees the document must find
+    # the images it names; publishing the document before its images would show a
+    # broken page for as long as the uploads took.
+    res.assets_uploaded, res.assets_failed = _upload_assets(s3_client, bucket,
+                                                            assets)
+    if res.assets_failed:
+        res.errors.append(f"{res.assets_failed} evidence file(s) failed to "
+                          f"upload")
 
     try:
         s3_client.upload_file(res.local_json, bucket, key,

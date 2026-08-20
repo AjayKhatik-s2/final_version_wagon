@@ -45,6 +45,18 @@ from delivery import camera_inspection as CI                        # noqa: E402
 from test_camera_report_adapter import _bundle                      # noqa: E402
 
 
+def _json_upload(s3):
+    """The DOCUMENT upload among s3.uploads.
+
+    `publish()` uploads the referenced evidence JPEGs before the JSON, so the
+    document is no longer `uploads[0]`. Selecting it by extension keeps these
+    tests indifferent to how many images a fixture happens to reference.
+    """
+    hits = [(b, k) for b, k in s3.uploads if k.endswith(".json")]
+    assert len(hits) == 1, f"expected exactly one JSON upload, got {hits}"
+    return hits[0]
+
+
 class _StubS3:
     def __init__(self, fail=False):
         self.uploads = []
@@ -210,7 +222,11 @@ class TestPublish(unittest.TestCase):
                              verbose=False)
             self.assertEqual(res.status, "ingested", res.errors)
             self.assertEqual(res.segments, len(segs))
-            self.assertEqual(len(s3.uploads), 1)
+            # One document, plus however many evidence images it references.
+            self.assertEqual(len([k for _b, k in s3.uploads
+                                  if k.endswith(".json")]), 1)
+            self.assertTrue(all(k.endswith((".json", ".jpg"))
+                                for _b, k in s3.uploads))
             self.assertEqual(len(req.calls), len(DASH.ingest_api_urls()))
 
     def test_key_matches_the_canonical_one_so_assembly_replaces_it(self):
@@ -232,7 +248,7 @@ class TestPublish(unittest.TestCase):
             CI.publish(b, s3_client=s3, requests_mod=_StubRequests(),
                        raw_video_name=clip, batch_key="20260729_103722",
                        verbose=False)
-            _bucket, key = s3.uploads[0]
+            _bucket, key = _json_upload(s3)
             self.assertNotIn("/per_camera/", key)
             ts = DASH.extract_train_timestamp("20260729_103722")
             canonical = DASH.inspection_s3_key(
@@ -251,7 +267,7 @@ class TestPublish(unittest.TestCase):
                                  requests_mod=_StubRequests(),
                                  raw_video_name="clip_20260729_103722_train.mp4",
                                  batch_key="20260729_103722", verbose=False)
-            _bucket, key = s3.uploads[0]
+            _bucket, key = _json_upload(s3)
             self.assertIn("/per_camera/", key)
             self.assertEqual(res.key_mode, CI.KEY_MODE_SIDECAR)
 
@@ -578,7 +594,7 @@ class TestStagingPrefixDoesNotBreakReplacement(unittest.TestCase):
                 CI.publish(b, s3_client=s3, requests_mod=_StubRequests(),
                            raw_video_name=self.STAGED,
                            batch_key=self.BATCH_KEY, verbose=False)
-            _bucket, key = s3.uploads[0]
+            _bucket, key = _json_upload(s3)
             self.assertNotIn("RIGHT_UP_camera_", key)
             self.assertIn("camera_CCTV_HZBN_DHN_2_RIGHT_UP_20260731_052218",
                           key)
@@ -651,3 +667,100 @@ class TestProvisionalAndFusedShareOneIdentity(unittest.TestCase):
         src = _inspect.getsource(DASH._run_inner)
         self.assertIn('pj.get("json_sha256") == json_sha', src)
         self.assertIn("already_ingested", src)
+
+
+class TestProvisionalImagesAreActuallyUploaded(unittest.TestCase):
+    """A document must not name an S3 object nobody created.
+
+    `build_document` minted evidence URLs under
+    `<folder>/<date>/camera_evidence/...` in the inspection bucket, checking only
+    that the file existed LOCALLY -- while `publish()` uploaded the JSON alone.
+    Every thumbnail in a provisional document was therefore a 404. Confirmed on
+    2026-07-22: the fused document's images returned HTTP 200 from the report
+    bucket, while the provisional document referenced camera_evidence objects
+    that did not exist.
+    """
+
+    def setUp(self):
+        self._saved = _enable()
+
+    def tearDown(self):
+        _restore(self._saved)
+
+    def test_every_referenced_image_is_uploaded(self):
+        with tempfile.TemporaryDirectory() as root:
+            b, _ = _bundle(root)
+            s3 = _StubS3()
+            CI.publish(b, s3_client=s3, requests_mod=_StubRequests(),
+                       raw_video_name="clip_20260729_103722_train.mp4",
+                       batch_key="20260729_103722", verbose=False)
+
+            uploaded = {key for _bucket, key in s3.uploads}
+            doc_urls = set()
+            with open(
+                [k for k in
+                 [os.path.join(dp, f) for dp, _d, fs in os.walk(b.dir)
+                  for f in fs] if k.endswith("_inspection.json")][0],
+                encoding="utf-8") as f:
+                import re
+                doc_urls = set(re.findall(r'https://[^"]+\.jpg', f.read()))
+
+            missing = [u for u in doc_urls
+                       if u.split(".amazonaws.com/", 1)[-1] not in uploaded]
+            self.assertEqual(missing, [],
+                             f"{len(missing)} referenced image(s) were never "
+                             f"uploaded")
+
+    def test_the_result_reports_the_image_count(self):
+        with tempfile.TemporaryDirectory() as root:
+            b, _ = _bundle(root)
+            res = CI.publish(b, s3_client=_StubS3(),
+                             requests_mod=_StubRequests(),
+                             batch_key="20260729_103722", verbose=False)
+            self.assertGreaterEqual(res.assets_uploaded, 0)
+            self.assertEqual(res.assets_failed, 0, res.errors)
+
+    def test_images_are_uploaded_before_the_json(self):
+        """Publishing the document first would show a broken page meanwhile."""
+        import inspect as _inspect
+        src = _inspect.getsource(CI.publish)
+        self.assertLess(src.index("_upload_assets"),
+                        src.index("upload_file(res.local_json"))
+
+    def test_duplicate_references_upload_once(self):
+        from delivery.camera_inspection import _upload_assets
+
+        class _S3:
+            def __init__(self): self.n = 0
+            def upload_file(self, *a, **k): self.n += 1
+
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "a.jpg")
+            open(f, "wb").write(b"x")
+            s3 = _S3()
+            ok, failed = _upload_assets(s3, "b", [(f, "k/a.jpg")] * 5)
+            self.assertEqual((ok, failed, s3.n), (1, 0, 1))
+
+    def test_a_failed_image_does_not_stop_publication(self):
+        from delivery.camera_inspection import _upload_assets
+
+        class _S3:
+            def upload_file(self, *a, **k): raise RuntimeError("denied")
+
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "a.jpg")
+            open(f, "wb").write(b"x")
+            ok, failed = _upload_assets(_S3(), "b", [(f, "k/a.jpg")])
+            self.assertEqual((ok, failed), (0, 1))
+
+    def test_a_missing_local_file_is_counted_not_raised(self):
+        from delivery.camera_inspection import _upload_assets
+        ok, failed = _upload_assets(_StubS3(), "b", [("/nope/x.jpg", "k.jpg")])
+        self.assertEqual((ok, failed), (0, 1))
+
+    def test_build_document_without_assets_still_works(self):
+        """The parameter is optional; existing callers are unchanged."""
+        with tempfile.TemporaryDirectory() as root:
+            b, _ = _bundle(root)
+            doc = CI.build_document(b, batch_key="20260729_103722")
+            self.assertIn("inspection_data", doc)
