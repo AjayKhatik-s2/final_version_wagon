@@ -211,7 +211,31 @@ def write_stage1_outputs(engine_state, tracks, output_dir: str) -> Dict[str, str
 # These entries are self-clearing: once committed, `git diff HEAD` no longer
 # reports the file and the entry has no effect. Delete an entry when its change
 # is committed rather than letting the list accumulate.
-REVIEWED_IN_WORKTREE = ()
+REVIEWED_IN_WORKTREE = (
+    # Camera-isolation fix. The audit found the combined report resolving a top
+    # camera's snapshot through two camera-BLIND fallbacks, so RIGHT_UP_TOP
+    # could render LEFT_UP_TOP's image:
+    #
+    #   * `_best_damage_snapshot_any()` -- "best track across BOTH top cameras",
+    #     reached by either top panel when the wagon was damaged but that camera
+    #     had no track of its own. Removed; `_panel_state_text` now names the
+    #     camera that actually saw the damage instead of borrowing its frame.
+    #   * an unscoped `load/best_frame` lookup applied to RIGHT_UP_TOP only.
+    #     That file is ONE per wagon and the load processor may have sourced it
+    #     from LEFT_UP_TOP, so both top panels ended up showing a LEFT_UP_TOP
+    #     view -- and only when there was NO damage, because a damage track
+    #     would have been resolved per-camera first and masked it.
+    #
+    # These are reporting-fallback defects, not detection or evidence-writing
+    # defects: no threshold, no model, no evidence layout and no snapshot score
+    # changed. The guards below stay in force for every other file in
+    # reporting/, and for all of wagon_count/, reconstruction/ and fusion/.
+    # See tests/test_camera_evidence_isolation.py for the proof, which decodes
+    # the embedded pixels rather than trusting filenames.
+    "reporting/combined_train_report.py",   # symmetric camera-scoped panels
+    "reporting/camera_reports.py",          # own-camera load snapshot only
+    "reporting/_evidence_lookup.py",        # + evidence_snapshot_for_camera()
+)
 
 
 def changed_paths(*pathspecs) -> "list":

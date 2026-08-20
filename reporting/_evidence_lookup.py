@@ -172,6 +172,45 @@ def evidence_snapshot(
     return p if os.path.isfile(p) else None
 
 
+def evidence_snapshot_for_camera(
+    evidence_root: Optional[str], gw_id: str, feature: str, slot: str,
+    camera_id: str, *, source_key: str = "source_camera",
+) -> Optional[str]:
+    """`evidence_snapshot`, but ONLY if that file belongs to `camera_id`.
+
+    Some features write ONE file per wagon even though two cameras could have
+    produced it.  `load/best_frame.jpg` is the case that matters: the load
+    processor picks a single `source_cam` -- RIGHT_UP_TOP when it has data for
+    the winning class, else LEFT_UP_TOP -- and saves that camera's frame under
+    a filename with no camera in it (features/load/processor.py).  The path
+    therefore cannot say who owns the image; only `metadata.json`'s
+    `source_camera` can.
+
+    A resolver that skips that check hands the other camera's frame to this
+    camera's report, and because the two top views look alike the substitution
+    is invisible on inspection.  That is exactly the defect this function
+    exists to make impossible.
+
+    Ownership must be PROVEN, not assumed: when the metadata carries no
+    attribution at all, this returns None rather than guessing.  None is a safe
+    answer -- every caller's remaining fallback is the wagon_cache frame for
+    this camera, which is camera-correct by construction (`_cache_frame_path`
+    keys on `C.CAMERA_FOLDER[camera_id]`).  Borrowing is never a fallback.
+    """
+    if not camera_id:
+        raise ValueError(
+            "evidence_snapshot_for_camera requires camera_id: camera identity "
+            "is part of the lookup, not an optional refinement")
+    path = evidence_snapshot(evidence_root, gw_id, feature, slot)
+    if not path:
+        return None
+    meta = evidence_metadata(evidence_root, gw_id, feature)
+    owner = meta.get(source_key) or meta.get("camera_id")
+    if not owner:
+        return None                  # unproven ownership is not ownership
+    return path if owner == camera_id else None
+
+
 def evidence_metadata(
     evidence_root: Optional[str], gw_id: str, feature: str,
 ) -> Dict[str, Any]:

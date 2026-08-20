@@ -280,15 +280,21 @@ class TestNoSecondRenderer(unittest.TestCase):
                 self.assertNotIn(banned, src)
 
     def test_existing_report_builders_unmodified(self):
-        import subprocess
-        r = subprocess.run(["git", "diff", "--name-only", "HEAD",
-                            "reporting/camera_reports.py",
-                            "reporting/combined_train_report.py",
-                            "reporting/_pages.py", "reporting/_brand.py"],
-                           cwd=V4_ROOT, capture_output=True, text=True)
-        if r.returncode != 0:
+        # Routed through the shared `changed_paths` helper rather than calling
+        # `git diff` directly, so this guard honours the SAME reviewed-exception
+        # list as the four other drift guards. It previously ran its own
+        # subprocess, which meant a deliberate, reviewed reporting change had to
+        # be waived in two different places -- and was silently enforced here
+        # even after being waived there.
+        from _engine_harness import changed_paths
+        modified = changed_paths(
+            "reporting/camera_reports.py",
+            "reporting/combined_train_report.py",
+            "reporting/_pages.py", "reporting/_brand.py")
+        if modified is None:
             self.skipTest("git unavailable")
-        self.assertEqual([x for x in r.stdout.split() if x], [])
+        self.assertEqual(modified, [],
+                         "existing report builders must be unmodified")
 
 
 class TestLocalIds(unittest.TestCase):

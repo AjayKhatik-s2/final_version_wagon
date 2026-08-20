@@ -397,3 +397,380 @@ class TestEveryResolverIsCameraScoped(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# The COMBINED report's multi-angle grid
+# ---------------------------------------------------------------------------
+
+#: A tint used by NOTHING that any panel legitimately owns, so its appearance
+#: is proof of a borrow rather than a coincidence.
+POISON = 20
+
+
+def _combined_fixture(root, *, load_source_camera=None, damage_cams=(),
+                      right_top_cache=True, load_tint=POISON):
+    """One anomalous wagon, four cameras, fully controlled evidence.
+
+    The wagon is anomalous because its RIGHT door is OPEN -- deliberately NOT
+    because of damage, so the multi-angle page renders while the top cameras
+    have no damage evidence at all.  That is the exact state in which the
+    combined report used to duplicate a top-camera view.
+    """
+    ev = os.path.join(root, "evidence")
+    states = os.path.join(root, "wagon_states")
+    cache = os.path.join(root, "wagon_cache")
+    gw = "GW_1"
+
+    # Per-camera wagon_cache frames: each camera's own fingerprint.
+    for cam in ("RIGHT_UP", "LEFT_UP", "RIGHT_UP_TOP", "LEFT_UP_TOP"):
+        if cam == "RIGHT_UP_TOP" and not right_top_cache:
+            continue
+        cd = os.path.join(cache, gw, C.CAMERA_FOLDER[cam])
+        os.makedirs(cd, exist_ok=True)
+        for fi in range(0, 60):
+            cv2.imwrite(os.path.join(cd, f"frame_{fi:06d}.jpg"), _tile(cam))
+
+    # Door evidence: slot names carry the camera, so these are safe by design.
+    dd = os.path.join(ev, gw, "door")
+    os.makedirs(dd)
+    cv2.imwrite(os.path.join(dd, "right_best.jpg"), _tile("RIGHT_UP"))
+    cv2.imwrite(os.path.join(dd, "left_best.jpg"), _tile("LEFT_UP"))
+    with open(os.path.join(dd, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump({"global_id": gw, "feature": "door", "sides": {}}, f)
+
+    # Load evidence: ONE file per wagon whose owner lives only in metadata.
+    if load_source_camera:
+        ld = os.path.join(ev, gw, "load")
+        os.makedirs(ld)
+        cv2.imwrite(os.path.join(ld, "best_frame.jpg"),
+                    np.full((40, 40, 3), load_tint, dtype=np.uint8))
+        with open(os.path.join(ld, "metadata.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"global_id": gw, "feature": "load",
+                       "fused_status": "LOADED", "fused_confidence": 0.9,
+                       "source_camera": load_source_camera,
+                       "best_frame_idx": 10, "per_camera": {}}, f)
+
+    # Optional damage, per camera, identical in every field but camera_id.
+    if damage_cams:
+        ed = os.path.join(ev, gw, "damage")
+        os.makedirs(ed)
+        tracks = []
+        for i, cam in enumerate(damage_cams, start=1):
+            cv2.imwrite(os.path.join(ed, f"track_{i}.jpg"), _tile(cam))
+            tracks.append({"track_idx": i, "camera_id": cam, "track_id": 1,
+                           "class_name": "inner_wall_damage",
+                           "confidence": 0.77, "best_confidence": 0.77,
+                           "best_frame_idx": 123, "bbox": [1, 1, 20, 20]})
+        with open(os.path.join(ed, "metadata.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"global_id": gw, "feature": "damage",
+                       "top_damage": "DAMAGE", "tracks": tracks}, f)
+
+    # wagon_states: RIGHT door OPEN is the anomaly that renders the page.
+    sd = os.path.join(states, "door")
+    os.makedirs(sd)
+    with open(os.path.join(sd, f"{gw}.json"), "w", encoding="utf-8") as f:
+        json.dump({"global_id": gw, "feature": "door", "status": "OK",
+                   "right_door": "OPEN", "left_door": "CLOSED",
+                   "right_door_confidence": 0.95,
+                   "left_door_confidence": 0.9,
+                   "supporting_cameras": ["RIGHT_UP", "LEFT_UP"]}, f)
+    sl = os.path.join(states, "load")
+    os.makedirs(sl)
+    with open(os.path.join(sl, f"{gw}.json"), "w", encoding="utf-8") as f:
+        json.dump({"global_id": gw, "feature": "load", "status": "OK",
+                   "load_status": "LOADED", "load_confidence": 0.9,
+                   "supporting_cameras": list(TOPS)}, f)
+    if damage_cams:
+        sdm = os.path.join(states, "damage")
+        os.makedirs(sdm)
+        with open(os.path.join(sdm, f"{gw}.json"), "w", encoding="utf-8") as f:
+            json.dump({"global_id": gw, "feature": "damage", "status": "OK",
+                       "top_damage": "DAMAGE",
+                       "top_damage_details": ["inner_wall_damage"],
+                       "supporting_cameras": list(damage_cams)}, f)
+
+    state = GlobalTrainState(
+        total_wagons=1,
+        wagons=(GlobalWagon(global_id=gw, wagon_index=1,
+                            start_frame_master=0, end_frame_master=59,
+                            start_time=0.0, end_time=4.0,
+                            classification="WAGON",
+                            classification_confidence=1.0),),
+        master_camera=C.MASTER_CAMERA, master_fps=15.0,
+        master_total_frames=60)
+    return ev, states, cache, state, gw
+
+
+def _unified_for(state, states_root):
+    from fusion import wagon_state_builder
+    return wagon_state_builder.build(
+        state=state, wagon_states_root=states_root,
+        write_per_wagon_json=False, verbose=False)
+
+
+class TestPanelSnapshotIsCameraScoped(unittest.TestCase):
+    """`_panel_snapshot` decides which image a panel shows. Pixels, not paths.
+
+    Every assertion decodes the file the resolver returned and compares its
+    mean value to the requesting camera's fingerprint, so a resolver that
+    returned a plausibly-named file belonging to the other camera still fails.
+    """
+
+    def _resolve(self, cam, **kw):
+        """Build a throwaway fixture and return the MEAN PIXEL of what the
+        resolver chose. A fresh directory each time -- `_combined_fixture`
+        creates its trees with bare `os.makedirs`, so reusing one collides."""
+        from reporting import combined_train_report as CTR
+        with tempfile.TemporaryDirectory() as root:
+            ev, states, cache, state, gw = _combined_fixture(root, **kw)
+            unified = _unified_for(state, states)
+            path = CTR._panel_snapshot(unified[gw], cam, ev, cache, gw)
+            if path is None:
+                return None
+            img = cv2.imread(path)
+            return None if img is None else float(img.mean())
+
+    def _assert_own(self, mean, cam):
+        self.assertIsNotNone(mean, f"{cam} got no snapshot at all")
+        self.assertAlmostEqual(
+            mean, TINT[cam], delta=5.0,
+            msg=f"{cam} panel resolved to a mean of {mean}, which is not its "
+                f"own tint {TINT[cam]}")
+
+    # ---- the reported bug: NO damage anywhere -------------------------
+
+    def test_no_damage_right_top_does_not_borrow_the_load_frame(self):
+        """The exact defect. `load/best_frame.jpg` is owned by LEFT_UP_TOP."""
+        self._assert_own(self._resolve("RIGHT_UP_TOP",
+                                       load_source_camera="LEFT_UP_TOP"),
+                         "RIGHT_UP_TOP")
+
+    def test_no_damage_left_top_keeps_its_own_view(self):
+        self._assert_own(self._resolve("LEFT_UP_TOP",
+                                       load_source_camera="RIGHT_UP_TOP"),
+                         "LEFT_UP_TOP")
+
+    def test_no_damage_the_two_top_panels_differ(self):
+        """Both panels showing the same view is the symptom that was reported."""
+        with tempfile.TemporaryDirectory() as root:
+            from reporting import combined_train_report as CTR
+            ev, states, cache, state, gw = _combined_fixture(
+                root, load_source_camera="LEFT_UP_TOP")
+            unified = _unified_for(state, states)
+            means = []
+            for cam in TOPS:
+                p = CTR._panel_snapshot(unified[gw], cam, ev, cache, gw)
+                self.assertIsNotNone(p, f"{cam} got no snapshot")
+                means.append(round(float(cv2.imread(p).mean())))
+            self.assertNotEqual(means[0], means[1],
+                                "both top panels resolved to the same image")
+
+    def test_load_owner_may_use_its_own_load_frame(self):
+        """The fix must not throw away legitimately-owned evidence."""
+        with tempfile.TemporaryDirectory() as root:
+            from reporting import combined_train_report as CTR
+            ev, states, cache, state, gw = _combined_fixture(
+                root, load_source_camera="RIGHT_UP_TOP")
+            unified = _unified_for(state, states)
+            p = CTR._panel_snapshot(unified[gw], "RIGHT_UP_TOP", ev, cache, gw)
+            self.assertAlmostEqual(float(cv2.imread(p).mean()), POISON,
+                                   delta=5.0,
+                                   msg="the owning camera lost its load frame")
+
+    def test_unattributed_load_evidence_is_never_claimed(self):
+        """No `source_camera` in the metadata means ownership is unproven."""
+        with tempfile.TemporaryDirectory() as root:
+            from reporting import combined_train_report as CTR
+            ev, states, cache, state, gw = _combined_fixture(
+                root, load_source_camera="RIGHT_UP_TOP")
+            meta = os.path.join(ev, gw, "load", "metadata.json")
+            doc = json.load(open(meta, encoding="utf-8"))
+            doc.pop("source_camera")
+            json.dump(doc, open(meta, "w", encoding="utf-8"))
+            unified = _unified_for(state, states)
+            for cam in TOPS:
+                p = CTR._panel_snapshot(unified[gw], cam, ev, cache, gw)
+                with self.subTest(camera=cam):
+                    self.assertIsNotNone(p, f"{cam} got no snapshot")
+                    self._assert_own(float(cv2.imread(p).mean()), cam)
+
+    # ---- damage present: no borrowing either --------------------------
+
+    def test_damage_on_one_top_camera_only_is_not_borrowed(self):
+        self._assert_own(self._resolve("RIGHT_UP_TOP",
+                                       damage_cams=("LEFT_UP_TOP",)),
+                         "RIGHT_UP_TOP")
+
+    def test_damage_on_own_camera_is_used(self):
+        self._assert_own(self._resolve("RIGHT_UP_TOP",
+                                       damage_cams=("RIGHT_UP_TOP",)),
+                         "RIGHT_UP_TOP")
+
+    def test_damage_on_both_cameras_stays_per_camera(self):
+        for cam in TOPS:
+            with self.subTest(camera=cam):
+                self._assert_own(self._resolve(cam, damage_cams=TOPS), cam)
+
+    # ---- the enumerated collision cases ------------------------------
+
+    def test_identical_track_ids_frames_and_scores(self):
+        """Identical in every field a resolver might sort or match on.
+
+        Both records carry tracker `track_id` 1, `best_confidence` 0.77 and
+        `best_frame_idx` 123 -- the fixture's defaults -- so `camera_id` is the
+        only thing that can separate them.
+
+        Note what is NOT forced identical: `track_idx`, the number in the
+        FILENAME. The damage writer enumerates `all_evidence` once across both
+        cameras, so two tracks can never share an index; forcing that would
+        fabricate a state the writer cannot produce. `track_id` colliding is
+        the collision that really happens, because each camera's tracker
+        numbers its own tracks from 1.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            from reporting import combined_train_report as CTR
+            ev, states, cache, state, gw = _combined_fixture(
+                root, damage_cams=TOPS)
+            doc = json.load(open(os.path.join(ev, gw, "damage",
+                                              "metadata.json"),
+                                 encoding="utf-8"))
+            ids = [(t["track_id"], t["best_confidence"], t["best_frame_idx"])
+                   for t in doc["tracks"]]
+            self.assertEqual(ids[0], ids[1],
+                             "fixture must make the two records identical")
+            self.assertNotEqual(doc["tracks"][0]["track_idx"],
+                                doc["tracks"][1]["track_idx"])
+            unified = _unified_for(state, states)
+            for cam in TOPS:
+                p = CTR._panel_snapshot(unified[gw], cam, ev, cache, gw)
+                with self.subTest(camera=cam):
+                    self._assert_own(float(cv2.imread(p).mean()), cam)
+
+    def test_processing_order_reversal_changes_nothing(self):
+        """Which camera was written first must not decide who owns what."""
+        self._assert_own(self._resolve("RIGHT_UP_TOP", damage_cams=TOPS),
+                         "RIGHT_UP_TOP")
+        self._assert_own(
+            self._resolve("RIGHT_UP_TOP", damage_cams=tuple(reversed(TOPS))),
+            "RIGHT_UP_TOP")
+
+    def test_missing_evidence_uses_only_that_cameras_fallback(self):
+        """RIGHT_UP_TOP has no evidence AND no cache -> nothing, not a borrow."""
+        self.assertIsNone(
+            self._resolve("RIGHT_UP_TOP", load_source_camera="LEFT_UP_TOP",
+                          right_top_cache=False),
+            "a camera with no evidence of its own must render a placeholder, "
+            "never another camera's image")
+
+    def test_side_cameras_never_cross(self):
+        for cam in ("RIGHT_UP", "LEFT_UP"):
+            with self.subTest(camera=cam):
+                self._assert_own(self._resolve(cam), cam)
+
+
+class TestCombinedPdfPixels(unittest.TestCase):
+    """End to end through the real renderer, asserting on embedded pixels."""
+
+    def _build(self, root, **kw):
+        from reporting import combined_train_report as CTR
+        ev, states, cache, state, gw = _combined_fixture(root, **kw)
+        unified = _unified_for(state, states)
+        out = CTR.build(
+            state=state, unified=unified, output_dir=root,
+            batch_key="iso", evidence_root=ev, wagon_states_root=states,
+            cache_root=cache, verbose=False)
+        self.assertIsNotNone(out.get("pdf_path"), "no PDF was produced")
+        return embedded_image_means(out["pdf_path"])
+
+    def test_no_damage_pdf_contains_right_up_tops_own_frame(self):
+        """Decisive: under the old fallback RIGHT_UP_TOP's tint was ABSENT.
+
+        With `load/best_frame.jpg` owned by LEFT_UP_TOP, the camera-blind
+        lookup made the RIGHT_UP_TOP panel render the load frame, so
+        RIGHT_UP_TOP's own tint never reached the page. Its presence is proof
+        the panel fell through to its own camera instead of borrowing.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            means = self._build(root, load_source_camera="LEFT_UP_TOP")
+            self.assertTrue(
+                _has_tint(means, "RIGHT_UP_TOP"),
+                f"RIGHT_UP_TOP's own view is missing from the combined "
+                f"report; embedded means were {sorted(set(round(m) for m in means))}")
+
+    def test_no_damage_pdf_shows_the_load_owner_its_own_load_frame(self):
+        """RIGHT_UP_TOP owns the load frame, so it shows THAT (tint POISON),
+        while LEFT_UP_TOP -- which does not own it -- shows its own cache view.
+        Two distinct images, each belonging to the panel that renders it."""
+        with tempfile.TemporaryDirectory() as root:
+            means = self._build(root, load_source_camera="RIGHT_UP_TOP")
+            self.assertTrue(any(abs(m - POISON) < 5.0 for m in means),
+                            "the load owner lost its own load frame")
+            self.assertTrue(_has_tint(means, "LEFT_UP_TOP"),
+                            "LEFT_UP_TOP view missing from combined report")
+
+    def test_damage_on_one_camera_does_not_poison_the_other_panel(self):
+        with tempfile.TemporaryDirectory() as root:
+            means = self._build(root, damage_cams=("LEFT_UP_TOP",))
+            self.assertTrue(_has_tint(means, "RIGHT_UP_TOP"),
+                            "RIGHT_UP_TOP borrowed instead of showing itself")
+
+    def test_a_borrowed_only_image_never_reaches_the_page(self):
+        """POISON is owned by nobody: LEFT_UP_TOP prefers its damage track.
+
+        So the load frame is legitimately used by NO panel, and its tint
+        appearing at all can only mean RIGHT_UP_TOP borrowed it.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            means = self._build(root, load_source_camera="LEFT_UP_TOP",
+                                damage_cams=("LEFT_UP_TOP",))
+            self.assertFalse(
+                any(abs(m - POISON) < 5.0 for m in means),
+                "an image owned by no panel was embedded -- a borrow occurred")
+
+
+class TestNoCameraBlindResolverRemains(unittest.TestCase):
+    """Structural: the removed fallbacks must not come back."""
+
+    def test_best_damage_snapshot_any_is_gone(self):
+        from reporting import combined_train_report as CTR
+        self.assertFalse(
+            hasattr(CTR, "_best_damage_snapshot_any"),
+            "the cross-camera damage fallback was reintroduced")
+
+    def test_panel_snapshot_never_calls_an_unscoped_evidence_lookup(self):
+        """Every lookup inside `_panel_snapshot` must be camera-qualified."""
+        import ast
+        import inspect
+        from reporting import combined_train_report as CTR
+        src = inspect.getsource(CTR._panel_snapshot)
+        tree = ast.parse(src.lstrip())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, "attr", getattr(node.func, "id", ""))
+            if name != "evidence_snapshot":
+                continue
+            # The only permitted unscoped use is a door slot, whose NAME
+            # carries the camera (`right_best` / `left_best`).
+            slots = [a.value for a in node.args
+                     if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+            self.assertTrue(
+                any(s in ("right_best", "left_best") for s in slots),
+                f"unscoped evidence_snapshot({slots}) in _panel_snapshot")
+
+    def test_camera_reports_load_lookup_is_scoped(self):
+        import inspect
+        from reporting import camera_reports
+        src = inspect.getsource(camera_reports)
+        self.assertNotIn('ev.evidence_snapshot(evidence_root, gw.global_id, "load"',
+                         src, "the load snapshot lookup is camera-blind again")
+        self.assertIn("evidence_snapshot_for_camera", src)
+
+    def test_the_scoped_helper_demands_a_camera(self):
+        from reporting import _evidence_lookup as ev_mod
+        with self.assertRaises(ValueError):
+            ev_mod.evidence_snapshot_for_camera(None, "GW_1", "load",
+                                                "best_frame", "")

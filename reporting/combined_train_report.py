@@ -737,29 +737,31 @@ def _panel_state_text(u: UnifiedWagonState, camera_id: str, damage_cams: set,
     if camera_id == C.CAMERA_RIGHT_UP_TOP:
         dmg = "DAMAGE" if C.CAMERA_RIGHT_UP_TOP in damage_cams else ("OK" if has_frames else "NO DATA")
         load = u.load_status if u.load_status not in (None, "") else C.NO_DATA
-        return f"Top Damage: {dmg}  |  Load: {load}"
+        return (f"Top Damage: {dmg}{_elsewhere(u, camera_id, damage_cams)}"
+                f"  |  Load: {load}")
     # LEFT_UP_TOP
     dmg = "DAMAGE" if C.CAMERA_LEFT_UP_TOP in damage_cams else ("OK" if has_frames else "NO DATA")
-    return f"Top Damage (support): {dmg}"
+    return (f"Top Damage (support): {dmg}"
+            f"{_elsewhere(u, camera_id, damage_cams)}")
 
 
-def _best_damage_snapshot_any(evidence_root: Optional[str], gw_id: str) -> Optional[str]:
-    """Highest-confidence damage-track snapshot across BOTH top cameras."""
-    md = ev.evidence_metadata(evidence_root, gw_id, "damage")
-    best = None
-    best_conf = -1.0
-    for tr in (md.get("tracks") or []):
-        if not isinstance(tr, dict):
-            continue
-        idx = tr.get("track_idx")
-        if idx is None:
-            continue
-        conf = float(tr.get("best_confidence") or 0.0)
-        if conf > best_conf:
-            snap = ev.evidence_snapshot(evidence_root, gw_id, "damage", f"track_{int(idx)}")
-            if snap:
-                best, best_conf = snap, conf
-    return best
+def _elsewhere(u: UnifiedWagonState, camera_id: str, damage_cams: set) -> str:
+    """Attribute damage this camera did NOT see to the camera that did.
+
+    Replaces what the removed `_best_damage_snapshot_any` fallback used to
+    achieve by substituting the other camera's IMAGE: the wagon is known
+    damaged, this camera has no track of its own, so instead of borrowing a
+    frame the panel says who saw it.  The reader still learns the wagon is
+    damaged, and the snapshot above it remains this camera's own view.
+    """
+    if u is None or u.top_damage != C.DAMAGE_PRESENT:
+        return ""
+    if camera_id in (damage_cams or set()):
+        return ""                      # this camera saw it; nothing to add
+    others = sorted(c for c in (damage_cams or set()) if c != camera_id)
+    if not others:
+        return "  (damage fused from top cameras)"
+    return f"  (detected by {', '.join(others)})"
 
 
 def _panel_snapshot(u: UnifiedWagonState, camera_id: str,
@@ -768,25 +770,47 @@ def _panel_snapshot(u: UnifiedWagonState, camera_id: str,
     """Resolve a snapshot for one camera: feature evidence first, else a
     representative wagon_cache frame (so all four angles show the wagon).
 
-    ITEM 7: for TOP cameras, when the wagon is damaged we ALWAYS prefer a boxed
-    damage snapshot (own-camera first, then the best across BOTH top cameras) so
-    a detected anomaly is never shown as a clean frame in the multi-angle grid.
+    CAMERA IDENTITY IS A HARD INVARIANT HERE.  Every branch may only return an
+    image produced by `camera_id` itself.  A camera with no usable evidence
+    shows its own wagon_cache frame; it NEVER borrows another camera's image,
+    not even to illustrate a real anomaly.
+
+    Two camera-blind fallbacks used to live in this function and both are gone:
+
+    * `_best_damage_snapshot_any(...)`, reached by BOTH top panels when the
+      wagon was damaged but this camera had no track of its own.  It returned
+      the best track across both top cameras, so RIGHT_UP_TOP could render
+      LEFT_UP_TOP's frame and vice versa.  Its intent ("ITEM 7": never show a
+      clean frame for a damaged wagon) is now served without substitution --
+      `_panel_state_text` names the camera that actually saw the damage, so the
+      anomaly is still reported on the page, correctly attributed.
+    * an unscoped `load/best_frame` lookup, applied to RIGHT_UP_TOP only.
+      `load/best_frame.jpg` is a single file per wagon whose owning camera is
+      recorded only in `metadata.json`, so when the load processor sourced it
+      from LEFT_UP_TOP the RIGHT_UP_TOP panel showed a LEFT_UP_TOP frame --
+      and since LEFT_UP_TOP fell through to its own cache frame, BOTH top
+      panels ended up showing a LEFT_UP_TOP view.  That is why the duplication
+      appeared specifically when there was NO damage: a damage track, when one
+      existed, was resolved per-camera first and masked the defect.
+
+    Both top cameras now take the SAME symmetric path, so neither can drift
+    from the other again.
     """
     snap = None
     if camera_id == C.CAMERA_RIGHT_UP:
+        # Slot name carries the camera: `right_best` is written from RIGHT_UP's
+        # stream and `left_best` from LEFT_UP's (features/door/processor.py),
+        # so these two are camera-scoped by construction.
         snap = ev.evidence_snapshot(evidence_root, gw_id, "door", "right_best")
     elif camera_id == C.CAMERA_LEFT_UP:
         snap = ev.evidence_snapshot(evidence_root, gw_id, "door", "left_best")
-    elif camera_id == C.CAMERA_RIGHT_UP_TOP:
-        snap = _top_damage_snapshot(evidence_root, gw_id, C.CAMERA_RIGHT_UP_TOP)
-        if snap is None and u.top_damage == C.DAMAGE_PRESENT:
-            snap = _best_damage_snapshot_any(evidence_root, gw_id)
+    elif camera_id in C.TOP_CAMERAS:
+        # Own damage track first (filtered on camera_id via metadata), then this
+        # camera's own load frame -- proven by `source_camera`, never assumed.
+        snap = _top_damage_snapshot(evidence_root, gw_id, camera_id)
         if snap is None:
-            snap = ev.evidence_snapshot(evidence_root, gw_id, "load", "best_frame")
-    elif camera_id == C.CAMERA_LEFT_UP_TOP:
-        snap = _top_damage_snapshot(evidence_root, gw_id, C.CAMERA_LEFT_UP_TOP)
-        if snap is None and u.top_damage == C.DAMAGE_PRESENT:
-            snap = _best_damage_snapshot_any(evidence_root, gw_id)
+            snap = ev.evidence_snapshot_for_camera(
+                evidence_root, gw_id, "load", "best_frame", camera_id)
     if snap and os.path.isfile(snap):
         return snap
     return _cache_mid_frame(cache_root, gw_id, camera_id)

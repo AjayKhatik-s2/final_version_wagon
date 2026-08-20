@@ -49,6 +49,7 @@ class CameraRunResult:
     recovered_gaps: int = 0
     raw_detections: int = 0
     frames_materialized: int = 0
+    engine_frames: int = 0              # train-level loco frames, NOT wagons
     feature_calls: Dict[str, int] = field(default_factory=dict)
     feature_summary: Dict[str, Dict[str, str]] = field(default_factory=dict)
     timings: Dict[str, float] = field(default_factory=dict)
@@ -65,6 +66,7 @@ class CameraRunResult:
             "recovered_gaps": self.recovered_gaps,
             "raw_detections": self.raw_detections,
             "frames_materialized": self.frames_materialized,
+            "engine_frames": self.engine_frames,
             "feature_yolo_calls": dict(self.feature_calls),
             "timings": dict(self.timings),
             "report_path": self.report_path,
@@ -122,6 +124,8 @@ def run_camera(
     enabled_features: Optional[List[str]] = None,
     camera_local_features: bool = True,
     deliver_per_camera: bool = False,
+    collect_engine_frames: bool = True,
+    train_id: str = "",
     s3_client=None,
     verbose: bool = True,
 ) -> CameraRunResult:
@@ -205,6 +209,29 @@ def run_camera(
         bundle.write_segments(out.segments)
         res.local_segments = len(out.segments)
         bundle.advance("SEGMENTED")
+
+        # ---- engine/loco frames: a TRAIN-level asset, NOT wagons -------
+        # Deliberately placed AFTER write_segments, so the segment list this
+        # reads is already final and persisted: the collector cannot influence
+        # what a segment is, only look at the ones already labelled ENGINE.
+        # It writes to its own `engine_frames/` tree and touches no wagon
+        # structure -- no id is minted, nothing lands in camera_cache, and the
+        # materializer below is fed `out.segments` exactly as before.
+        if collect_engine_frames:
+            t0 = time.perf_counter()
+            try:
+                from features import engine_frames as EF
+                ef = EF.collect(
+                    train_id=train_id or os.path.basename(evidence_root),
+                    camera_id=camera_id, video_path=video_path,
+                    segments=out.segments, output_dir=bundle.dir,
+                    fps=out.tracks.fps, verbose=verbose)
+                res.engine_frames = ef.count
+                EF.write_metadata(bundle.dir, [ef])
+            except Exception as e:  # noqa: BLE001 - never fail a camera for this
+                print(f"[SEQ/{camera_id}] engine-frame capture failed "
+                      f"(non-fatal): {type(e).__name__}: {e}")
+            _t("engine_frames", t0)
 
         # ---- materialize LOCAL segments --------------------------------
         t0 = time.perf_counter()

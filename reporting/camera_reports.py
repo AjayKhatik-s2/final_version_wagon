@@ -162,8 +162,14 @@ def _build_camera_items(
                 anomalies.append(("MEDIUM", "LEFT_DOOR PARTIAL CLOSED"))
 
         elif camera_id == C.CAMERA_RIGHT_UP_TOP:
-            # Load (authoritative)
-            load_snap = ev.evidence_snapshot(evidence_root, gw.global_id, "load", "best_frame")
+            # Load (authoritative).  `load/best_frame.jpg` is ONE file per wagon
+            # and the load processor may have sourced it from LEFT_UP_TOP, so it
+            # is claimed only when `metadata.json` proves RIGHT_UP_TOP owns it.
+            # An unscoped lookup here put a LEFT_UP_TOP frame in this camera's
+            # report whenever RIGHT_UP_TOP had no data for the winning class.
+            load_snap = ev.evidence_snapshot_for_camera(
+                evidence_root, gw.global_id, "load", "best_frame",
+                C.CAMERA_RIGHT_UP_TOP)
             detections.append(("Load Status", u.load_status,
                                u.load_confidence, load_snap))
             confidences.append(u.load_confidence)

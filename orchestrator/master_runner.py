@@ -30,7 +30,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Make sibling packages importable when running this file directly.
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -920,6 +920,141 @@ def run_local(
 # SEQUENTIAL MODE (opt-in) -- one camera at a time, then global assembly
 # -----------------------------------------------------------------------------
 
+def run_sessions(
+    *,
+    sessions: List[Tuple[str, Dict[str, str]]],
+    workspace: Optional[str] = None,
+    recon_models_dir: str = DEFAULT_RECON_MODELS_DIR,
+    feat_models_dir: str = DEFAULT_FEAT_MODELS_DIR,
+    feature_config: Optional[FeatureConfig] = None,
+    expected_cameras: Optional[Sequence[str]] = None,
+    deliver: bool = False,
+    deliver_per_camera: bool = True,
+    send_email: bool = False,
+    scheduler=None,
+    verbose: bool = True,
+) -> int:
+    """Drive one or more trains through sequential mode under the scheduler.
+
+    `sessions` is `[(train_id, {camera_id: video_path}), ...]` -- the caller has
+    already decided which clip belongs to which train, using the pipeline's
+    existing identification logic.  Train identity is never re-derived here.
+
+    The scheduler owns ORDER ONLY.  Each camera is still run by the existing
+    `camera_runner.run_camera` (which renders that camera's report and publishes
+    it the moment it seals) and each train is still assembled by the existing
+    `global_assembler.assemble`.  No stage is reimplemented.
+
+    A train is assembled the instant its last camera finishes, before any newer
+    train receives further work -- so an older train's combined report is never
+    held behind a newer train's inference.
+
+    Pass `scheduler=` to supply a pre-seeded `TrainScheduler` (used by tests and
+    by callers that want to submit feeds as they arrive rather than up front).
+    """
+    from orchestrator import camera_runner, global_assembler
+    from orchestrator.train_scheduler import TrainScheduler
+
+    workspace = workspace or DEFAULT_WORKSPACE_PARENT
+    os.makedirs(workspace, exist_ok=True)
+    cams = tuple(expected_cameras or C.ALL_CAMERAS)
+    enabled = (feature_config or FeatureConfig.all_on()).enabled_keys()
+
+    sched = scheduler or TrainScheduler(
+        expected_cameras=cams,
+        state_path=os.path.join(workspace, "scheduler_state.json"),
+        verbose=verbose)
+
+    for train_id, videos in sessions:
+        for cam in cams:
+            vp = videos.get(cam)
+            if vp:
+                sched.submit_camera_video(
+                    camera_id=cam, video_path=vp, train_id=train_id,
+                    train_timestamp=train_id)
+
+    def _evidence_root(train_id: str) -> str:
+        p = os.path.join(workspace, train_id, "camera_evidence")
+        os.makedirs(p, exist_ok=True)
+        return p
+
+    results: Dict[str, List[Any]] = {}
+    assemblies: Dict[str, Any] = {}
+    t0 = time.time()
+
+    print("=" * 78)
+    print(f"  SCHEDULED SEQUENTIAL MODE  ({len(sched.sessions)} session(s))")
+    print("=" * 78)
+
+    def _assemble(train_id: str) -> None:
+        print(f"--- GLOBAL ASSEMBLY {train_id} ---")
+        try:
+            asm = global_assembler.assemble(
+                evidence_root=_evidence_root(train_id),
+                output_root=os.path.join(workspace, train_id),
+                batch_key=train_id, feat_models_dir=feat_models_dir,
+                deliver=deliver, send_email=send_email, verbose=verbose)
+            assemblies[train_id] = asm
+        except Exception as e:  # noqa: BLE001 - one train must not stop the rest
+            print(f"[SCHED] assembly of {train_id} raised "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+        sched.mark_assembled(train_id)
+
+    while True:
+        job = sched.next_job()
+        if job is None:
+            pending = sched.sessions_ready_to_assemble()
+            if not pending:
+                break
+            _assemble(pending[0].train_id)     # oldest first
+            continue
+
+        print(f"--- {job.train_id} / {job.camera_id} ---")
+        res = camera_runner.run_camera(
+            camera_id=job.camera_id, video_path=job.video_path,
+            recon_models_dir=recon_models_dir,
+            feat_models_dir=feat_models_dir,
+            evidence_root=_evidence_root(job.train_id),
+            enabled_features=enabled,
+            # The camera's own report is rendered and published inside
+            # run_camera, immediately after it SEALS -- not after the train.
+            deliver_per_camera=deliver_per_camera,
+            train_id=job.train_id,
+            verbose=verbose)
+        results.setdefault(job.train_id, []).append(res)
+
+        if res.sealed:
+            sess = sched.mark_camera_completed(job.train_id, job.camera_id)
+        else:
+            sess = sched.mark_camera_failed(job.train_id, job.camera_id,
+                                            res.failure_reason)
+        # Assemble the moment this train is done, before any newer train gets
+        # another job.
+        if sess.is_complete() and not sess.assembled:
+            _assemble(sess.train_id)
+
+    elapsed = time.time() - t0
+    print("=" * 78)
+    print("  SCHEDULED SEQUENTIAL SUMMARY")
+    print("=" * 78)
+    print(sched.render_status())
+    for train_id, rs in results.items():
+        for r in rs:
+            print(f"  {train_id} {r.camera_id:<13} {r.state:<8} "
+                  f"segments={r.local_segments:<4} engine_frames="
+                  f"{r.engine_frames:<3} {r.timings.get('total', 0):.1f}s")
+        asm = assemblies.get(train_id)
+        if asm is not None:
+            print(f"  {train_id} global wagons : {asm.total_wagons}")
+            print(f"  {train_id} combined pdf  : "
+                  f"{asm.report_pdf_path or '(none)'}")
+    print(f"  TOTAL         : {elapsed:.1f}s")
+
+    ok = bool(assemblies) and all(
+        a.ready and a.total_wagons > 0 for a in assemblies.values())
+    return 0 if ok else 3
+
+
 def run_sequential(
     *,
     local_inputs: str,
@@ -942,6 +1077,7 @@ def run_sequential(
     """
     from datetime import datetime
     from orchestrator import camera_runner, global_assembler
+    from orchestrator.train_scheduler import TrainScheduler
 
     if not os.path.isdir(local_inputs):
         print(f"ERROR: {local_inputs} does not exist", file=sys.stderr)
@@ -962,20 +1098,45 @@ def run_sequential(
 
     t0 = time.time()
     results = []
+
+    # The scheduler is the single source of truth for camera-job ORDER, even
+    # for this single-train path: one session, its feeds submitted in arrival
+    # order, and `next_job()` asked what to run next. Behaviour for one train is
+    # identical to the previous plain loop -- with all feeds present the oldest
+    # (only) session is immediately processable and its cameras are handed out
+    # in `expected_cameras` order -- but the ordering decision now lives in one
+    # place instead of two, so multi-train scheduling cannot drift from it.
+    sched = TrainScheduler(
+        expected_cameras=tuple(order),
+        state_path=os.path.join(workspace, key, "scheduler_state.json"),
+        verbose=verbose)
     for cam in order:
         vp = videos.get(cam)
         if not vp:
             print(f"--- ARRIVAL {cam}: no video, skipping ---")
             continue
-        print(f"--- ARRIVAL {cam} ---")
-        results.append(camera_runner.run_camera(
-            camera_id=cam, video_path=vp,
+        sched.submit_camera_video(camera_id=cam, video_path=vp,
+                                  train_id=key, train_timestamp=key)
+
+    while True:
+        job = sched.next_job()
+        if job is None:
+            break
+        print(f"--- ARRIVAL {job.camera_id} ---")
+        r = camera_runner.run_camera(
+            camera_id=job.camera_id, video_path=job.video_path,
             recon_models_dir=recon_models_dir,
             feat_models_dir=feat_models_dir,
             evidence_root=evidence_root,
             enabled_features=enabled,
             deliver_per_camera=deliver_per_camera,
-            verbose=verbose))
+            train_id=key,
+            verbose=verbose)
+        results.append(r)
+        if r.sealed:
+            sched.mark_camera_completed(key, job.camera_id)
+        else:
+            sched.mark_camera_failed(key, job.camera_id, r.failure_reason)
 
     print("--- GLOBAL ASSEMBLY ---")
     asm = global_assembler.assemble(
