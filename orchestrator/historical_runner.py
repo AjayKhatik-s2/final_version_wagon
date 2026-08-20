@@ -652,6 +652,7 @@ def process_batch_sequential(
         source_video_urls={cam: cv.s3_url
                            for cam, cv in batch.videos.items()
                            if getattr(cv, "s3_url", "")},
+        enabled_features=enabled,
         verbose=verbose)
     return asm
 

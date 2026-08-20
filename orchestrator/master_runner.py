@@ -993,7 +993,8 @@ def run_sessions(
                 evidence_root=_evidence_root(train_id),
                 output_root=os.path.join(workspace, train_id),
                 batch_key=train_id, feat_models_dir=feat_models_dir,
-                deliver=deliver, send_email=send_email, verbose=verbose)
+                deliver=deliver, send_email=send_email,
+                enabled_features=enabled, verbose=verbose)
             assemblies[train_id] = asm
         except Exception as e:  # noqa: BLE001 - one train must not stop the rest
             print(f"[SCHED] assembly of {train_id} raised "
@@ -1142,7 +1143,8 @@ def run_sequential(
     asm = global_assembler.assemble(
         evidence_root=evidence_root, output_root=workspace,
         batch_key=key, feat_models_dir=feat_models_dir,
-        deliver=deliver, send_email=send_email, verbose=verbose)
+        deliver=deliver, send_email=send_email,
+        enabled_features=enabled, verbose=verbose)
 
     elapsed = time.time() - t0
     print("=" * 78)

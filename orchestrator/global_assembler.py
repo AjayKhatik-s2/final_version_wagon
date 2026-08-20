@@ -38,7 +38,7 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 _PKG = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_PKG)
@@ -147,6 +147,16 @@ _FEATURE_ORDER = (
     ("load",   dict(inference_mode="sampled", sample_stride=LOAD_STRIDE)),
     ("door",   dict(inference_mode="sampled", sample_stride=DOOR_STRIDE)),
     ("damage", dict(inference_mode="sampled", sample_stride=DAMAGE_STRIDE)),
+    # OCR takes NO stride arguments -- it discards `every_nth`/`max_frames`
+    # because the Rekognition and EasyOCR readers each pick their own frames
+    # (banding -> 3-frame vertical sheet), so an empty extras dict is correct
+    # rather than an oversight. `master_runner`'s `_feature_extra` omits it for
+    # the same reason.
+    #
+    # It runs LAST because it is the most expensive per wagon (a Rekognition
+    # DetectText call each) and nothing downstream in Stage 3 reads its output;
+    # a crash here therefore costs the least.
+    ("ocr",    {}),
 )
 
 
@@ -180,6 +190,8 @@ def _feature_module(name: str):
         from features.door import processor as m
     elif name == "damage":
         from features.damage import processor as m
+    elif name == "ocr":
+        from features.ocr import processor as m
     else:
         raise ValueError(f"unknown feature {name!r}")
     return m
@@ -203,6 +215,12 @@ def assemble(
     # for `trimmed_video_url` / `raw_video_urls` to be populated. Omitted, those
     # fields stay empty rather than being guessed from a local path.
     source_video_urls: Optional[Dict[str, str]] = None,
+    # Which Stage-3 features to run. None = all of them, which is what every
+    # existing caller got implicitly. Passing it matters because assembly used
+    # to run its whole feature list unconditionally, so `--disable-features ocr`
+    # was honoured for the camera-local pass and then silently ignored here --
+    # and OCR is a billed Rekognition call per wagon.
+    enabled_features: Optional[Sequence[str]] = None,
     verbose: bool = True,
 ) -> AssemblyResult:
     """Fuse sealed camera bundles into the global train + combined report."""
@@ -359,7 +377,12 @@ def assemble(
                           output_dir=states_root,
                           evidence_root=global_evidence, verbose=verbose)
     t0 = time.perf_counter()
+    wanted = (None if enabled_features is None else set(enabled_features))
     for name, extra in _FEATURE_ORDER:
+        if wanted is not None and name not in wanted:
+            print(f"[ASSEMBLY/{name}] DISABLED by feature config -- skipped")
+            res.feature_summary[name] = {}
+            continue
         try:
             mod = _feature_module(name)
         except Exception as e:

@@ -271,11 +271,19 @@ class TestFeatureAuthorityAndOcr(unittest.TestCase):
             with self.subTest(camera=cam):
                 self.assertNotIn("ocr", self._plan(cam))
 
-    def test_no_ocr_anywhere_in_the_sequential_path(self):
+    def test_no_ocr_in_the_CAMERA_LOCAL_path(self):
+        """OCR must not run per camera -- only at assembly.
+
+        `global_assembler` is deliberately NOT checked here any more: OCR is now
+        part of assembly's Stage 3, over the fused global wagon windows. What
+        must stay true is that no CAMERA-LOCAL module reaches for it. A camera
+        runs alone and cannot know its own clock offset, so its wagon windows
+        are provisional; reading a wagon number off them would produce a number
+        attributed to the wrong wagon.
+        """
         import ast
-        from orchestrator import (camera_report_adapter, camera_runner,
-                                  global_assembler)
-        for mod in (camera_runner, global_assembler, camera_report_adapter):
+        from orchestrator import camera_report_adapter, camera_runner
+        for mod in (camera_runner, camera_report_adapter):
             tree = ast.parse(inspect.getsource(mod))
             names = {a.name for n in ast.walk(tree)
                      if isinstance(n, (ast.Import, ast.ImportFrom))
@@ -287,6 +295,11 @@ class TestFeatureAuthorityAndOcr(unittest.TestCase):
             with self.subTest(module=mod.__name__):
                 self.assertFalse([x for x in names if "ocr" in x.lower()],
                                  f"{mod.__name__} imports an OCR module")
+
+    def test_assembly_is_the_one_place_ocr_runs(self):
+        from orchestrator.global_assembler import _feature_module
+        mod = _feature_module("ocr")
+        self.assertEqual(mod.__name__, "features.ocr.processor")
 
     def test_strides_are_the_approved_values(self):
         from orchestrator.camera_runner import _feature_plan
@@ -551,14 +564,47 @@ class TestAssemblyIsTheBatchSequence(unittest.TestCase):
 
     def test_strides_match_the_approved_values(self):
         from orchestrator.global_assembler import _FEATURE_ORDER
-        got = {n: e["sample_stride"] for n, e in _FEATURE_ORDER}
+        strided = {n: e for n, e in _FEATURE_ORDER if e}
+        got = {n: e["sample_stride"] for n, e in strided.items()}
         self.assertEqual(got, {"door": 3, "damage": 3, "load": 2})
-        for _n, e in _FEATURE_ORDER:
+        for _n, e in strided.items():
             self.assertEqual(e["inference_mode"], "sampled")
 
-    def test_no_ocr_in_assembly(self):
+    def test_ocr_takes_no_stride_arguments(self):
+        """`features.ocr.processor.run` discards `every_nth`/`max_frames`.
+
+        Each reader picks its own frames (banding -> 3-frame vertical sheet), so
+        an empty extras dict is the correct call, not a missing one.
+        """
         from orchestrator.global_assembler import _FEATURE_ORDER
-        self.assertNotIn("ocr", [n for n, _e in _FEATURE_ORDER])
+        extras = dict(_FEATURE_ORDER)["ocr"]
+        self.assertEqual(extras, {})
+
+    def test_ocr_runs_in_assembly(self):
+        """Sequential mode produced NO wagon numbers until this was wired.
+
+        OCR was in neither the camera-local plan (`camera_runner._feature_plan`
+        covers door / load / damage only) nor assembly's feature list, so
+        `wagon_identifier` came out NO_DATA for every wagon no matter how
+        Rekognition was configured. It runs at assembly, over the fused global
+        wagon windows, for the same reason the other three do: a support
+        camera's clock offset is unknowable until the master and that camera
+        have both been seen.
+        """
+        from orchestrator.global_assembler import _FEATURE_ORDER
+        names = [n for n, _e in _FEATURE_ORDER]
+        self.assertIn("ocr", names)
+        self.assertEqual(names[-1], "ocr",
+                         "OCR is the most expensive per wagon and nothing in "
+                         "Stage 3 reads it, so it runs last")
+
+    def test_assembly_honours_a_disabled_feature(self):
+        """OCR bills per wagon, so `--disable-features ocr` must reach here."""
+        import inspect
+        from orchestrator import global_assembler as ga
+        src = inspect.getsource(ga.assemble)
+        self.assertIn("enabled_features", src)
+        self.assertIn("name not in wanted", src)
 
     def test_features_run_over_the_global_state(self):
         """Not over camera-local segments -- that was the divergence."""
