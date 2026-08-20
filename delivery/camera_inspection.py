@@ -115,6 +115,45 @@ class CameraIngestResult:
         return "  ".join(bits)
 
 
+def source_video_name(raw_video_name: str, camera_id: str) -> str:
+    """The SOURCE clip's name, with any staging prefix removed.
+
+    Both stagers copy a clip to ``<CAMERA>_<original name>`` --
+    `historical_runner.stage_clips` and the batch downloader in
+    `master_runner` -- so the local file this camera actually ran on is
+    ``RIGHT_UP_camera_CCTV_HZBN_DHN_2_RIGHT_UP_20260731_052218_train.mp4``,
+    while the ORIGINAL S3 object is the same name without the leading
+    ``RIGHT_UP_``.
+
+    Why that matters here: the fused pass names its document from the S3 URL
+    (`dashboard_ingest`: ``raw_video_name = os.path.basename(src_url)``), so it
+    never sees the prefix.  Under ``WAGONEYE_INSPECTION_KEY_LAYOUT=v1`` the
+    filename is part of the S3 key, so a prefixed name puts the provisional
+    document at
+
+        Right_up/2026-07-31/RIGHT_UP_camera_..._train_inspection.json
+
+    while assembly writes
+
+        Right_up/2026-07-31/camera_..._train_inspection.json
+
+    -- two objects, and the stale camera-local one is never replaced.  Under
+    the v4 layout the key ignores the filename, so this only changed the
+    ``raw_video_name`` field; the bug was invisible there, which is exactly why
+    it is worth stripping unconditionally rather than per layout.
+
+    Only an EXACT leading ``<camera_id>_`` is removed.  A blunt replace would
+    corrupt the name, because the camera id also occurs INSIDE it
+    (``..._DHN_2_RIGHT_UP_2026...``).  A file that was never staged -- the
+    ``--local-only`` case -- is returned untouched.
+    """
+    if not raw_video_name or not camera_id:
+        return raw_video_name
+    prefix = f"{camera_id}_"
+    return (raw_video_name[len(prefix):]
+            if raw_video_name.startswith(prefix) else raw_video_name)
+
+
 def _train_ts(batch_key: str, raw_video_name: str, bundle):
     """The train's timestamp, derived the way the FUSED path derives it.
 
@@ -162,6 +201,11 @@ def build_document(
     state, unified, paths = adapt(bundle, fps=fps, total_frames=total_frames)
     evidence_root = paths["evidence_root"]
 
+    # Report the SOURCE clip, not our staged copy of it -- see
+    # `source_video_name`. This is what keeps the document's `raw_video_name`
+    # equal to the one assembly will write, and therefore keeps the two S3 keys
+    # equal under the v1 layout.
+    raw_video_name = source_video_name(raw_video_name, cam)
     ts = _train_ts(batch_key, raw_video_name, bundle)
     folder = DASH.full_camera_id(cam)
     version = DASH._version()
@@ -242,6 +286,7 @@ def publish(
     from delivery import dashboard_ingest as DASH
 
     cam = getattr(bundle, "camera_id", "?")
+    raw_video_name = source_video_name(raw_video_name, cam)
     res = CameraIngestResult(camera_id=cam)
 
     if not is_enabled():

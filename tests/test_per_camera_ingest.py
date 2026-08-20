@@ -450,3 +450,135 @@ class TestPerCameraPostIsReplacedInPlace(unittest.TestCase):
         src = inspect.getsource(camera_runner.run_camera)
         block = src[src.index("camera_inspection.publish"):]
         self.assertIn("batch_key=train_id", block)
+
+
+class TestStagingPrefixDoesNotBreakReplacement(unittest.TestCase):
+    """Historical/batch mode stages clips as `<CAM>_<original>`.
+
+    The fused pass names its document from the S3 URL, so it never sees that
+    prefix. Under the v1 key layout the filename IS part of the key, so a
+    prefixed name would put the provisional document beside the canonical one
+    instead of under it.
+    """
+
+    ORIGINAL = "camera_CCTV_HZBN_DHN_2_RIGHT_UP_20260731_052218_train.mp4"
+    STAGED = f"{C.CAMERA_RIGHT_UP}_{ORIGINAL}"
+    BATCH_KEY = "20260731_052211"
+
+    def setUp(self):
+        # publish() is a no-op unless per-camera ingest is switched on.
+        self._saved = _enable()
+
+    def tearDown(self):
+        _restore(self._saved)
+
+    def test_the_staging_prefix_is_stripped(self):
+        self.assertEqual(
+            CI.source_video_name(self.STAGED, C.CAMERA_RIGHT_UP),
+            self.ORIGINAL)
+
+    def test_an_unstaged_name_is_untouched(self):
+        """`--local-only` files are never prefixed."""
+        self.assertEqual(
+            CI.source_video_name(self.ORIGINAL, C.CAMERA_RIGHT_UP),
+            self.ORIGINAL)
+
+    def test_the_camera_id_inside_the_name_is_not_damaged(self):
+        """A blunt replace would eat `_RIGHT_UP_` from the middle."""
+        out = CI.source_video_name(self.STAGED, C.CAMERA_RIGHT_UP)
+        self.assertIn("_2_RIGHT_UP_20260731", out,
+                      "the camera id occurring INSIDE the name was mangled")
+        self.assertEqual(out.count("RIGHT_UP"), 1)
+
+    def test_a_top_camera_prefix_is_handled(self):
+        """LEFT_UP is a prefix of LEFT_UP_TOP -- strip only this camera's own."""
+        original = "camera_CCTV_HZBN_DHN_6_LEFT_TOP_20260731_052241_train.mp4"
+        staged = f"{C.CAMERA_LEFT_UP_TOP}_{original}"
+        self.assertEqual(
+            CI.source_video_name(staged, C.CAMERA_LEFT_UP_TOP), original)
+        # LEFT_UP must NOT strip LEFT_UP_TOP's prefix.
+        self.assertEqual(
+            CI.source_video_name(staged, C.CAMERA_LEFT_UP),
+            "TOP_" + original)
+
+    def test_empty_inputs_are_safe(self):
+        self.assertEqual(CI.source_video_name("", C.CAMERA_RIGHT_UP), "")
+        self.assertEqual(CI.source_video_name(self.STAGED, ""), self.STAGED)
+
+    def _keys(self, staged_name, layout):
+        """(per-camera key, fused key) for one camera under `layout`."""
+        from delivery import dashboard_ingest as DASH
+
+        class _B:
+            camera_id = C.CAMERA_RIGHT_UP
+            dir = "/x/camera_evidence/RIGHT_UP"
+
+        with mock.patch.dict(os.environ,
+                             {"WAGONEYE_INSPECTION_KEY_LAYOUT": layout}):
+            # per-camera, as publish() now derives it
+            name = CI.source_video_name(staged_name, C.CAMERA_RIGHT_UP)
+            ts_p = CI._train_ts(self.BATCH_KEY, name, _B())
+            jn_p = f"{os.path.splitext(name)[0]}_inspection.json"
+            per = DASH.inspection_s3_key(
+                camera=C.CAMERA_RIGHT_UP,
+                date_folder_str=DASH.date_folder(ts_p),
+                json_name=jn_p, ts=ts_p)
+            # fused, which names the document from the S3 URL
+            ts_f = DASH.extract_train_timestamp(self.BATCH_KEY)
+            jn_f = f"{os.path.splitext(self.ORIGINAL)[0]}_inspection.json"
+            fused = DASH.inspection_s3_key(
+                camera=C.CAMERA_RIGHT_UP,
+                date_folder_str=DASH.date_folder(ts_f),
+                json_name=jn_f, ts=ts_f)
+        return per, fused
+
+    def test_v1_layout_keys_collide_despite_the_staging_prefix(self):
+        per, fused = self._keys(self.STAGED, "v1")
+        self.assertEqual(per, fused)
+        self.assertTrue(per.startswith("Right_up/"),
+                        f"expected the dashboard folder layout, got {per}")
+        self.assertNotIn("RIGHT_UP_camera_", per)
+
+    def test_v4_layout_keys_collide_too(self):
+        per, fused = self._keys(self.STAGED, "v4")
+        self.assertEqual(per, fused)
+        self.assertTrue(per.endswith("/inspection_data.json"))
+
+    def test_without_the_strip_the_v1_keys_would_differ(self):
+        """Proof the fix is load-bearing, not decorative."""
+        from delivery import dashboard_ingest as DASH
+        with mock.patch.dict(os.environ,
+                             {"WAGONEYE_INSPECTION_KEY_LAYOUT": "v1"}):
+            ts = DASH.extract_train_timestamp(self.BATCH_KEY)
+            df = DASH.date_folder(ts)
+            unstripped = DASH.inspection_s3_key(
+                camera=C.CAMERA_RIGHT_UP, date_folder_str=df,
+                json_name=f"{os.path.splitext(self.STAGED)[0]}_inspection.json",
+                ts=ts)
+            fused = DASH.inspection_s3_key(
+                camera=C.CAMERA_RIGHT_UP, date_folder_str=df,
+                json_name=f"{os.path.splitext(self.ORIGINAL)[0]}_inspection.json",
+                ts=ts)
+        self.assertNotEqual(unstripped, fused)
+
+    def test_the_document_reports_the_source_clip_not_the_staged_copy(self):
+        with tempfile.TemporaryDirectory() as root:
+            b, _ = _bundle(root)
+            doc = CI.build_document(b, raw_video_name=self.STAGED,
+                                    batch_key=self.BATCH_KEY)
+            self.assertEqual(doc["inspection_data"]["raw_video_name"],
+                             self.ORIGINAL)
+
+    def test_publish_uploads_under_the_unprefixed_name(self):
+        with tempfile.TemporaryDirectory() as root:
+            b, _ = _bundle(root)
+            s3 = _StubS3()
+            with mock.patch.dict(os.environ,
+                                 {"WAGONEYE_INSPECTION_KEY_LAYOUT": "v1"}):
+                CI.publish(b, s3_client=s3, requests_mod=_StubRequests(),
+                           raw_video_name=self.STAGED,
+                           batch_key=self.BATCH_KEY, verbose=False)
+            _bucket, key = s3.uploads[0]
+            self.assertNotIn("RIGHT_UP_camera_", key)
+            self.assertIn("camera_CCTV_HZBN_DHN_2_RIGHT_UP_20260731_052218",
+                          key)
