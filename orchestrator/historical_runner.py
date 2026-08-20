@@ -624,6 +624,12 @@ def process_batch_sequential(
             evidence_root=evidence_root,
             enabled_features=enabled,
             deliver_per_camera=deliver_per_camera,
+            # The train's key, so a per-camera post lands on the object
+            # assembly later replaces (delivery.camera_inspection._train_ts).
+            # Without it the provisional document keys off this camera's own
+            # clip stamp, which differs from the batch anchor for every camera
+            # but the one that set it.
+            train_id=batch.batch_key,
             s3_client=s3_client,
             verbose=verbose))
 
@@ -639,6 +645,13 @@ def process_batch_sequential(
         evidence_root=evidence_root, output_root=hist_root,
         batch_key=batch.batch_key, feat_models_dir=feat_models_dir,
         deliver=deliver, send_email=send_email, s3_client=s3_client,
+        # Assembly only sees the STAGED local copies, so the S3 objects they
+        # came from have to be handed over for `trimmed_video_url` /
+        # `raw_video_urls` to be populated. Same map `process_batch` passes to
+        # its Stage-5 call.
+        source_video_urls={cam: cv.s3_url
+                           for cam, cv in batch.videos.items()
+                           if getattr(cv, "s3_url", "")},
         verbose=verbose)
     return asm
 

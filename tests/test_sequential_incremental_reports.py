@@ -335,3 +335,102 @@ class TestBackwardCompatibility(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# Video URLs in the sequential path
+# ---------------------------------------------------------------------------
+
+class TestSequentialPopulatesVideoUrls(unittest.TestCase):
+    """Sequential used to publish every document with no video links.
+
+    Two separate causes, both fixed: `assemble` passed empty URL maps to Stage
+    5, and it never ran Stage 4b at all -- so `detected_video_url` had nothing
+    to point at even if the map had been threaded through.
+    """
+
+    def test_assemble_accepts_the_source_urls(self):
+        from orchestrator import global_assembler
+        p = inspect.signature(global_assembler.assemble).parameters
+        self.assertIn("source_video_urls", p)
+        self.assertIsNone(p["source_video_urls"].default,
+                          "omitting it must leave the fields empty, not guess")
+
+    def test_assemble_no_longer_hardcodes_empty_url_maps(self):
+        from orchestrator import global_assembler
+        src = inspect.getsource(global_assembler.assemble)
+        self.assertNotIn("source_video_urls={}", src)
+        self.assertNotIn("processed_video_urls={}", src)
+
+    def test_assemble_runs_the_existing_overlay_renderer(self):
+        from orchestrator import global_assembler
+        src = inspect.getsource(global_assembler.assemble)
+        self.assertIn("feature_overlay_renderer.render_all_cameras", src)
+
+    def test_overlay_rendering_runs_before_the_combined_report(self):
+        """Stage 5 embeds the links, so 4b has to have produced them first."""
+        from orchestrator import global_assembler
+        src = inspect.getsource(global_assembler.assemble)
+        self.assertLess(src.index("render_all_cameras"),
+                        src.index("combined_train_report.build"))
+
+    def test_a_render_failure_cannot_fail_the_train(self):
+        from orchestrator import global_assembler
+        src = inspect.getsource(global_assembler.assemble)
+        block = src[src.index("render_all_cameras"):
+                    src.index("combined_train_report")]
+        self.assertIn("except Exception", block)
+
+    def test_processed_url_uses_the_upload_key_construction(self):
+        """Must match what s3_upload.upload_tree will actually create."""
+        from orchestrator.global_assembler import _processed_video_url
+        url = _processed_video_url("20260731_052211",
+                                   "/w/processed/RIGHT_UP_processed.mp4", True)
+        self.assertIn(f"{C.S3_TRAIN_BATCH_PREFIX}/20260731_052211/"
+                      "processed_videos/RIGHT_UP_processed.mp4", url)
+        self.assertTrue(url.startswith(f"https://{C.S3_OUTPUT_BUCKET}.s3."))
+
+    def test_processed_url_reports_the_local_path_when_not_delivering(self):
+        """A non-delivering run must not emit a URL that would 404."""
+        from orchestrator.global_assembler import _processed_video_url
+        p = "/w/processed/RIGHT_UP_processed.mp4"
+        self.assertEqual(_processed_video_url("k", p, False), p)
+        self.assertEqual(_processed_video_url("k", "", True), "")
+
+    def test_source_urls_are_filtered_to_sealed_cameras(self):
+        from orchestrator import global_assembler
+        src = inspect.getsource(global_assembler.assemble)
+        self.assertIn("if c in res.sealed_cameras and u", src,
+                      "a URL must not be emitted for a camera that never sealed")
+
+    def test_historical_sequential_hands_over_the_s3_urls(self):
+        from orchestrator import historical_runner
+        src = inspect.getsource(historical_runner.process_batch_sequential)
+        self.assertIn("source_video_urls=", src)
+        self.assertIn("cv.s3_url", src)
+
+    def test_historical_sequential_passes_the_train_id(self):
+        """Otherwise the provisional post keys off the camera's own clip stamp."""
+        from orchestrator import historical_runner
+        src = inspect.getsource(historical_runner.process_batch_sequential)
+        self.assertIn("train_id=batch.batch_key", src)
+
+    def test_per_camera_document_still_has_no_video_links(self):
+        """Correct, not broken: when a camera seals, neither artifact exists."""
+        from delivery import camera_inspection
+        src = inspect.getsource(camera_inspection.build_document)
+        self.assertIn('trimmed_video_url=""', src)
+        self.assertIn('detected_video_url=""', src)
+
+    def test_stage4b_is_recorded_in_the_timings(self):
+        from orchestrator import global_assembler
+        src = inspect.getsource(global_assembler.assemble)
+        self.assertIn('res.timings["stage4b_overlay_render"]', src)
+
+    def test_assembly_still_runs_no_detector(self):
+        """Stage 4b is visualization; the no-YOLO invariant must hold."""
+        from orchestrator import global_assembler
+        src = inspect.getsource(global_assembler.assemble)
+        for banned in ("YOLO(", "ultralytics"):
+            with self.subTest(token=banned):
+                self.assertNotIn(banned, src)

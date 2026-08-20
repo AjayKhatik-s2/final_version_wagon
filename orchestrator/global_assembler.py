@@ -74,6 +74,11 @@ class AssemblyResult:
     report_json_path: str = ""
     yolo_calls_during_assembly: int = 0     # must stay 0
     delivery: Any = None                   # delivery.finalize.DeliveryResult
+    # Stage 4b + the URL maps the published documents embed.
+    processed_video_paths: Dict[str, str] = field(default_factory=dict)
+    processed_video_urls: Dict[str, str] = field(default_factory=dict)
+    source_video_urls: Dict[str, str] = field(default_factory=dict)
+    per_camera_tracking_path: str = ""
 
 
 def _load_master_classifications(bundle: CameraEvidenceBundle) -> List[Any]:
@@ -145,6 +150,28 @@ _FEATURE_ORDER = (
 )
 
 
+def _processed_video_url(batch_key: str, local_path: str,
+                         will_upload: bool) -> str:
+    """Deterministic S3 URL for an overlay video, before it is uploaded.
+
+    Uses the SAME key construction `delivery.s3_upload.upload_tree` will apply
+    (`<S3_TRAIN_BATCH_PREFIX>/<batch_key>/processed_videos/<file>`), which is how
+    batch mode lets Stage 5 embed the link before Stage 6 runs. Identical to
+    `master_runner`'s local helper of the same name.
+
+    When nothing will be uploaded the LOCAL PATH is returned rather than a URL
+    that would 404 -- a report from a non-delivering run should point at the file
+    that actually exists.
+    """
+    if not local_path:
+        return ""
+    if not will_upload:
+        return local_path
+    key = (f"{C.S3_TRAIN_BATCH_PREFIX}/{batch_key}/"
+           f"processed_videos/{os.path.basename(local_path)}")
+    return f"https://{C.S3_OUTPUT_BUCKET}.s3.{C.S3_REGION}.amazonaws.com/{key}"
+
+
 def _feature_module(name: str):
     """Import a feature processor lazily, so assembly costs nothing if unused."""
     if name == "load":
@@ -171,6 +198,11 @@ def assemble(
     deliver: bool = False,
     send_email: bool = False,
     s3_client=None,
+    # {camera_id -> the S3 URL the clip was staged FROM}. Assembly only ever
+    # sees the local copy, so a caller that downloaded the clips must pass this
+    # for `trimmed_video_url` / `raw_video_urls` to be populated. Omitted, those
+    # fields stay empty rather than being guessed from a local path.
+    source_video_urls: Optional[Dict[str, str]] = None,
     verbose: bool = True,
 ) -> AssemblyResult:
     """Fuse sealed camera bundles into the global train + combined report."""
@@ -351,13 +383,66 @@ def assemble(
                                         verbose=verbose)
     res.timings["fusion_state"] = round(time.perf_counter() - t0, 3)
 
+    # ---- Stage 4b: feature overlay rendering ----------------------------
+    # The SAME renderer batch mode calls, with the same arguments -- sequential
+    # used to skip this entirely, which left `detected_video_url` empty in every
+    # published document even after assembly, because there was no overlay video
+    # to point at. Visualization only: the renderer runs no detector and cannot
+    # touch the roster.
+    #
+    # `per_camera_tracking.json` is written from the tracks already
+    # reconstructed above, in the same shape run_global_count writes it
+    # (`{camera: tracks.to_dict()}`), so the renderer and the camera reports
+    # read the file they already expect rather than a sequential-only variant.
+    processed_root = os.path.join(batch_root, "processed_videos")
+    pct_path = os.path.join(gs_dir, "per_camera_tracking.json")
+    try:
+        os.makedirs(processed_root, exist_ok=True)
+        with open(pct_path, "w", encoding="utf-8") as f:
+            json.dump({c: t.to_dict(include_classifications=(c == master_camera))
+                       for c, t in tracks.items()}, f, indent=2)
+        res.per_camera_tracking_path = pct_path
+    except Exception as e:  # noqa: BLE001
+        print(f"[ASSEMBLY] per_camera_tracking.json failed: {e}")
+        pct_path = ""
+
+    t0 = time.perf_counter()
+    try:
+        from rendering import feature_overlay_renderer
+        res.processed_video_paths = feature_overlay_renderer.render_all_cameras(
+            state=state,
+            unified=unified,
+            evidence_root=global_evidence,
+            video_paths=video_paths,
+            per_camera_tracking_path=pct_path,
+            output_dir=processed_root,
+            camera_offsets=resolved,
+            verbose=verbose,
+        )
+    except Exception as e:  # noqa: BLE001 - visualization must not fail a train
+        print(f"[ASSEMBLY] overlay rendering FAILED: {e}", file=sys.stderr)
+        traceback.print_exc(limit=3)
+        res.processed_video_paths = {}
+    res.timings["stage4b_overlay_render"] = round(time.perf_counter() - t0, 3)
+
+    res.processed_video_urls = {
+        c: _processed_video_url(batch_key, p, deliver)
+        for c, p in res.processed_video_paths.items()
+    }
+    # Source clips: the caller knows which S3 object each camera was staged
+    # from; assembly only sees the local copy. Absent, the fields stay empty
+    # rather than being guessed from a local path.
+    res.source_video_urls = {c: u for c, u in (source_video_urls or {}).items()
+                             if c in res.sealed_cameras and u}
+
     t0 = time.perf_counter()
     try:
         from reporting import combined_train_report
         out = combined_train_report.build(
             state=state, unified=unified, output_dir=reports_root,
-            batch_key=batch_key, source_video_urls={},
-            processed_video_urls={},
+            batch_key=batch_key,
+            source_video_urls=res.source_video_urls,
+            processed_video_urls=res.processed_video_urls,
             evidence_root=global_evidence,
             wagon_states_root=states_root, cache_root=global_cache,
             missing_cameras=sorted(set(res.failed_cameras)
