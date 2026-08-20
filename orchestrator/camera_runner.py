@@ -346,6 +346,11 @@ def run_camera(
                     fps=out.tracks.fps,
                     total_frames=out.tracks.total_frames,
                     raw_video_name=os.path.basename(video_path),
+                    # The train's key, NOT this camera's clip name. Stage 6b
+                    # derives the fused document's S3 key from exactly this, so
+                    # passing it is what lets assembly replace this provisional
+                    # post in place instead of leaving a stale record beside it.
+                    batch_key=train_id,
                     verbose=verbose,
                 )
                 if verbose and res.per_camera_ingest is not None:

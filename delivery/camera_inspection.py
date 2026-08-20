@@ -61,6 +61,25 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+#: How a per-camera post relates to the fused one that assembly publishes.
+#:
+#: ``replace`` (default) -- the per-camera document is written to the SAME S3
+#: key the fused document will later occupy, so the dashboard shows a camera's
+#: provisional result within minutes and assembly overwrites it in place with
+#: the canonical, GW-numbered one. One record per camera per train, upgraded.
+#:
+#: ``sidecar`` -- the older behaviour: per-camera documents live under a
+#: ``per_camera/`` prefix and both versions stay retrievable side by side.
+#: Nothing is ever overwritten, but the dashboard sees two records.
+KEY_MODE_REPLACE = "replace"
+KEY_MODE_SIDECAR = "sidecar"
+
+
+def key_mode() -> str:
+    raw = (os.getenv("WAGONEYE_PER_CAMERA_KEY_MODE") or "").strip().lower()
+    return KEY_MODE_SIDECAR if raw == KEY_MODE_SIDECAR else KEY_MODE_REPLACE
+
+
 def is_enabled() -> bool:
     """Per-camera immediate publishing.  OFF unless explicitly turned on.
 
@@ -80,17 +99,43 @@ class CameraIngestResult:
     run_id: Optional[str] = None
     local_json: str = ""
     segments: int = 0
+    key_mode: str = ""
     errors: List[str] = field(default_factory=list)
 
     def render(self) -> str:
         bits = [f"[per-camera/{self.camera_id}] {self.status}"]
         if self.segments:
             bits.append(f"segments={self.segments}")
+        if self.key_mode:
+            bits.append(f"key={self.key_mode}")
         if self.run_id:
             bits.append(f"run_id={self.run_id}")
         if self.errors:
             bits.append(f"errors={self.errors}")
         return "  ".join(bits)
+
+
+def _train_ts(batch_key: str, raw_video_name: str, bundle):
+    """The train's timestamp, derived the way the FUSED path derives it.
+
+    `dashboard_ingest.run()` uses `extract_train_timestamp(batch_key)` -- ONE
+    value shared by all four cameras. The per-camera path must agree with it,
+    because the S3 key is built from this timestamp and the two documents can
+    only replace one another if their keys are identical.
+
+    Using each camera's own clip filename here (as this did originally) breaks
+    that: the four clips are stamped seconds apart -- 05:22:11, 05:22:18,
+    05:22:27, 05:22:41 for one real train -- so three of the four per-camera
+    documents would land on keys the fused pass never touches, and the
+    dashboard would keep a stale camera-local record beside the canonical one
+    instead of showing it replaced.
+
+    The clip name and bundle directory remain as FALLBACKS, for a caller that
+    has no batch key to give.
+    """
+    from delivery import dashboard_ingest as DASH
+    return DASH.extract_train_timestamp(
+        batch_key, raw_video_name, os.path.basename(bundle.dir))
 
 
 def build_document(
@@ -100,6 +145,7 @@ def build_document(
     total_frames: int = 0,
     raw_video_name: str = "",
     direction: str = "unknown",
+    batch_key: str = "",
 ) -> Dict[str, Any]:
     """Build this camera's `{camera_id, version, inspection_data}` document.
 
@@ -116,7 +162,7 @@ def build_document(
     state, unified, paths = adapt(bundle, fps=fps, total_frames=total_frames)
     evidence_root = paths["evidence_root"]
 
-    ts = DASH.extract_train_timestamp(raw_video_name, os.path.basename(bundle.dir))
+    ts = _train_ts(batch_key, raw_video_name, bundle)
     folder = DASH.full_camera_id(cam)
     version = DASH._version()
 
@@ -162,6 +208,8 @@ def build_document(
         "source": f"sealed camera bundle for {cam}",
         "numbering": "camera-local",
         "superseded_by_assembly": True,
+        "provisional": True,
+        "replaced_in_place_by_assembly": key_mode() == KEY_MODE_REPLACE,
         "note": ("wagon n is THIS camera's nth segment -- not necessarily the "
                  "same physical wagon as another camera's wagon n, and not the "
                  "fused GW_n.  total_wagons is this camera's own segment count."),
@@ -180,6 +228,7 @@ def publish(
     total_frames: int = 0,
     raw_video_name: str = "",
     direction: str = "unknown",
+    batch_key: str = "",
     dry_run: bool = False,
     requests_mod=None,
     verbose: bool = True,
@@ -201,7 +250,8 @@ def publish(
 
     try:
         doc = build_document(bundle, fps=fps, total_frames=total_frames,
-                             raw_video_name=raw_video_name, direction=direction)
+                             raw_video_name=raw_video_name, direction=direction,
+                             batch_key=batch_key)
         res.built = True
         res.segments = int(doc["inspection_data"].get("total_wagons") or 0)
     except Exception as e:  # noqa: BLE001
@@ -212,7 +262,7 @@ def publish(
 
     text = json.dumps(doc, indent=2, default=str)
     folder = DASH.full_camera_id(cam)
-    ts = DASH.extract_train_timestamp(raw_video_name, os.path.basename(bundle.dir))
+    ts = _train_ts(batch_key, raw_video_name, bundle)
     json_name = f"{os.path.splitext(doc['inspection_data']['raw_video_name'])[0]}_inspection.json"
 
     # Written beside the camera's own artifacts, so a sealed bundle carries the
@@ -227,12 +277,21 @@ def publish(
         res.errors.append(f"local write: {e}")
 
     bucket = DASH.inspection_bucket()
-    # A DISTINCT key from the fused document's: an immediate per-camera post must
-    # not overwrite (or be overwritten by) the canonical one that assembly
-    # publishes.  `per_camera/` keeps both retrievable and makes the difference
-    # visible in the URI itself.
-    key = (f"{folder}/{DASH.date_folder(ts)}/per_camera/"
-           f"{os.path.splitext(json_name)[0]}.json")
+    # In `replace` mode the key is built by the SAME function the fused path
+    # calls, with the SAME timestamp, so assembly's document lands on exactly
+    # this object and upgrades the dashboard record in place. Calling
+    # `inspection_s3_key` rather than formatting a path by hand is deliberate:
+    # it also keeps the two in step under `WAGONEYE_INSPECTION_KEY_LAYOUT=v1`,
+    # where the key includes `json_name`.
+    mode = key_mode()
+    res.key_mode = mode
+    if mode == KEY_MODE_REPLACE:
+        key = DASH.inspection_s3_key(camera=cam,
+                                     date_folder_str=DASH.date_folder(ts),
+                                     json_name=json_name, ts=ts)
+    else:
+        key = (f"{folder}/{DASH.date_folder(ts)}/per_camera/"
+               f"{os.path.splitext(json_name)[0]}.json")
     res.s3_uri = f"s3://{bucket}/{key}"
 
     if dry_run:

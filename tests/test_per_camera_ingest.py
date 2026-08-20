@@ -26,11 +26,13 @@ Nothing here touches AWS: the S3 client and `requests` are stubs.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -211,22 +213,47 @@ class TestPublish(unittest.TestCase):
             self.assertEqual(len(s3.uploads), 1)
             self.assertEqual(len(req.calls), len(DASH.ingest_api_urls()))
 
-    def test_key_is_separate_from_the_canonical_fused_document(self):
-        """An early per-camera post must not overwrite the authoritative one."""
+    def test_key_matches_the_canonical_one_so_assembly_replaces_it(self):
+        """The provisional post targets the object assembly will overwrite.
+
+        This test used to assert the OPPOSITE -- a `per_camera/` sidecar that
+        could never be overwritten. The requirement changed: a camera should
+        publish early and then be REPLACED by the combined result, so the
+        dashboard carries one record per camera per train that gets upgraded
+        rather than two records that must be reconciled by the reader. The old
+        layout is still reachable via `WAGONEYE_PER_CAMERA_KEY_MODE=sidecar`
+        and is pinned by the test below.
+        """
         from delivery import dashboard_ingest as DASH
+        clip = "clip_20260729_103722_train.mp4"
         with tempfile.TemporaryDirectory() as root:
             b, _ = _bundle(root)
             s3 = _StubS3()
             CI.publish(b, s3_client=s3, requests_mod=_StubRequests(),
-                       raw_video_name="clip_20260729_103722_train.mp4",
+                       raw_video_name=clip, batch_key="20260729_103722",
                        verbose=False)
             _bucket, key = s3.uploads[0]
-            self.assertIn("/per_camera/", key)
-            ts = DASH.extract_train_timestamp("clip_20260729_103722_train.mp4")
+            self.assertNotIn("/per_camera/", key)
+            ts = DASH.extract_train_timestamp("20260729_103722")
             canonical = DASH.inspection_s3_key(
-                camera=C.CAMERA_RIGHT_UP, date_folder_str="2026-07-29",
-                json_name="x.json", ts=ts)
-            self.assertNotEqual(key, canonical)
+                camera=C.CAMERA_RIGHT_UP,
+                date_folder_str=DASH.date_folder(ts),
+                json_name=f"{clip.rsplit(".", 1)[0]}_inspection.json", ts=ts)
+            self.assertEqual(key, canonical)
+
+    def test_sidecar_mode_still_keeps_the_two_documents_apart(self):
+        with tempfile.TemporaryDirectory() as root:
+            b, _ = _bundle(root)
+            s3 = _StubS3()
+            with mock.patch.dict(os.environ,
+                                 {"WAGONEYE_PER_CAMERA_KEY_MODE": "sidecar"}):
+                res = CI.publish(b, s3_client=s3,
+                                 requests_mod=_StubRequests(),
+                                 raw_video_name="clip_20260729_103722_train.mp4",
+                                 batch_key="20260729_103722", verbose=False)
+            _bucket, key = s3.uploads[0]
+            self.assertIn("/per_camera/", key)
+            self.assertEqual(res.key_mode, CI.KEY_MODE_SIDECAR)
 
     def test_ingest_payload_is_v4s_three_fields(self):
         with tempfile.TemporaryDirectory() as root:
@@ -236,7 +263,10 @@ class TestPublish(unittest.TestCase):
             for call in req.calls:
                 self.assertEqual(set(call["json"]),
                                  {"camera_id", "inspection_s3_uri", "version"})
-                self.assertIn("/per_camera/", call["json"]["inspection_s3_uri"])
+                self.assertTrue(
+                    call["json"]["inspection_s3_uri"].endswith(
+                        "inspection_data.json"),
+                    "the POST must point at the object assembly replaces")
 
     def test_writes_the_published_document_beside_the_bundle(self):
         with tempfile.TemporaryDirectory() as root:
@@ -317,3 +347,106 @@ class TestCameraRunnerWiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Replacement: the provisional post and the fused one must share a key
+# ---------------------------------------------------------------------------
+
+class TestPerCameraPostIsReplacedInPlace(unittest.TestCase):
+    """A camera posts early, assembly overwrites it with the canonical answer.
+
+    That only works if both write the SAME S3 object. The fused path builds its
+    key from `extract_train_timestamp(batch_key)` -- one value for all four
+    cameras -- so the per-camera path has to do the same. Deriving it from the
+    camera's own clip name instead leaves three of four cameras on keys the
+    fused pass never touches, and the dashboard keeps a stale camera-local
+    record beside the real one.
+    """
+
+    #: One real train from 2026-07-31: the four clips are stamped up to 30
+    #: seconds apart, which is exactly what breaks a filename-derived key.
+    CLIPS = {
+        C.CAMERA_RIGHT_UP:     "camera_CCTV_HZBN_DHN_2_RIGHT_UP_20260731_052218_train.mp4",
+        C.CAMERA_LEFT_UP:      "camera_CCTV_HZBN_DHN_1_LEFT_UP_20260731_052211_train.mp4",
+        C.CAMERA_RIGHT_UP_TOP: "camera_CCTV_HZBN_DHN_5_RIGHT_TOP_20260731_052227_train.mp4",
+        C.CAMERA_LEFT_UP_TOP:  "camera_CCTV_HZBN_DHN_6_LEFT_TOP_20260731_052241_train.mp4",
+    }
+    BATCH_KEY = "20260731_052211"
+
+    def _fused_key(self, cam, raw_video_name):
+        """The key Stage 6b will write, reproduced from dashboard_ingest."""
+        from delivery import dashboard_ingest as DASH
+        ts = DASH.extract_train_timestamp(self.BATCH_KEY)
+        json_name = f"{os.path.splitext(raw_video_name)[0]}_inspection.json"
+        return DASH.inspection_s3_key(camera=cam,
+                                      date_folder_str=DASH.date_folder(ts),
+                                      json_name=json_name, ts=ts)
+
+    def _per_camera_key(self, cam, raw_video_name, batch_key):
+        from delivery import camera_inspection as CI
+        from delivery import dashboard_ingest as DASH
+
+        class _B:
+            camera_id = cam
+            dir = os.path.join("/tmp", "camera_evidence", cam)
+
+        ts = CI._train_ts(batch_key, raw_video_name, _B())
+        json_name = f"{os.path.splitext(raw_video_name)[0]}_inspection.json"
+        return DASH.inspection_s3_key(camera=cam,
+                                      date_folder_str=DASH.date_folder(ts),
+                                      json_name=json_name, ts=ts)
+
+    def test_the_two_keys_are_identical_for_every_camera(self):
+        for cam, clip in self.CLIPS.items():
+            with self.subTest(camera=cam):
+                self.assertEqual(
+                    self._per_camera_key(cam, clip, self.BATCH_KEY),
+                    self._fused_key(cam, clip),
+                    f"{cam}'s provisional post would not be replaced by "
+                    f"assembly")
+
+    def test_a_clip_derived_key_would_NOT_collide(self):
+        """Documents why the batch key is passed -- the old rule really failed.
+
+        Three of the four cameras have a clip timestamp different from the batch
+        anchor, so a filename-derived key misses the fused object.
+        """
+        missed = []
+        for cam, clip in self.CLIPS.items():
+            if self._per_camera_key(cam, clip, "") != self._fused_key(cam, clip):
+                missed.append(cam)
+        self.assertEqual(len(missed), 3,
+                         f"expected 3 cameras to miss, got {missed}")
+        self.assertNotIn(C.CAMERA_LEFT_UP, missed,
+                         "LEFT_UP set the cluster anchor, so it alone matched")
+
+    def test_all_four_cameras_get_distinct_keys(self):
+        """Replacement must not make two cameras collide with each other."""
+        keys = {self._per_camera_key(cam, clip, self.BATCH_KEY)
+                for cam, clip in self.CLIPS.items()}
+        self.assertEqual(len(keys), 4)
+
+    def test_replace_is_the_default_mode(self):
+        from delivery import camera_inspection as CI
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WAGONEYE_PER_CAMERA_KEY_MODE", None)
+            self.assertEqual(CI.key_mode(), CI.KEY_MODE_REPLACE)
+
+    def test_sidecar_mode_restores_the_side_by_side_layout(self):
+        from delivery import camera_inspection as CI
+        with mock.patch.dict(os.environ,
+                             {"WAGONEYE_PER_CAMERA_KEY_MODE": "sidecar"}):
+            self.assertEqual(CI.key_mode(), CI.KEY_MODE_SIDECAR)
+
+    def test_the_document_says_it_is_provisional(self):
+        from delivery import camera_inspection as CI
+        self.assertIn("provisional", inspect.getsource(CI.build_document))
+        self.assertIn("replaced_in_place_by_assembly",
+                      inspect.getsource(CI.build_document))
+
+    def test_camera_runner_passes_the_train_id_as_the_batch_key(self):
+        from orchestrator import camera_runner
+        src = inspect.getsource(camera_runner.run_camera)
+        block = src[src.index("camera_inspection.publish"):]
+        self.assertIn("batch_key=train_id", block)
