@@ -632,9 +632,46 @@ def _pdf_url(report_meta: Dict[str, Any], camera: str) -> str:
 # Ingest (HTTP) with retries -- mirrors the old ingest loop
 # -----------------------------------------------------------------------------
 
-def ingest_idempotency_key(batch_key: str, camera: str, report_revision: int,
-                           json_sha256: str) -> str:
-    raw = f"{batch_key}|{camera}|{report_revision}|{json_sha256}"
+def ingest_idempotency_key(batch_key: str, camera: str,
+                           report_revision: int = 0,
+                           json_sha256: Optional[str] = None) -> str:
+    """Stable identity for "this camera's result for this train".
+
+    The document's CONTENT HASH is deliberately NOT part of this key, and that
+    is the whole point.
+
+    The receiver snapshots on POST -- it records what it fetched and does not
+    re-read the S3 object later. So when a camera publishes a provisional,
+    camera-local document and assembly later publishes the canonical one over
+    the SAME S3 key, the receiver only learns about the second document from the
+    second POST. With the content hash folded in, those two POSTs carried
+    DIFFERENT keys, so the receiver treated them as unrelated events and minted
+    a separate run for each: measured on 2026-07-22, every camera of every train
+    produced two dashboard runs, and the camera-local one (59 segments on one
+    train) was displayed instead of the fused count (54).
+
+    An idempotency key is supposed to identify the logical EVENT, not the bytes.
+    Including a content hash made every revision a new event, which is the exact
+    opposite of idempotent.
+
+    `json_sha256` is still accepted so existing callers keep working, but it is
+    ignored. Nothing is lost locally: `run()` compares `json_sha256` against its
+    own ledger DIRECTLY to skip re-delivering unchanged content, and never
+    consults this key for that decision.
+
+    Whether the receiver honours this as an upsert key is its own contract, not
+    ours -- but with a stable key it CAN, and with a per-content key it never
+    could.
+
+    `report_revision` is ignored for the same reason. A corrected report for a
+    train is an UPDATE to that camera's record, not a second record; folding the
+    revision in would split them again the moment a report was re-delivered.
+
+    So the identity is exactly (train, camera) -- which is what "this camera's
+    result for this train" means.
+    """
+    del json_sha256, report_revision    # intentionally not part of the identity
+    raw = f"{batch_key}|{camera}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 

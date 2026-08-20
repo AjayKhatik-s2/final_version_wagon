@@ -367,8 +367,13 @@ def publish(
 
     payload = {"camera_id": folder, "inspection_s3_uri": res.s3_uri,
                "version": DASH._version()}
-    idem = DASH.ingest_idempotency_key(
-        os.path.basename(bundle.dir), cam, 0, DASH._sha256_text(text))
+    # `batch_key`, NOT `basename(bundle.dir)` -- that is the CAMERA folder
+    # (`<evidence_root>/RIGHT_UP`), so the provisional post was identifying
+    # itself as train "RIGHT_UP" while assembly identified the same result as
+    # train "20260722_050704". The two could never have been recognised as the
+    # same event, no matter what the receiver does with the key.
+    idem = DASH.ingest_idempotency_key(batch_key or
+                                       os.path.basename(bundle.dir), cam)
 
     any_ok = False
     for url in DASH.ingest_api_urls():

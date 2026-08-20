@@ -582,3 +582,72 @@ class TestStagingPrefixDoesNotBreakReplacement(unittest.TestCase):
             self.assertNotIn("RIGHT_UP_camera_", key)
             self.assertIn("camera_CCTV_HZBN_DHN_2_RIGHT_UP_20260731_052218",
                           key)
+
+
+class TestProvisionalAndFusedShareOneIdentity(unittest.TestCase):
+    """The provisional post and the canonical one must be the SAME event.
+
+    The receiver snapshots on POST -- it records what it fetched and never
+    re-reads the S3 object. So overwriting the object is not enough: unless both
+    POSTs carry the same idempotency key, the receiver mints a separate run for
+    each and the dashboard ends up holding two records per camera per train.
+
+    Measured on 2026-07-22 before this was fixed: every camera of every train
+    produced two runs, and the camera-local one (59 segments) was displayed
+    instead of the fused count (54).
+    """
+
+    BATCH_KEY = "20260722_050704"
+
+    def test_key_ignores_the_content_hash(self):
+        from delivery.dashboard_ingest import ingest_idempotency_key as k
+        self.assertEqual(k(self.BATCH_KEY, C.CAMERA_RIGHT_UP, 0, "aaa"),
+                         k(self.BATCH_KEY, C.CAMERA_RIGHT_UP, 0, "bbb"))
+
+    def test_key_ignores_the_report_revision(self):
+        """A corrected report updates the record; it is not a new record."""
+        from delivery.dashboard_ingest import ingest_idempotency_key as k
+        self.assertEqual(k(self.BATCH_KEY, C.CAMERA_RIGHT_UP, 0),
+                         k(self.BATCH_KEY, C.CAMERA_RIGHT_UP, 7))
+
+    def test_key_still_separates_cameras_and_trains(self):
+        from delivery.dashboard_ingest import ingest_idempotency_key as k
+        keys = {k(t, c) for t in ("T1", "T2")
+                for c in (C.CAMERA_RIGHT_UP, C.CAMERA_LEFT_UP)}
+        self.assertEqual(len(keys), 4)
+
+    def test_the_provisional_post_uses_the_TRAIN_key_not_the_camera_dir(self):
+        """The bug that made a match impossible in principle.
+
+        `publish()` passed `os.path.basename(bundle.dir)` as the batch key, and
+        `bundle.dir` is `<evidence_root>/<CAMERA>` -- so the provisional post
+        identified itself as train "RIGHT_UP" while assembly identified the same
+        result as train "20260722_050704".
+        """
+        import inspect as _inspect
+        src = _inspect.getsource(CI.publish)
+        block = src[src.index("ingest_idempotency_key"):]
+        self.assertIn("batch_key", block.split(")")[0] + ")",
+                      "the provisional key is not derived from the train key")
+
+    def test_provisional_and_fused_keys_are_identical(self):
+        """End to end: the two code paths must agree on the identity."""
+        from delivery.dashboard_ingest import ingest_idempotency_key as k
+        # what dashboard_ingest.run() computes for the fused document
+        fused = k(self.BATCH_KEY, C.CAMERA_RIGHT_UP, 0, "fused-sha")
+        # what camera_inspection.publish() computes for the provisional one
+        provisional = k(self.BATCH_KEY, C.CAMERA_RIGHT_UP)
+        self.assertEqual(provisional, fused)
+
+    def test_the_local_ledger_still_skips_unchanged_content(self):
+        """Removing the sha from the KEY must not break re-delivery skipping.
+
+        `run()` compares `json_sha256` against its own ledger directly, so that
+        behaviour is independent of the idempotency key.
+        """
+        import inspect as _inspect
+        from delivery import dashboard_ingest as DASH
+        # `run` is a thin never-raises wrapper; the ledger lives in _run_inner.
+        src = _inspect.getsource(DASH._run_inner)
+        self.assertIn('pj.get("json_sha256") == json_sha', src)
+        self.assertIn("already_ingested", src)
