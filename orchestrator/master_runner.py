@@ -83,6 +83,7 @@ class BatchOutcome:
     unified: Dict[str, UnifiedWagonState] = field(default_factory=dict)
     feature_summary: Dict[str, Dict[str, str]] = field(default_factory=dict)
     cache_summary: Optional[Any] = None
+    engine_frames: Optional[Any] = None
     report_pdf_path: Optional[str] = None
     report_pdf_url: Optional[str] = None
     report_json_path: Optional[str] = None
@@ -272,6 +273,23 @@ def process_batch(
                 verbose=verbose,
             )
         assert_roster_unchanged(recon.state, roster_guard, stage="Stage 2 (materializer)")
+
+        # Engine frames: TRAIN-level evidence, not wagons. Runs here because the
+        # state, the videos and the resolved offsets are all in hand. Shares one
+        # implementation with sequential mode, and cannot affect the roster --
+        # it only reads the ENGINE segments the counter already excluded.
+        try:
+            from orchestrator import engine_frames
+            out.engine_frames = engine_frames.extract(
+                state=recon.state, video_paths=video_paths,
+                per_camera_fps=recon.per_camera_fps,
+                output_root=batch_root,
+                camera_offsets=recon.camera_offsets, verbose=verbose)
+        except Exception as e:
+            print(f"[ENGINE] extraction failed (non-fatal): "
+                  f"{type(e).__name__}: {e}")
+        assert_roster_unchanged(recon.state, roster_guard,
+                                stage="engine frames")
     except Exception as e:
         out.error = f"stage2: {e}"
         out.final_status = C.BATCH_FAILED

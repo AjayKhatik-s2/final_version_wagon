@@ -66,6 +66,7 @@ class AssemblyResult:
     mapping_by_camera: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     wagon_regions_applied: List[str] = field(default_factory=list)
     cache_summary: Any = None
+    engine_frames: Any = None
     feature_summary: Dict[str, Any] = field(default_factory=dict)
     missing_cameras: List[str] = field(default_factory=list)
     timings: Dict[str, float] = field(default_factory=dict)
@@ -311,6 +312,20 @@ def assemble(
         verbose=verbose,
     )
     res.timings["stage2_materializer"] = round(time.perf_counter() - t0, 3)
+
+    # Engine frames: the SAME shared extractor batch mode calls. Train-level
+    # evidence, never a wagon -- see orchestrator/engine_frames.py.
+    t0 = time.perf_counter()
+    try:
+        from orchestrator import engine_frames
+        res.engine_frames = engine_frames.extract(
+            state=state, video_paths=video_paths,
+            per_camera_fps=per_camera_fps, output_root=batch_root,
+            camera_offsets=resolved, verbose=verbose)
+    except Exception as e:
+        print(f"[ENGINE] extraction failed (non-fatal): "
+              f"{type(e).__name__}: {e}")
+    res.timings["engine_frames"] = round(time.perf_counter() - t0, 3)
 
     # ---- Stage 3: feature inference over the GLOBAL wagons --------------
     # Same processors, same strides, same order as master_runner: LOAD runs to

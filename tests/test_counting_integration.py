@@ -262,9 +262,25 @@ class TestCameraOffsetsReachMaterialization(unittest.TestCase):
                 os.path.abspath(__file__))), "orchestrator",
                 "master_runner.py"), "r", encoding="utf-8") as f:
             src = f.read()
-        self.assertEqual(src.count("camera_offsets=recon.camera_offsets"), 2,
-                         "camera offsets must reach BOTH the materializer "
-                         "(Stage 2) and the overlay renderer (Stage 4b)")
+        # Assert the CONSUMERS by name rather than counting occurrences. The
+        # count was a proxy that breaks whenever a legitimate new consumer
+        # appears -- engine-frame extraction needs the same offsets to project
+        # a master time onto each camera -- while saying nothing about which
+        # call sites actually got them.
+        import ast
+        tree = ast.parse(src)
+        receivers = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not any(kw.arg == "camera_offsets" for kw in node.keywords):
+                continue
+            receivers.add(ast.unparse(node.func))
+        for consumer in ("wagon_cache_builder.build",
+                         "feature_overlay_renderer.render_all_cameras"):
+            self.assertIn(consumer, receivers,
+                          f"{consumer} no longer receives camera_offsets; "
+                          f"got {sorted(receivers)}")
 
     def test_unresolved_camera_falls_back_to_shared_t0(self):
         """An UNRESOLVED camera is never given a guessed shift."""
