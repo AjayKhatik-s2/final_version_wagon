@@ -233,7 +233,8 @@ def _camera_damage_tracks(evidence_root, gw_id, camera_id):
         if tr.get("camera_id") != camera_id:
             continue
         idx = tr.get("track_idx")
-        path = ev.evidence_snapshot(evidence_root, gw_id, "damage", f"track_{int(idx)}") if idx else None
+        path = (ev.damage_track_snapshot(evidence_root, gw_id, camera_id,
+                                         int(idx)) if idx else None)
         if path:
             out.append((path, tr))
     out.sort(key=lambda x: float(x[1].get("best_confidence") or 0.0), reverse=True)

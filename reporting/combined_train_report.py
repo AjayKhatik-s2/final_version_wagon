@@ -679,7 +679,11 @@ def _top_damage_snapshot(evidence_root: Optional[str], gw_id: str, camera_id: st
             continue
         conf = float(tr.get("best_confidence") or 0.0)
         if conf > best_conf:
-            snap = ev.evidence_snapshot(evidence_root, gw_id, "damage", f"track_{int(idx)}")
+            # Camera-scoped slot (`track_2__RIGHT_UP_TOP`), legacy name as
+            # fallback -- safe because the loop above already confirmed this
+            # track belongs to `camera_id`.
+            snap = ev.damage_track_snapshot(evidence_root, gw_id,
+                                            camera_id, int(idx))
             if snap:
                 best, best_conf = snap, conf
     return best

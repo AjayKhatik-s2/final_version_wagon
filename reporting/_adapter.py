@@ -131,7 +131,11 @@ def _damage_entries(
         if cam not in (C.CAMERA_RIGHT_UP_TOP, C.CAMERA_LEFT_UP_TOP):
             continue
         idx = tr.get("track_idx")
-        snap = ev.evidence_snapshot(evidence_root, gw_id, "damage", f"track_{int(idx)}") if idx else None
+        # Camera-scoped slot, legacy name as fallback -- `cam` is already
+        # established from the track metadata just above, so this cannot cross
+        # camera identity.
+        snap = (ev.damage_track_snapshot(evidence_root, gw_id, cam, int(idx))
+                if idx else None)
         bucket = "right_top" if cam == C.CAMERA_RIGHT_UP_TOP else "left_top"
         out[bucket].append({
             "wagon_number":        wagon_number,

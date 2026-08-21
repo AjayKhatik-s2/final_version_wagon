@@ -65,6 +65,47 @@ class UnifiedWagonState:
         return (self.top_damage == C.DAMAGE_PRESENT
                 or self.side_damage == C.DAMAGE_PRESENT)
 
+    def damage_observations_by_camera(self) -> Dict[str, List[Dict[str, Any]]]:
+        """This wagon's damage detections grouped by the camera that saw them.
+
+        Damage is a property of the WAGON, assembled from per-camera
+        observations. One camera detecting it is sufficient -- the other camera
+        reporting nothing is not evidence of absence, because the two views
+        differ in angle, timing, occlusion and detection quality. That asymmetry
+        is already how the damage processor works (`any_damage` across the top
+        cameras), and this does not change it.
+
+        What this adds is a camera-keyed VIEW of provenance that is otherwise
+        buried in a flat list, so a report can show each camera's own snapshot
+        instead of one picture standing in for both. It is pure grouping over
+        `camera_id`, which the damage processor already stamps on every track --
+        no wagon matching happens here, and none should: the observation is
+        already attached to this wagon by the existing global mapping.
+
+        Returns {camera_id: [observation, ...]}, each list ordered by
+        descending best_confidence. Cameras with no detection are ABSENT from
+        the mapping rather than present with an empty list, so a caller cannot
+        mistake "saw nothing" for "was not consulted".
+        """
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for obs in list(self.top_damage_details or []) + \
+                list(self.side_damage_details or []):
+            if not isinstance(obs, dict):
+                continue
+            cam = obs.get("camera_id")
+            if not cam:
+                continue            # provenance-less: never guess a camera
+            out.setdefault(str(cam), []).append(obs)
+        for cam in out:
+            out[cam].sort(key=lambda o: float(o.get("best_confidence") or 0.0),
+                          reverse=True)
+        return out
+
+    @property
+    def damage_cameras(self) -> List[str]:
+        """Cameras that actually reported damage on this wagon, sorted."""
+        return sorted(self.damage_observations_by_camera())
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 

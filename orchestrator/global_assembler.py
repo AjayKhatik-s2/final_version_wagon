@@ -368,6 +368,7 @@ def assemble(
     )
     res.timings["stage2_materializer"] = round(time.perf_counter() - t0, 3)
 
+
     # ---- Stage 3: feature inference over the GLOBAL wagons --------------
     # Same processors, same strides, same order as master_runner: LOAD runs to
     # completion first so the damage processor's loaded-wagon floor-damage

@@ -238,6 +238,7 @@ REVIEWED_IN_WORKTREE = (
 )
 
 
+
 def changed_paths(*pathspecs) -> "list":
     """Worktree changes vs HEAD under `pathspecs`, minus REVIEWED_IN_WORKTREE.
 

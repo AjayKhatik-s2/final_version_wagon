@@ -280,6 +280,7 @@ def process_batch(
                 verbose=verbose,
             )
         assert_roster_unchanged(recon.state, roster_guard, stage="Stage 2 (materializer)")
+
     except Exception as e:
         out.error = f"stage2: {e}"
         out.final_status = C.BATCH_FAILED

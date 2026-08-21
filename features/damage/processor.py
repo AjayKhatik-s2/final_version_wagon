@@ -63,6 +63,7 @@ from features._common import (
 from features.inference_lib.damage_tracker import (
     DamageTracker, DamageTrackerConfig, yolo_to_damage_detections,
 )
+from core.evidence_identity import damage_track_slot
 from features._evidence import (
     wagon_evidence_dir, save_jpeg, safe_crop,
     write_metadata, draw_annotated_bbox,
@@ -610,15 +611,22 @@ def run(
                         label=f"{tr['class_name']} {tr['best_confidence']:.2f}",
                         color=(0, 0, 255),
                     )
-                    full_p = os.path.join(ev_dir, f"track_{i}.jpg")
-                    crop_p = os.path.join(ev_dir, f"track_{i}_crop.jpg")
+                    # The filename carries the CAMERA, not just the index.
+                    # `i` is unique only within this one invocation; two
+                    # invocations writing the same evidence directory would both
+                    # start at track_1 and silently overwrite each other, and
+                    # the two top cameras look alike enough that nobody would
+                    # notice. Camera in the name makes that impossible.
+                    slot = damage_track_slot(i, tr["camera_id"])
+                    full_p = os.path.join(ev_dir, f"{slot}.jpg")
+                    crop_p = os.path.join(ev_dir, f"{slot}_crop.jpg")
                     save_jpeg(full_p, annotated)
                     crop_img = safe_crop(snap, tr.get("bbox"), pad=10)
                     if crop_img is not None:
                         save_jpeg(crop_p, crop_img)
-                    evidence_paths[f"track_{i}"] = full_p
+                    evidence_paths[slot] = full_p
                     if crop_img is not None:
-                        evidence_paths[f"track_{i}_crop"] = crop_p
+                        evidence_paths[f"{slot}_crop"] = crop_p
                     track_meta.append({
                         "track_idx":       i,
                         "camera_id":       tr["camera_id"],
