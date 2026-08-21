@@ -46,6 +46,7 @@ from core import constants as C                                   # noqa: E402
 from core.global_state_loader import parse_global_train_state      # noqa: E402
 from delivery import dashboard_ingest as DASH                      # noqa: E402
 from delivery import inspection_json as IJ                         # noqa: E402
+from core import evidence_identity as EI                           # noqa: E402
 from delivery import ml_api                                        # noqa: E402
 
 
@@ -887,3 +888,158 @@ class TestPdfLinkReachesTheDashboard(unittest.TestCase):
         self.assertIn("upload_urls", src)
         self.assertIn("_FIN.load(batch_root) is None", src,
                       "must not overwrite an existing finalization marker")
+
+
+# ---------------------------------------------------------------------------
+# 12. Top-camera evidence is never shared between the two top cameras
+# ---------------------------------------------------------------------------
+
+class TestTopCameraEvidenceIsNotShared(unittest.TestCase):
+    """RIGHT_UP_TOP and LEFT_UP_TOP must never publish each other's photo.
+
+    Both top cameras shoot the same wagon roof from opposite sides, so a swapped
+    frame is not a visible bug -- it is a plausible photo, of the wrong camera.
+    The dashboard showed it plainly: both top panels rendered the SAME image,
+    because `load/best_frame.jpg` is one file for a verdict two cameras voted on
+    and the flat resolver hands it to whoever asks.
+
+    The combined PDF was already correct (it goes through
+    `reporting/_evidence_lookup.evidence_snapshot_for_camera`, which demands
+    proven ownership), which is exactly why the two disagreed.
+    """
+
+    @staticmethod
+    def _url_for(evidence_root):
+        """The real resolver, so these tests exercise real path resolution."""
+        def _u(*, gw_id, feature, camera, filename):
+            rel = DASH.evidence_rel_path(evidence_root, gw_id, feature,
+                                         camera, filename)
+            return f"https://b.s3.ap-south-1.amazonaws.com/{rel}" if rel else None
+        return _u
+
+    def _frames(self, evidence_root, camera):
+        return IJ._wagon_frames(evidence_root, "GW_1", camera,
+                                IJ.FLAVOUR_TOP, self._url_for(evidence_root))
+
+    @staticmethod
+    def _load_urls(frames):
+        return [f["s3_url"] for f in frames if "/load/" in f["s3_url"]]
+
+    def test_each_top_camera_publishes_its_own_load_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ev = os.path.join(tmp, "evidence")
+            for cam in C.TOP_CAMERAS:
+                _jpeg(os.path.join(ev, "GW_1", "load",
+                                   f"{EI.load_best_frame_slot(cam)}.jpg"))
+            right = self._load_urls(self._frames(ev, C.CAMERA_RIGHT_UP_TOP))
+            left = self._load_urls(self._frames(ev, C.CAMERA_LEFT_UP_TOP))
+            self.assertEqual(len(right), 1)
+            self.assertEqual(len(left), 1)
+            self.assertNotEqual(
+                right[0], left[0],
+                "the two top cameras published the SAME load frame -- this is "
+                "the defect that made both dashboard top panels identical")
+            self.assertIn(C.CAMERA_RIGHT_UP_TOP, right[0])
+            self.assertIn(C.CAMERA_LEFT_UP_TOP, left[0])
+
+    def test_a_top_camera_with_no_frame_of_its_own_borrows_nothing(self):
+        """Only RIGHT_UP_TOP has a frame; LEFT_UP_TOP must show none."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ev = os.path.join(tmp, "evidence")
+            _jpeg(os.path.join(
+                ev, "GW_1", "load",
+                f"{EI.load_best_frame_slot(C.CAMERA_RIGHT_UP_TOP)}.jpg"))
+            self.assertEqual(
+                len(self._load_urls(self._frames(ev, C.CAMERA_RIGHT_UP_TOP))), 1)
+            self.assertEqual(
+                self._load_urls(self._frames(ev, C.CAMERA_LEFT_UP_TOP)), [],
+                "an absent frame must stay absent; borrowing is not a fallback")
+
+    def test_the_legacy_shared_frame_reaches_only_its_proven_owner(self):
+        """A pre-rename tree has one `best_frame.jpg`, owned per metadata."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ev = os.path.join(tmp, "evidence")
+            _jpeg(os.path.join(ev, "GW_1", "load", "best_frame.jpg"))
+            _write(os.path.join(ev, "GW_1", "load", "metadata.json"),
+                   {"global_id": "GW_1", "feature": "load",
+                    "source_camera": C.CAMERA_RIGHT_UP_TOP})
+            owner = self._load_urls(self._frames(ev, C.CAMERA_RIGHT_UP_TOP))
+            other = self._load_urls(self._frames(ev, C.CAMERA_LEFT_UP_TOP))
+            self.assertEqual(len(owner), 1)
+            self.assertEqual(other, [],
+                             "the non-owner republished the owner's frame")
+
+    def test_an_unattributed_shared_frame_reaches_nobody(self):
+        """No `source_camera` means ownership is unproven, so no URL at all.
+
+        Guessing would be a coin flip on which top panel is a lie.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            ev = os.path.join(tmp, "evidence")
+            _jpeg(os.path.join(ev, "GW_1", "load", "best_frame.jpg"))
+            for cam in C.TOP_CAMERAS:
+                self.assertEqual(self._load_urls(self._frames(ev, cam)), [])
+
+    def test_camera_scoped_frame_wins_over_the_legacy_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ev = os.path.join(tmp, "evidence")
+            _jpeg(os.path.join(ev, "GW_1", "load", "best_frame.jpg"))
+            _write(os.path.join(ev, "GW_1", "load", "metadata.json"),
+                   {"source_camera": C.CAMERA_RIGHT_UP_TOP})
+            for cam in C.TOP_CAMERAS:
+                _jpeg(os.path.join(ev, "GW_1", "load",
+                                   f"{EI.load_best_frame_slot(cam)}.jpg"))
+            for cam in C.TOP_CAMERAS:
+                got = self._load_urls(self._frames(ev, cam))
+                self.assertEqual(len(got), 1)
+                self.assertIn(cam, got[0])
+
+    def test_every_top_gallery_entry_carries_the_camera(self):
+        """A gallery template without `{cam}` is a shared-file bug waiting."""
+        for t in IJ._TOP_GALLERY:
+            self.assertIn("{cam}", t, f"{t!r} is camera-ambiguous")
+
+    def test_load_best_frame_slot_refuses_an_empty_camera(self):
+        with self.assertRaises(ValueError):
+            EI.load_best_frame_slot("")
+
+
+class TestDamageEvidenceIsCameraScoped(unittest.TestCase):
+    """The damage WRITER already scopes by camera; the JSON reader must agree.
+
+    `features/damage/processor.py` writes `track_1__RIGHT_UP_TOP.jpg`, but the
+    inspection JSON asked for `track_1.jpg` -- so on a current evidence tree the
+    URL resolved to nothing and the dashboard's damage panel had no image, while
+    the PDF (which uses the scoped slot) showed the damage correctly.
+    """
+
+    @staticmethod
+    def _url_for(evidence_root):
+        def _u(*, gw_id, feature, camera, filename):
+            rel = DASH.evidence_rel_path(evidence_root, gw_id, feature,
+                                         camera, filename)
+            return f"https://b.s3.ap-south-1.amazonaws.com/{rel}" if rel else None
+        return _u
+
+    def _damage_urls(self, ev, camera):
+        frames = IJ._wagon_frames(ev, "GW_1", camera, IJ.FLAVOUR_TOP,
+                                  self._url_for(ev))
+        return [f["s3_url"] for f in frames if "/damage/" in f["s3_url"]]
+
+    def test_the_scoped_track_written_by_the_processor_is_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ev = os.path.join(tmp, "evidence")
+            slot = EI.damage_track_slot(1, C.CAMERA_RIGHT_UP_TOP)
+            _jpeg(os.path.join(ev, "GW_1", "damage", f"{slot}.jpg"))
+            got = self._damage_urls(ev, C.CAMERA_RIGHT_UP_TOP)
+            self.assertEqual(len(got), 1, "the writer's own filename was missed")
+            self.assertIn(slot, got[0])
+
+    def test_one_top_cameras_damage_track_is_not_the_others(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ev = os.path.join(tmp, "evidence")
+            _jpeg(os.path.join(
+                ev, "GW_1", "damage",
+                f"{EI.damage_track_slot(1, C.CAMERA_RIGHT_UP_TOP)}.jpg"))
+            self.assertEqual(len(self._damage_urls(ev, C.CAMERA_RIGHT_UP_TOP)), 1)
+            self.assertEqual(self._damage_urls(ev, C.CAMERA_LEFT_UP_TOP), [])

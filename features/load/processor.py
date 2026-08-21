@@ -41,6 +41,7 @@ import traceback
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from core import constants as C
+from core.evidence_identity import load_best_frame_slot
 from core.global_state_loader import GlobalTrainState
 
 from features._common import (
@@ -279,15 +280,38 @@ def run(
                     meta_payload["best_frame_idx"] = b.frame_idx
                     meta_payload["best_class"]     = b.meta.get("class_name")
                     meta_payload["best_confidence"] = b.meta.get("confidence")
-                # Also keep a per-camera audit trail
+                # ALSO give each contributing camera its own frame, under a
+                # camera-scoped name.
+                #
+                # `best_frame.jpg` above is the FUSED winner: one image for a
+                # verdict both top cameras voted on. It is the right picture for
+                # the combined verdict and the wrong picture for the other
+                # camera, whose per-camera document would otherwise publish it
+                # as its own -- and since the two top cameras photograph the same
+                # roof from opposite sides, that renders as a plausible photo of
+                # the wrong camera rather than as an obvious bug. It is what made
+                # both top panels in the dashboard show the same image.
+                #
+                # The frames are already in hand from the same pass, so this adds
+                # no inference: only a JPEG write per camera that saw something.
                 for cam, side in best_by_cam.items():
                     for key, b in side.items():
-                        if b.has_data():
-                            meta_payload["per_camera"].setdefault(cam, {})[key] = {
-                                "frame_idx":  b.frame_idx,
-                                "confidence": b.meta.get("confidence"),
-                                "class_name": b.meta.get("class_name"),
-                            }
+                        if not b.has_data():
+                            continue
+                        meta_payload["per_camera"].setdefault(cam, {})[key] = {
+                            "frame_idx":  b.frame_idx,
+                            "confidence": b.meta.get("confidence"),
+                            "class_name": b.meta.get("class_name"),
+                        }
+                    own = side.get(winning_key)
+                    if own is None or not own.has_data():
+                        continue
+                    slot = load_best_frame_slot(cam)
+                    own_p = os.path.join(ev_dir, f"{slot}.jpg")
+                    if save_jpeg(own_p, own.frame):
+                        evidence_paths[slot] = own_p
+                        meta_payload["per_camera"].setdefault(cam, {})[
+                            "best_frame_slot"] = slot
                 write_metadata(os.path.join(ev_dir, "metadata.json"), meta_payload)
 
             payload: Dict[str, Any] = {

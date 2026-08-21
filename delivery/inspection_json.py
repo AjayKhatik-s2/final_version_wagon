@@ -52,6 +52,9 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from core import constants as C
+from core.evidence_identity import (
+    damage_track_slot, legacy_damage_track_slot, load_best_frame_slot,
+    legacy_load_best_frame_slot)
 from core.logging_setup import get_logger
 
 log = get_logger("delivery.inspection_json")
@@ -396,8 +399,16 @@ def _side_door_fields(states_root: str, camera: str, gw_id: str,
 # Ordered gallery candidates per camera role, as "<feature>/<filename>".
 _SIDE_GALLERY = ("door/{side}_best.jpg", "door/{side}_crop.jpg",
                  "ocr/best_frame.jpg", "ocr/number_crop.jpg")
-_TOP_GALLERY = ("load/best_frame.jpg", "damage/track_1.jpg",
-                "damage/track_2.jpg", "damage/track_3.jpg")
+#: `{cam}` is substituted with the asking camera. Both entries MUST carry it:
+#: `load/best_frame.jpg` and `damage/track_1.jpg` are camera-ambiguous names,
+#: and handing either to whichever camera asked is what published one top
+#: camera's photo as the other's. The camera-scoped names are what the writers
+#: actually produce now (features/load/processor.py, features/damage/processor.py
+#: via core.evidence_identity).
+_TOP_GALLERY = ("load/best_frame__{cam}.jpg",
+                "damage/track_1__{cam}.jpg",
+                "damage/track_2__{cam}.jpg",
+                "damage/track_3__{cam}.jpg")
 
 #: V4 side cameras sample 4 representative frames named start/mid1/mid2/end
 #: (configs/cameras/right_up.yaml: representative_position_names).
@@ -412,13 +423,25 @@ def _wagon_frames(evidence_root: str, gw_id: str, camera: str,
     fabricated for a frame the pipeline did not produce.
     """
     side = "right" if camera == C.CAMERA_RIGHT_UP else "left"
-    templates = (_TOP_GALLERY if flavour == FLAVOUR_TOP
+    templates = (tuple(t.format(cam=camera) for t in _TOP_GALLERY)
+                 if flavour == FLAVOUR_TOP
                  else tuple(t.format(side=side) for t in _SIDE_GALLERY))
     frames: List[Dict[str, Any]] = []
     for rel in templates:
         feature, filename = rel.split("/", 1)
         url = url_for(gw_id=gw_id, feature=feature, camera=camera,
                       filename=filename)
+        if not url and feature == "load":
+            # An evidence tree written before load frames carried the camera has
+            # only the fused `best_frame.jpg`. That file belongs to ONE camera,
+            # named in metadata.json's `source_camera`, and may be published by
+            # that camera alone -- borrowing it is the bug, not the fallback.
+            # Unproven ownership is not ownership: no attribution means no URL.
+            meta = _read_json(os.path.join(evidence_root, gw_id, "load",
+                                           "metadata.json")) or {}
+            if (meta.get("source_camera") or meta.get("camera_id")) == camera:
+                url = url_for(gw_id=gw_id, feature=feature, camera=camera,
+                              filename=f"{legacy_load_best_frame_slot()}.jpg")
         if not url:
             continue
         frames.append({
@@ -699,12 +722,22 @@ def build_inspection_json(
                 ptype = _V4_TOP_PROBLEM_TYPE.get(cls, cls)
                 _bump(ptype)
                 idx = track.get("track_idx", 1)
+                # `_project_camera_view` has already dropped every track whose
+                # `camera_id` is not this camera, so the legacy unscoped name is
+                # a safe LAST resort here: reaching it means this camera owns the
+                # track. It exists only for evidence trees written before the
+                # slots carried the camera.
+                dmg_url = url_for(gw_id=gw_id, feature="damage", camera=camera,
+                                  filename=f"{damage_track_slot(idx, camera)}.jpg")
+                if not dmg_url:
+                    dmg_url = url_for(
+                        gw_id=gw_id, feature="damage", camera=camera,
+                        filename=f"{legacy_damage_track_slot(idx)}.jpg")
                 problem_frames.append(_problem_frame(
                     wagon_count=wagon_count, segment_type=display,
                     segment_number=segment_type_map[str(seg_id)].get("number"),
                     problem_type=ptype, frame_number=track.get("frame_idx"),
-                    url=url_for(gw_id=gw_id, feature="damage", camera=camera,
-                                filename=f"track_{idx}.jpg"),
+                    url=dmg_url,
                     bbox=track.get("bbox"), schema=schema,
                     confidence=track.get("best_confidence", track.get("confidence")),
                     class_name=cls,

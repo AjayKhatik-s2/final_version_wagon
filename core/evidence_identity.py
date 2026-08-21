@@ -8,6 +8,13 @@ The global wagon id says WHICH wagon; it is metadata, never a substitute for
 the camera. Two cameras observing the same wagon produce two records, and the
 report must be able to ask for one of them specifically.
 
+Two features need this, for two different reasons.
+
+`damage` needs it because BOTH top cameras write tracks into one directory and
+the index alone collides. `load` needs it because the load processor writes only
+ONE image for the whole wagon -- the winning camera's -- under a filename with no
+camera in it, so a reader cannot tell whose frame it is holding.
+
 This matters most for damage. A wagon's `evidence/<gw>/damage/` directory holds
 the tracks of BOTH top cameras, and the index alone is unique only within the
 single processor invocation that produced it. Two invocations writing the same
@@ -48,6 +55,36 @@ def legacy_damage_track_slot(track_idx: int) -> str:
     reintroducing cross-camera substitution.
     """
     return f"track_{int(track_idx)}"
+
+
+def load_best_frame_slot(camera_id: str) -> str:
+    """Slot name for ONE top camera's own load frame, ``best_frame__LEFT_UP_TOP``.
+
+    The load processor fuses both top cameras into a single verdict and saves a
+    single ``best_frame.jpg`` -- whichever camera won (RIGHT_UP_TOP preferred,
+    LEFT_UP_TOP as fallback; features/load/processor.py). That filename cannot
+    say who took the picture, so a per-camera consumer asking for
+    ``load/best_frame.jpg`` gets the same file no matter which camera it is, and
+    the two top cameras photograph the same roof from opposite sides: the
+    substitution renders as a plausible photo of the wrong camera.
+
+    The camera-scoped slot is what lets each top camera have its own frame.
+    """
+    if not camera_id:
+        raise ValueError(
+            "load_best_frame_slot requires camera_id: a load frame with no "
+            "camera in its name is exactly the ambiguity this avoids")
+    return f"best_frame{_SEP}{camera_id}"
+
+
+def legacy_load_best_frame_slot() -> str:
+    """The camera-ambiguous name, ``best_frame``.
+
+    Still the fused winner's frame, and still correct for the camera that WON --
+    but only that camera. A reader may fall back to it solely after confirming
+    from ``metadata.json``'s ``source_camera`` that it owns the file.
+    """
+    return "best_frame"
 
 
 def parse_damage_track_slot(slot: str) -> tuple:

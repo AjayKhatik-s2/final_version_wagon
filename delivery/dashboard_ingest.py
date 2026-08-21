@@ -348,9 +348,21 @@ def evidence_rel_path(evidence_root: str, gw: str, feature: str, camera: str,
 
     Two layouts are supported, in order:
       1. ``<GW>/<feature>/<CAMERA>/<file>`` -- a per-camera evidence subtree.
-      2. ``<GW>/<feature>/<file>``          -- this package's flat layout, where
-         the camera is encoded in the filename (``right_best.jpg``) or in the
-         sibling ``metadata.json`` (damage tracks carry ``camera_id``).
+      2. ``<GW>/<feature>/<file>``          -- this package's flat layout.
+
+    This function resolves EXISTENCE, not ownership: given a filename it reports
+    where that file is, and it does not and cannot check whose camera took the
+    picture. In the flat layout the camera is carried by the filename itself
+    (``right_best.jpg``, ``best_frame__LEFT_UP_TOP.jpg``,
+    ``track_1__RIGHT_UP_TOP.jpg``) -- so asking for a camera-scoped name is
+    self-verifying, and asking for a bare ``best_frame.jpg`` or ``track_1.jpg``
+    returns the same file to every camera that asks.
+
+    Callers must therefore ask for camera-scoped names (see
+    core.evidence_identity), and may fall back to a bare name only after
+    confirming from the sibling ``metadata.json`` that this camera owns it.
+    Publishing a bare name unchecked is what put one top camera's photo in the
+    other's document, invisibly, because the two top cameras shoot the same roof.
 
     Returning the RELATIVE path keeps the S3 URL and the local file in lockstep:
     the Stage-6 tree upload mirrors ``evidence/`` verbatim, so whichever layout
