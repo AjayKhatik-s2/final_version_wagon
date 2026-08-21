@@ -679,7 +679,8 @@ def _top_damage_snapshot(evidence_root: Optional[str], gw_id: str, camera_id: st
             continue
         conf = float(tr.get("best_confidence") or 0.0)
         if conf > best_conf:
-            snap = ev.evidence_snapshot(evidence_root, gw_id, "damage", f"track_{int(idx)}")
+            snap = ev.damage_track_snapshot(evidence_root, gw_id,
+                                            camera_id, int(idx))
             if snap:
                 best, best_conf = snap, conf
     return best
@@ -743,50 +744,40 @@ def _panel_state_text(u: UnifiedWagonState, camera_id: str, damage_cams: set,
     return f"Top Damage (support): {dmg}"
 
 
-def _best_damage_snapshot_any(evidence_root: Optional[str], gw_id: str) -> Optional[str]:
-    """Highest-confidence damage-track snapshot across BOTH top cameras."""
-    md = ev.evidence_metadata(evidence_root, gw_id, "damage")
-    best = None
-    best_conf = -1.0
-    for tr in (md.get("tracks") or []):
-        if not isinstance(tr, dict):
-            continue
-        idx = tr.get("track_idx")
-        if idx is None:
-            continue
-        conf = float(tr.get("best_confidence") or 0.0)
-        if conf > best_conf:
-            snap = ev.evidence_snapshot(evidence_root, gw_id, "damage", f"track_{int(idx)}")
-            if snap:
-                best, best_conf = snap, conf
-    return best
-
-
 def _panel_snapshot(u: UnifiedWagonState, camera_id: str,
                     evidence_root: Optional[str], cache_root: Optional[str],
                     gw_id: str) -> Optional[str]:
-    """Resolve a snapshot for one camera: feature evidence first, else a
-    representative wagon_cache frame (so all four angles show the wagon).
+    """Resolve a snapshot for ONE camera, from that camera's own evidence.
 
-    ITEM 7: for TOP cameras, when the wagon is damaged we ALWAYS prefer a boxed
-    damage snapshot (own-camera first, then the best across BOTH top cameras) so
-    a detected anomaly is never shown as a clean frame in the multi-angle grid.
+    Every lookup here is camera-scoped, and deliberately so. This panel used to
+    prefer, for a damaged wagon, "own camera first, then the best across BOTH
+    top cameras". When only one top camera had a damage track -- the common case,
+    since the two see different sides of the roof -- both panels resolved to the
+    same file, and the combined PDF showed one camera's picture twice under two
+    different camera headings. The two top views look alike, so it read as
+    correct.
+
+    A camera with no evidence of its own now falls back only WITHIN its own
+    identity: its wagon_cache mid-frame, which is extracted per camera folder.
+    If even that is absent the panel renders a missing state rather than
+    borrowing a neighbour's image.
+
+    The global wagon id says WHICH wagon; camera_id says WHERE the picture came
+    from. The id alone is never a sufficient evidence key.
     """
     snap = None
     if camera_id == C.CAMERA_RIGHT_UP:
         snap = ev.evidence_snapshot(evidence_root, gw_id, "door", "right_best")
     elif camera_id == C.CAMERA_LEFT_UP:
         snap = ev.evidence_snapshot(evidence_root, gw_id, "door", "left_best")
-    elif camera_id == C.CAMERA_RIGHT_UP_TOP:
-        snap = _top_damage_snapshot(evidence_root, gw_id, C.CAMERA_RIGHT_UP_TOP)
-        if snap is None and u.top_damage == C.DAMAGE_PRESENT:
-            snap = _best_damage_snapshot_any(evidence_root, gw_id)
+    elif camera_id in (C.CAMERA_RIGHT_UP_TOP, C.CAMERA_LEFT_UP_TOP):
+        # Own damage track first, so a detected anomaly is not shown as a clean
+        # frame -- but only ever THIS camera's track.
+        snap = _top_damage_snapshot(evidence_root, gw_id, camera_id)
         if snap is None:
-            snap = ev.evidence_snapshot(evidence_root, gw_id, "load", "best_frame")
-    elif camera_id == C.CAMERA_LEFT_UP_TOP:
-        snap = _top_damage_snapshot(evidence_root, gw_id, C.CAMERA_LEFT_UP_TOP)
-        if snap is None and u.top_damage == C.DAMAGE_PRESENT:
-            snap = _best_damage_snapshot_any(evidence_root, gw_id)
+            # load/best_frame.jpg is written by whichever top camera won, so it
+            # is resolved through its recorded source_camera.
+            snap = ev.load_snapshot(evidence_root, gw_id, camera_id)
     if snap and os.path.isfile(snap):
         return snap
     return _cache_mid_frame(cache_root, gw_id, camera_id)

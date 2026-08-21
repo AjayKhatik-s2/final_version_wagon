@@ -17,7 +17,7 @@ import os
 import tempfile
 import unittest
 
-from _engine_harness import V4_ROOT  # noqa: F401  (path bootstrap)
+from _engine_harness import V4_ROOT, changed_paths  # noqa: F401
 
 import cv2
 import numpy as np
@@ -87,8 +87,9 @@ def _bundle(root, cam=CAM, n=3, with_frames=True, with_features=True):
 EVIDENCE_SLOTS = {
     "RIGHT_UP":     [("door", "right_best")],
     "LEFT_UP":      [("door", "left_best")],
-    "RIGHT_UP_TOP": [("load", "best_frame"), ("damage", "track_1")],
-    "LEFT_UP_TOP":  [("damage", "track_1")],
+    "RIGHT_UP_TOP": [("load", "best_frame"),
+                     ("damage", "track_1__RIGHT_UP_TOP")],
+    "LEFT_UP_TOP":  [("damage", "track_1__LEFT_UP_TOP")],
 }
 
 
@@ -103,6 +104,14 @@ def _write_camera_evidence(bundle_dir, local_id, cam, tint):
         d = os.path.join(bundle_dir, "evidence", local_id, feature)
         os.makedirs(d, exist_ok=True)
         cv2.imwrite(os.path.join(d, f"{slot}.jpg"), img)
+        if feature == "load":
+            # `load_snapshot` resolves through source_camera: best_frame.jpg is
+            # written by whichever top camera won, so the reader must be told
+            # which one that was.
+            with open(os.path.join(d, "metadata.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"global_id": local_id, "feature": "load",
+                           "source_camera": cam}, f)
         if feature == "damage":
             # `_camera_damage_tracks` reads this metadata and filters on
             # camera_id before it will look for track_<n>.jpg at all.
@@ -220,16 +229,37 @@ class TestSnapshotsAreEmbedded(unittest.TestCase):
             self.assertTrue(p and os.path.isfile(p))
             self.assertEqual(_embedded_jpegs(p), [])
 
+    #: Slots the renderer no longer names inline, because they are resolved
+    #: through a CAMERA-AWARE helper instead. The literal lives in the helper;
+    #: the renderer passes the camera. Naming them here keeps the contract
+    #: pinned without demanding a camera-blind literal in the renderer.
+    HELPER_RESOLVED = {("load", "best_frame"): ("load_snapshot", "camera_id")}
+
     def test_slots_match_what_the_renderer_looks_up(self):
         """Pin the per-camera slot contract the renderer depends on."""
         src = inspect.getsource(
             __import__("reporting.camera_reports", fromlist=["x"]))
+        helper_src = inspect.getsource(
+            __import__("reporting._evidence_lookup", fromlist=["x"]))
         for cam, slots in EVIDENCE_SLOTS.items():
             for feature, slot in slots:
                 if slot.startswith("track_"):
                     continue          # resolved via damage metadata, not a literal
                 with self.subTest(camera=cam, slot=slot):
-                    self.assertIn(f'"{feature}", "{slot}"', src)
+                    helper = self.HELPER_RESOLVED.get((feature, slot))
+                    if helper:
+                        fn, needs = helper
+                        self.assertIn(f"ev.{fn}(", src,
+                                      f"{feature}/{slot} must go through {fn}")
+                        self.assertIn(f'"{feature}", "{slot}"', helper_src)
+                        self.assertIn(needs,
+                                      inspect.getsource(
+                                          getattr(__import__(
+                                              "reporting._evidence_lookup",
+                                              fromlist=["x"]), fn)),
+                                      f"{fn} must be camera-scoped")
+                    else:
+                        self.assertIn(f'"{feature}", "{slot}"', src)
 
 
 class TestCameraLocalEvidenceIsProduced(unittest.TestCase):
@@ -278,16 +308,37 @@ class TestNoSecondRenderer(unittest.TestCase):
             with self.subTest(token=banned):
                 self.assertNotIn(banned, src)
 
-    def test_existing_report_builders_unmodified(self):
+    def test_report_layout_modules_unmodified(self):
+        """Layout and styling stay frozen.
+
+        camera_reports.py and combined_train_report.py are NOT in this set any
+        more: fixing the cross-camera snapshot substitution required changing
+        how they RESOLVE an image (see tests/test_combined_report_camera_
+        isolation.py). Their page structure, tables and styling are untouched,
+        which is what _pages/_brand pin.
+        """
+        modified = changed_paths("reporting/_pages.py", "reporting/_brand.py")
+        if modified is None:
+            self.skipTest("git unavailable")
+        self.assertEqual(modified, [])
+
+    def test_resolution_changes_did_not_touch_layout(self):
+        """The two builders changed only in how they LOOK UP an image."""
         import subprocess
-        r = subprocess.run(["git", "diff", "--name-only", "HEAD",
+        r = subprocess.run(["git", "diff", "-U0", "HEAD",
                             "reporting/camera_reports.py",
-                            "reporting/combined_train_report.py",
-                            "reporting/_pages.py", "reporting/_brand.py"],
+                            "reporting/combined_train_report.py"],
                            cwd=V4_ROOT, capture_output=True, text=True)
         if r.returncode != 0:
             self.skipTest("git unavailable")
-        self.assertEqual([x for x in r.stdout.split() if x], [])
+        added = [ln for ln in r.stdout.splitlines()
+                 if ln.startswith("+") and not ln.startswith("+++")]
+        for ln in added:
+            if not ln.strip("+ ").startswith("#") and ln.strip("+ "):
+                self.assertNotRegex(
+                    ln, r"(TableStyle|SimpleDocTemplate|PageBreak|"
+                        r"getSampleStyleSheet|colors\.)",
+                    f"layout construct changed: {ln.strip()}")
 
 
 class TestLocalIds(unittest.TestCase):

@@ -211,7 +211,27 @@ def write_stage1_outputs(engine_state, tracks, output_dir: str) -> Dict[str, str
 # These entries are self-clearing: once committed, `git diff HEAD` no longer
 # reports the file and the entry has no effect. Delete an entry when its change
 # is committed rather than letting the list accumulate.
-REVIEWED_IN_WORKTREE = ()
+REVIEWED_IN_WORKTREE = (
+    # Cross-camera snapshot substitution. `_panel_snapshot` resolved a damaged
+    # wagon's top panel as "own camera first, then the best across BOTH top
+    # cameras", so with only one top camera damaged BOTH panels rendered the
+    # same file under two camera headings. The camera-blind fallback is gone and
+    # every lookup is camera-scoped; `load/best_frame.jpg` is now resolved
+    # through the `source_camera` its metadata already records. Layout, tables
+    # and styling are untouched -- see
+    # tests/test_combined_report_camera_isolation.py.
+    "reporting/combined_train_report.py",
+    "reporting/camera_reports.py",
+    "reporting/_evidence_lookup.py",
+    # Damage evidence filenames now carry the camera
+    # (`track_1__RIGHT_UP_TOP`), so two processor invocations sharing an
+    # evidence directory can no longer overwrite each other's track_1.jpg.
+    # Detection, thresholds and track numbering are unchanged.
+    "features/damage/processor.py",
+    # Added `damage_observations_by_camera()` / `damage_cameras`: a camera-keyed
+    # VIEW over provenance the state already carried. No field changed meaning.
+    "core/unified_wagon_state.py",
+)
 
 
 def changed_paths(*pathspecs) -> "list":

@@ -26,6 +26,9 @@ import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from core import constants as C
+from core.evidence_identity import (
+    damage_track_slot, legacy_damage_track_slot,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -187,6 +190,53 @@ def evidence_metadata(
         return {}
 
 
+#: Returned instead of a path when a camera has no evidence of its own.
+#: Distinct from None so a caller can tell "this camera saw nothing" from
+#: "nobody looked", and so no code path is tempted to fill the gap with a
+#: different camera's picture.
+MISSING_EVIDENCE = None
+
+
+def damage_track_snapshot(
+    evidence_root: Optional[str], gw_id: str, camera_id: str, track_idx: int,
+) -> Optional[str]:
+    """One camera's damage snapshot for one observation index.
+
+    Tries the camera-scoped slot first (`track_2__RIGHT_UP_TOP`). Falls back to
+    the legacy camera-less `track_2` so evidence written before the rename still
+    renders -- and that fallback is safe ONLY because every caller has already
+    confirmed from `metadata.json` that this track_idx belongs to `camera_id`.
+    The fallback therefore cannot cross camera identity; it just finds an
+    older filename for a record whose owner is already established.
+    """
+    slot = damage_track_slot(track_idx, camera_id)
+    p = evidence_snapshot(evidence_root, gw_id, "damage", slot)
+    if p:
+        return p
+    return evidence_snapshot(evidence_root, gw_id, "damage",
+                             legacy_damage_track_slot(track_idx))
+
+
+def load_snapshot(
+    evidence_root: Optional[str], gw_id: str, camera_id: str,
+) -> Optional[str]:
+    """The load snapshot, but ONLY if this camera produced it.
+
+    `evidence/<gw>/load/best_frame.jpg` is a single file written from whichever
+    top camera won: features/load/processor.py prefers RIGHT_UP_TOP and falls
+    back to LEFT_UP_TOP, recording the winner as `source_camera` in the
+    sibling metadata. Resolving that file by wagon id alone therefore hands a
+    LEFT_UP_TOP frame to a RIGHT_UP_TOP panel whenever the master had no load
+    evidence -- the two top cameras look alike, so it reads as correct.
+
+    The provenance is already on disk; this consults it.
+    """
+    md = evidence_metadata(evidence_root, gw_id, "load")
+    if md.get("source_camera") != camera_id:
+        return MISSING_EVIDENCE
+    return evidence_snapshot(evidence_root, gw_id, "load", "best_frame")
+
+
 def damage_track_snapshots(
     evidence_root: Optional[str], gw_id: str, camera_id: str,
     max_tracks: int = 3,
@@ -220,7 +270,7 @@ def damage_track_snapshots(
         idx = tr.get("track_idx")
         if not idx:
             continue
-        p = evidence_snapshot(evidence_root, gw_id, "damage", f"track_{int(idx)}")
+        p = damage_track_snapshot(evidence_root, gw_id, camera_id, int(idx))
         if not p:
             continue
         out.append((p, tr))

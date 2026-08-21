@@ -34,6 +34,7 @@ import cv2
 import numpy as np
 
 from core import constants as C
+from core.evidence_identity import damage_track_slot
 from core.camera_evidence import (
     LIFECYCLE, CameraEvidenceBundle, LocalSegment, local_segment_id,
 )
@@ -111,7 +112,8 @@ def _top_bundle(root, cam, *, n=2, track_idx=1, conf=0.77, frame_idx=123,
             continue
         ed = os.path.join(b.dir, "evidence", s.local_id, "damage")
         os.makedirs(ed, exist_ok=True)
-        cv2.imwrite(os.path.join(ed, f"track_{track_idx}.jpg"), img)
+        cv2.imwrite(os.path.join(
+            ed, f"{damage_track_slot(track_idx, cam)}.jpg"), img)
         with open(os.path.join(ed, "metadata.json"), "w", encoding="utf-8") as f:
             json.dump({"global_id": s.local_id, "feature": "damage",
                        "top_damage": "DAMAGE",
@@ -281,7 +283,8 @@ class TestSharedEvidenceRootIsolation(unittest.TestCase):
         os.makedirs(ed)
         tracks = []
         for i, cam in enumerate(TOPS, start=1):
-            cv2.imwrite(os.path.join(ed, f"track_{i}.jpg"), _tile(cam))
+            cv2.imwrite(os.path.join(
+                ed, f"{damage_track_slot(i, cam)}.jpg"), _tile(cam))
             tracks.append({"track_idx": i, "camera_id": cam, "track_id": 1,
                            "class_name": "inner_wall_damage",
                            "confidence": 0.77, "best_confidence": 0.77,
@@ -379,20 +382,36 @@ class TestEveryResolverIsCameraScoped(unittest.TestCase):
                               f"{fn_name} resolves damage tracks without "
                               f"consulting camera_id")
 
-    def test_track_filenames_carry_no_camera_identity(self):
-        """Documents WHY the metadata filter is mandatory.
+    def test_track_filenames_now_carry_camera_identity(self):
+        """The filename itself names the camera, so a collision is impossible.
 
-        `track_N.jpg` is numbered across both top cameras in one sequence, so
-        the filename can never be used to infer ownership. If this ever stops
-        being true the resolvers can be simplified -- until then, do not.
+        `track_idx` alone is unique only within ONE processor invocation -- it
+        comes from enumerating the list that was extended once per camera. Two
+        invocations writing the same evidence directory would both start at
+        track_1 and overwrite each other. The slot therefore carries the camera:
+        `track_1__RIGHT_UP_TOP`.
+
+        The metadata camera filter is still mandatory and still applied; this
+        makes the on-disk identity unambiguous as well, rather than relying on
+        one invocation owning the directory.
         """
-        import ast
         src = open(os.path.join(V4_ROOT, "features", "damage", "processor.py"),
                    encoding="utf-8").read()
-        self.assertIn('f"track_{i}.jpg"', src)
-        # the index comes from enumerating the combined list, not a per-camera one
+        self.assertIn("damage_track_slot(i, tr[\"camera_id\"])", src)
+        self.assertNotIn('f"track_{i}.jpg"', src,
+                         "the camera-less filename must not come back")
+        # the index still comes from the combined list -- unchanged behaviour
         self.assertIn("for i, tr in enumerate(all_evidence, start=1)", src)
         self.assertIn("all_evidence.extend(tracks)", src)
+
+    def test_two_cameras_sharing_an_index_get_different_files(self):
+        """The collision that camera-scoped naming rules out."""
+        a = damage_track_slot(1, "RIGHT_UP_TOP")
+        b = damage_track_slot(1, "LEFT_UP_TOP")
+        self.assertNotEqual(a, b)
+        from core.evidence_identity import parse_damage_track_slot
+        self.assertEqual(parse_damage_track_slot(a), (1, "RIGHT_UP_TOP"))
+        self.assertEqual(parse_damage_track_slot("track_1"), (1, None))
 
 
 if __name__ == "__main__":
