@@ -872,11 +872,28 @@ class TestIntermediateReclamation(unittest.TestCase):
         src = io.open(os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "orchestrator", "historical_runner.py"), encoding="utf-8").read()
-        after_ok = src.split("if ok:", 1)[1].split("else:", 1)
-        self.assertIn("_cleanup_inputs", after_ok[0],
-                      "cleanup must be on the success branch")
-        self.assertIn("RETAINED", after_ok[1],
+        after_ok = src.split("if ok:", 1)[1].split("failures.append", 1)
+        # Either reclaim entry point is acceptable; what matters is that one of
+        # them is reached ONLY on success. The sequential branch uses
+        # `delivery.cleanup.cleanup_batch` (delivery-gated); the batch branch
+        # keeps the narrower `_cleanup_inputs`.
+        self.assertTrue(
+            ("cleanup_batch" in after_ok[0]) or ("_cleanup_inputs" in after_ok[0]),
+            "cleanup must be on the success branch")
+        self.assertIn("RETAINED", src.split("if ok:", 1)[1],
                       "the failure branch must retain inputs")
+
+    def test_sequential_cleanup_is_gated_on_delivery_not_assembly(self):
+        """Assembly succeeding is not enough: a train whose upload or dashboard
+        post failed must keep the artifacts a retry needs."""
+        src = io.open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "orchestrator", "historical_runner.py"), encoding="utf-8").read()
+        seq = src.split('if mode == "sequential"', 1)[1].split(
+            "invoking existing pipeline", 1)[0]
+        self.assertIn("cleanup_batch", seq)
+        self.assertIn("delivery=getattr(asm", seq,
+                      "the DeliveryResult must reach the cleanup gate")
 
 
 class TestFilenameTimestampConsistency(unittest.TestCase):

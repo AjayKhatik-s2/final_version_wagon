@@ -716,6 +716,18 @@ def run(
         log.info("[HISTORICAL] processing batch %d/%d: %s (cameras=%s)",
                  i, total, batch.batch_key, batch.present_cameras())
         batch_root = os.path.join(hist_root, batch.batch_key)
+        # Before committing to another train, reclaim ALREADY-DELIVERED ones if
+        # the disk is low. `active_batch_key` keeps this batch untouched, and a
+        # sibling is only reclaimed when its finalization marker proves it was
+        # delivered -- an in-flight or failed batch has no marker.
+        try:
+            from delivery import cleanup as CU
+            CU.ensure_free_space(workspace_root=hist_root,
+                                 active_batch_key=batch.batch_key,
+                                 cfg=_cleanup_config(keep_inputs),
+                                 verbose=verbose)
+        except Exception as e:  # noqa: BLE001 - never block a train on cleanup
+            log.warning("[CLEANUP] pre-train sweep failed (non-fatal): %s", e)
         log.info("[HISTORICAL] staging inputs -> %s",
                  os.path.join(batch_root, CFG.DIR_DOWNLOADS))
         # ---- sequential architecture ---------------------------------------
@@ -748,7 +760,20 @@ def run(
                      i, total, "completed" if ok else "FAILED",
                      getattr(asm, "total_wagons", 0), time.time() - t0)
             if ok:
-                _cleanup_inputs(batch_root, keep_inputs=keep_inputs)
+                # Cleanup is gated on DELIVERY, not on assembly. A train whose
+                # S3 upload or dashboard post failed keeps every byte, because
+                # those are exactly the artifacts a retry needs. When this run
+                # is not delivering at all (`--historical-deliver` absent) the
+                # old input-only reclaim still applies -- there is nothing to
+                # verify, and `downloads/` is re-stageable regardless.
+                if deliver:
+                    from delivery import cleanup as CU
+                    CU.cleanup_batch(
+                        batch_root=batch_root, batch_key=batch.batch_key,
+                        delivery=getattr(asm, "delivery", None),
+                        cfg=_cleanup_config(keep_inputs), verbose=verbose)
+                else:
+                    _cleanup_inputs(batch_root, keep_inputs=keep_inputs)
             else:
                 failures.append(batch.batch_key)
             continue
@@ -801,6 +826,18 @@ def run(
     log.info("[HISTORICAL] finished: %d/%d batch(es) completed%s",
              done, total, f", failed: {failures}" if failures else "")
     return 3 if failures else 0
+
+
+def _cleanup_config(keep_inputs: bool):
+    """Cleanup settings for this run.
+
+    `--keep-inputs` stays the master off switch, so the existing flag keeps its
+    existing meaning. Every other setting is read by `CleanupConfig.from_env`,
+    NOT here: this module reads no environment variable directly, which is what
+    guarantees it cannot redefine an existing variable's meaning.
+    """
+    from delivery.cleanup import CleanupConfig
+    return CleanupConfig.from_env(enabled=not keep_inputs)
 
 
 def _cleanup_inputs(batch_root: str, *, keep_inputs: bool) -> None:
