@@ -79,6 +79,7 @@ class AssemblyResult:
     processed_video_urls: Dict[str, str] = field(default_factory=dict)
     source_video_urls: Dict[str, str] = field(default_factory=dict)
     per_camera_tracking_path: str = ""
+    damage_boundary: Any = None      # damage_boundary.BoundaryResult
 
 
 def _load_master_classifications(bundle: CameraEvidenceBundle) -> List[Any]:
@@ -398,6 +399,52 @@ def assemble(
             res.feature_summary[name] = {}
         res.timings[f"stage3_{name}"] = round(time.perf_counter() - t1, 3)
     res.timings["stage3_features"] = round(time.perf_counter() - t0, 3)
+
+    # ---- Stage 3b: damage boundary ownership ---------------------------
+    # HERE and nowhere else. This is the only point where BOTH halves of the
+    # required data are live at once:
+    #
+    #   * `engine_state.global_gaps` -- the global boundaries with each
+    #     camera's `support_observations[cam].local_track_id`. The v4
+    #     `GlobalTrainState` the feature processors receive keeps only
+    #     `global_gap_count`, so a resolver inside features/damage could not
+    #     see them.
+    #   * `tracks` -- full-fidelity LocalCameraTracks read from
+    #     `tracking_full.json`, carrying hit_frames / center_x_trajectory /
+    #     bbox_history. `per_camera_tracking.json` drops those (GapEvent.to_dict
+    #     is a reporting view), which is why batch mode cannot run this yet.
+    #
+    # It rewrites only WHICH wagon owns an observation. No detector runs, no
+    # threshold moves, and the RIGHT_UP-mastered roster is read, never altered.
+    t0 = time.perf_counter()
+    try:
+        from orchestrator import damage_boundary as DBND
+        dmg_by_wagon = DBND.read_damage_by_wagon(states_root, state.wagons)
+        if dmg_by_wagon:
+            res.damage_boundary = DBND.resolve_train(
+                state=state,
+                engine_global_gaps=list(getattr(engine_state, "global_gaps",
+                                                None) or []),
+                tracks_by_camera=tracks,
+                damage_by_wagon=dmg_by_wagon,
+                verbose=verbose)
+            DBND.apply_verdicts(
+                result=res.damage_boundary, states_root=states_root,
+                evidence_root=global_evidence, wagons=state.wagons,
+                verbose=verbose)
+            try:
+                with open(os.path.join(gs_dir, "damage_boundary.json"), "w",
+                          encoding="utf-8") as f:
+                    json.dump(res.damage_boundary.to_dict(), f, indent=2)
+            except OSError as e:
+                print(f"[DAMAGE-BOUNDARY] could not write diagnostics: {e}")
+        elif verbose:
+            print("[DAMAGE-BOUNDARY] no damage observations to resolve")
+    except Exception as e:  # noqa: BLE001 - ownership must not fail a train
+        print(f"[DAMAGE-BOUNDARY] resolver FAILED (non-fatal): "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        traceback.print_exc(limit=3)
+    res.timings["stage3b_damage_boundary"] = round(time.perf_counter() - t0, 3)
 
     # ---- Stage 4: fuse (existing builder, unchanged) --------------------
     t0 = time.perf_counter()
