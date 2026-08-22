@@ -482,6 +482,38 @@ def _bounding_box(bbox: Optional[Sequence[float]], *, schema: str,
     }
 
 
+def _damage_track_url(url_for: Callable[..., Optional[str]], gw_id: str,
+                     camera: str, raw_idx: Any) -> Optional[str]:
+    """URL for one damage track's snapshot, or None -- never an exception.
+
+    `track_idx` is not guaranteed to be a usable integer. Real evidence trees
+    carry ``"track_idx": null``, and `dict.get(key, 1)` does NOT default in that
+    case: the default applies only when the KEY IS ABSENT, so a present-but-null
+    index arrives here as None. Handing that to `damage_track_slot` raises
+    TypeError from `int(None)`.
+
+    This is not hypothetical. It took out the WHOLE top-camera document for four
+    trains in production -- the exception escaped the per-track loop, the
+    document build failed, and only the two side cameras reached the dashboard.
+    An image URL is the least important field in the document; it must never be
+    able to sink the other 57 wagons' worth of findings with it.
+
+    So: one unusable track costs that track's picture and nothing else.
+    """
+    try:
+        idx = int(raw_idx)
+    except (TypeError, ValueError):
+        return None
+    # `_project_camera_view` has already dropped every track whose `camera_id`
+    # is not this camera, so the legacy unscoped name is a safe LAST resort:
+    # reaching it means this camera owns the track. It exists only for evidence
+    # trees written before the slots carried the camera.
+    return (url_for(gw_id=gw_id, feature="damage", camera=camera,
+                    filename=f"{damage_track_slot(idx, camera)}.jpg")
+            or url_for(gw_id=gw_id, feature="damage", camera=camera,
+                       filename=f"{legacy_damage_track_slot(idx)}.jpg"))
+
+
 def _problem_frame(*, wagon_count: Optional[int], segment_type: str,
                    segment_number: Optional[int], problem_type: str,
                    frame_number: Optional[int], url: Optional[str],
@@ -721,18 +753,8 @@ def build_inspection_json(
                 cls = str(track.get("class_name") or "damage").lower()
                 ptype = _V4_TOP_PROBLEM_TYPE.get(cls, cls)
                 _bump(ptype)
-                idx = track.get("track_idx", 1)
-                # `_project_camera_view` has already dropped every track whose
-                # `camera_id` is not this camera, so the legacy unscoped name is
-                # a safe LAST resort here: reaching it means this camera owns the
-                # track. It exists only for evidence trees written before the
-                # slots carried the camera.
-                dmg_url = url_for(gw_id=gw_id, feature="damage", camera=camera,
-                                  filename=f"{damage_track_slot(idx, camera)}.jpg")
-                if not dmg_url:
-                    dmg_url = url_for(
-                        gw_id=gw_id, feature="damage", camera=camera,
-                        filename=f"{legacy_damage_track_slot(idx)}.jpg")
+                dmg_url = _damage_track_url(url_for, gw_id, camera,
+                                            track.get("track_idx"))
                 problem_frames.append(_problem_frame(
                     wagon_count=wagon_count, segment_type=display,
                     segment_number=segment_type_map[str(seg_id)].get("number"),

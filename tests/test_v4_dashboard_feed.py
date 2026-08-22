@@ -1043,3 +1043,111 @@ class TestDamageEvidenceIsCameraScoped(unittest.TestCase):
                 f"{EI.damage_track_slot(1, C.CAMERA_RIGHT_UP_TOP)}.jpg"))
             self.assertEqual(len(self._damage_urls(ev, C.CAMERA_RIGHT_UP_TOP)), 1)
             self.assertEqual(self._damage_urls(ev, C.CAMERA_LEFT_UP_TOP), [])
+
+
+# ---------------------------------------------------------------------------
+# 13. One unusable field must never sink a whole camera's document
+# ---------------------------------------------------------------------------
+
+class TestNullTrackIndexDoesNotSinkTheDocument(unittest.TestCase):
+    """A production regression, kept as a test because it cost four trains.
+
+    Real evidence carries ``"track_idx": null``. `dict.get(key, 1)` does NOT
+    default in that case -- the default applies only when the KEY IS ABSENT --
+    so the index arrived as None and `int(None)` raised inside
+    `damage_track_slot`. The exception escaped the per-track loop and failed the
+    entire top-camera document:
+
+        [DASHBOARD] build failed for RIGHT_UP_TOP: int() argument must be a
+        string, a bytes-like object or a real number, not 'NoneType'
+
+    Only the two side cameras reached the dashboard, because the damage-slot
+    call is on the top-camera path alone. An image URL is the least important
+    field in the document; losing it must never cost the other 57 wagons'
+    findings.
+    """
+
+    def setUp(self):
+        self._saved = _clear_env(*_ENV_KEYS)
+
+    def tearDown(self):
+        _restore_env(self._saved)
+
+    @staticmethod
+    def _null_the_track_index(root):
+        """Make the fixture match the real evidence that triggered this."""
+        p = os.path.join(root, "evidence", "GW_2", "damage", "metadata.json")
+        with open(p, encoding="utf-8") as f:
+            doc = json.load(f)
+        doc["tracks"][0]["track_idx"] = None
+        _write(p, doc)
+
+    def test_all_four_cameras_still_ingest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = build_batch_root(tmp)
+            self._null_the_track_index(root)
+            res = DASH.run(batch_root=root, s3_client=_FakeS3(),
+                           requests_mod=_FakeRequests())
+            for cam in C.ALL_CAMERAS:
+                self.assertEqual(
+                    res["cameras"][cam]["status"], "ingested",
+                    f"{cam} did not ingest: {res['cameras'][cam]} -- a null "
+                    f"track_idx must cost one image, not the document")
+
+    def test_the_damaged_wagon_is_still_reported(self):
+        """The finding survives even though its picture does not."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = build_batch_root(tmp)
+            self._null_the_track_index(root)
+            s3 = _FakeS3()
+            DASH.run(batch_root=root, s3_client=s3,
+                     requests_mod=_FakeRequests())
+            top = [u for u in s3.uploads
+                   if C.CAMERA_S3_FOLDER[C.CAMERA_RIGHT_UP_TOP] in u["key"]
+                   or C.CAMERA_RIGHT_UP_TOP in u["key"]]
+            self.assertTrue(top, "no RIGHT_UP_TOP document was uploaded")
+            doc = json.loads(top[0]["body"]) if "body" in top[0] else None
+            if doc is None:              # fixture stores the path, not the body
+                return
+            segs = (doc.get("inspection_data") or {}).get("wagon_segments") or []
+            self.assertTrue(any(s.get("damage_detected") for s in segs),
+                            "the damage finding was lost with its image")
+
+    def test_a_bad_index_yields_no_url_and_no_exception(self):
+        calls = []
+
+        def _url_for(**kw):
+            calls.append(kw)
+            return "https://example/x.jpg"
+
+        for bad in (None, "", "x", {}, [], object()):
+            self.assertIsNone(
+                IJ._damage_track_url(_url_for, "GW_1", C.CAMERA_RIGHT_UP_TOP, bad),
+                f"{bad!r} should yield no URL")
+        self.assertEqual(calls, [],
+                         "an unusable index must not even be looked up")
+
+    def test_a_usable_index_still_resolves(self):
+        def _url_for(*, gw_id, feature, camera, filename):
+            return f"https://example/{filename}"
+
+        for good in (1, "2", 3.0):
+            got = IJ._damage_track_url(_url_for, "GW_1",
+                                       C.CAMERA_RIGHT_UP_TOP, good)
+            self.assertIsNotNone(got)
+            self.assertIn(f"track_{int(good)}__{C.CAMERA_RIGHT_UP_TOP}", got)
+
+    def test_a_null_report_revision_does_not_sink_every_camera(self):
+        """Same trap, one level up: this runs BEFORE the per-camera loop."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = build_batch_root(tmp)
+            p = os.path.join(root, "reports", "combined_train_report.json")
+            with open(p, encoding="utf-8") as f:
+                doc = json.load(f)
+            doc["report_meta"] = {"report_revision": None}
+            _write(p, doc)
+            res = DASH.run(batch_root=root, s3_client=_FakeS3(),
+                           requests_mod=_FakeRequests())
+            for cam in C.ALL_CAMERAS:
+                self.assertEqual(res["cameras"][cam]["status"], "ingested",
+                                 f"{cam}: {res['cameras'][cam]}")

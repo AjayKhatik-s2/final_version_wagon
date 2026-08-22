@@ -814,7 +814,12 @@ def _run_inner(*, batch_root, s3_client, skip_upload, skip_ingest,
     report_meta = dict(report_meta)
     report_meta["_upload_urls"] = fin_marker.get("upload_urls", {}) or {}
     report_doc = dict(report_doc, report_meta=report_meta)
-    report_revision = int(report_meta.get("report_revision", 0))
+    # `or 0`, not `get(..., 0)`: the default applies only when the key is
+    # ABSENT, so a present-but-null value reaches int() and raises. That exact
+    # mistake, on `track_idx`, failed four trains' top-camera documents in
+    # production. Here it would be worse -- this line runs before the per-camera
+    # loop, so it would take out all four cameras at once.
+    report_revision = int(report_meta.get("report_revision") or 0)
 
     present = report_meta.get("cameras_present") or [
         c for c in C.ALL_CAMERAS
