@@ -272,6 +272,12 @@ def deliver(
                 "terminal_status": final_status,
                 "upload_urls": urls,
                 "uploaded": True,
+                # Per-subtree upload COUNTS. Recorded because the pre-train disk
+                # sweep runs long after this process is gone and has no
+                # DeliveryResult to consult: without a durable count it cannot
+                # tell whether the overlay videos reached S3, and so refuses to
+                # reclaim them at all.
+                "archived": dict(getattr(res, "archived", None) or {}),
                 "source": "delivery.finalize",
             })
     except Exception as e:  # noqa: BLE001

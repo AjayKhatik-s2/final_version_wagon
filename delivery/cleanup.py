@@ -274,6 +274,59 @@ def _inside(child: str, parent: str) -> bool:
     return c != p and os.path.commonpath([c, p]) == p
 
 
+def _videos_reached_s3(batch_root: str, delivery: Any) -> bool:
+    """Did the overlay videos actually reach S3?
+
+    Only then are the local copies redundant, so this gates
+    `delete_processed_videos`. It is the most expensive artifact to regenerate:
+    if the answer is not a clear yes, the videos stay.
+
+    Two sources, because there are two callers. The per-train path holds a live
+    `DeliveryResult`. The pre-train SWEEP does not -- it passes `delivery=None`
+    and establishes delivery from the finalization marker instead. Reading only
+    the live object silently made the sweep's `delete_processed_videos` a no-op:
+    it reported "freed 0.00 GB from 0 path(s)" on batches whose markers plainly
+    recorded four uploaded videos. The marker is the same evidence the sweep
+    already trusts to call the batch delivered, so it is the right source here.
+    """
+    archived = dict(getattr(delivery, "archived", None) or {})
+    if archived:
+        try:
+            return int(archived.get("processed_videos") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    # Sweep path: no live result. `archived` is the upload COUNT and the
+    # strongest proof there is, so newer batches carry it in the marker (see
+    # delivery/finalize.py). Batches finalized before that do not, and for them
+    # the durable evidence is the published report's own
+    # `processed_video_urls`: the combined report and every dashboard document
+    # link the viewer at those S3 objects, so if they are absent from S3 the
+    # delivery is already broken in a way deleting a local copy cannot worsen.
+    # Weaker than a count, and deliberately the LAST resort.
+    try:
+        from delivery import finalization
+        marker = finalization.load(batch_root) or {}
+    except Exception:                                            # noqa: BLE001
+        return False
+    if not marker:
+        return False
+    try:
+        counts = dict(marker.get("archived") or {})
+        if counts:
+            return int(counts.get("processed_videos") or 0) > 0
+        import json as _json
+        rp = os.path.join(batch_root, CFG.DIR_REPORTS,
+                          "combined_train_report.json")
+        with open(rp, "r", encoding="utf-8") as fh:
+            doc = _json.load(fh)
+        urls = ((doc.get("train_metadata") or {}
+                 ).get("processed_video_urls") or {})
+        return bool([u for u in urls.values() if u])
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
 def plan(batch_root: str, cfg: CleanupConfig = DEFAULT_CONFIG,
          *, videos_uploaded: bool = False) -> List[Tuple[str, int]]:
     """`[(path, bytes), ...]` this configuration would remove, largest first.
@@ -390,8 +443,7 @@ def cleanup_batch(
             log.warning("[CLEANUP] %s KEPT -- %s", res.batch_key, why)
             return res
 
-    videos_uploaded = int((dict(getattr(delivery, "archived", None) or {})
-                           ).get("processed_videos") or 0) > 0
+    videos_uploaded = _videos_reached_s3(batch_root, delivery)
     try:
         targets = plan(batch_root, cfg, videos_uploaded=videos_uploaded)
     except Exception as e:  # noqa: BLE001

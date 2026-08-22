@@ -568,3 +568,85 @@ class TestWiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestSweepCanReclaimOverlayVideos(unittest.TestCase):
+    """The sweep holds no DeliveryResult, so it needs durable upload proof.
+
+    `videos_uploaded` was derived from `delivery.archived` alone. The sweep
+    passes `delivery=None`, so that read always yielded 0 and
+    `delete_processed_videos=True` silently did nothing -- it reported
+    "freed 0.00 GB from 0 path(s)" on batches whose delivery had plainly
+    uploaded four videos. A flag that quietly does nothing is worse than one
+    that refuses out loud.
+    """
+
+    def _batch(self, tmp, *, marker_counts=None, report_urls=True):
+        root = os.path.join(tmp, "20260729_101500")
+        os.makedirs(os.path.join(root, CFG.DIR_REPORTS), exist_ok=True)
+        vids = os.path.join(root, CFG.DIR_PROCESSED_VIDEOS)
+        os.makedirs(vids, exist_ok=True)
+        for cam in C.ALL_CAMERAS:
+            with open(os.path.join(vids, f"{cam}_processed.mp4"), "wb") as f:
+                f.write(b"\x00" * 4096)
+        doc = {"batch_key": "20260729_101500", "summary": {"total_wagons": 2}}
+        if report_urls:
+            doc["train_metadata"] = {"processed_video_urls": {
+                cam: f"https://b.s3.ap-south-1.amazonaws.com/p/{cam}.mp4"
+                for cam in C.ALL_CAMERAS}}
+        with open(os.path.join(root, CFG.DIR_REPORTS,
+                               "combined_train_report.json"), "w") as f:
+            json.dump(doc, f)
+        marker = {"batch_key": "20260729_101500", "uploaded": True,
+                  "upload_urls": {"json": "https://x/y.json"}}
+        if marker_counts is not None:
+            marker["archived"] = marker_counts
+        from delivery import finalization
+        finalization.write(root, marker)
+        return root
+
+    def _run(self, root):
+        cfg = CU.CleanupConfig(delete_processed_videos=True)
+        return CU.cleanup_batch(batch_root=root, batch_key="20260729_101500",
+                                delivery=None, require_delivery=False,
+                                cfg=cfg, verbose=False)
+
+    def test_a_recorded_count_lets_the_videos_go(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._batch(tmp, marker_counts={"processed_videos": 4})
+            res = self._run(root)
+            self.assertGreater(res.freed_bytes, 0,
+                               "a recorded upload count must permit reclaim")
+            self.assertFalse(os.path.isdir(
+                os.path.join(root, CFG.DIR_PROCESSED_VIDEOS)))
+
+    def test_a_zero_count_keeps_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._batch(tmp, marker_counts={"processed_videos": 0})
+            self._run(root)
+            self.assertTrue(os.path.isdir(
+                os.path.join(root, CFG.DIR_PROCESSED_VIDEOS)),
+                "nothing uploaded means the local copies are all there is")
+
+    def test_an_older_marker_falls_back_to_the_reports_own_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._batch(tmp, marker_counts=None, report_urls=True)
+            res = self._run(root)
+            self.assertGreater(res.freed_bytes, 0)
+
+    def test_no_count_and_no_urls_keeps_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._batch(tmp, marker_counts=None, report_urls=False)
+            self._run(root)
+            self.assertTrue(os.path.isdir(
+                os.path.join(root, CFG.DIR_PROCESSED_VIDEOS)),
+                "no evidence of upload is not evidence of upload")
+
+    def test_the_default_config_never_touches_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._batch(tmp, marker_counts={"processed_videos": 4})
+            CU.cleanup_batch(batch_root=root, batch_key="k", delivery=None,
+                             require_delivery=False, verbose=False)
+            self.assertTrue(os.path.isdir(
+                os.path.join(root, CFG.DIR_PROCESSED_VIDEOS)),
+                "reclaiming the videos must stay strictly opt-in")
