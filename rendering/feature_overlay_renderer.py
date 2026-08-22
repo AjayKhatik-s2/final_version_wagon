@@ -287,6 +287,79 @@ def _draw_damage_info(frame, frame_idx: int, n_damages: int, frame_class: str) -
 # Helpers
 # -----------------------------------------------------------------------------
 
+#: Codecs to try, in order. H.264 FIRST, because this video's whole purpose is
+#: to be played in a browser from the dashboard.
+#:
+#: `mp4v` (MPEG-4 Part 2) writes anywhere and plays nowhere: no browser can
+#: decode it in an HTML5 <video>, so the dashboard rendered a player that sat at
+#: 0:00 on a black frame. The file was fine and in S3 -- it simply was not a
+#: format any browser speaks. `avc1` is H.264 in an MP4 container, which every
+#: browser plays.
+#:
+#: mp4v stays last so a build without H.264 still produces a video rather than
+#: failing the train; `_transcode_to_h264` then rescues playability via ffmpeg.
+_CODEC_PREFERENCE = ("avc1", "H264", "mp4v")
+
+#: Not browser-playable; a file written with this needs transcoding.
+_FALLBACK_CODEC = "mp4v"
+
+
+def _open_browser_playable_writer(output_path: str, fps: float,
+                                  width: int, height: int):
+    """`(writer, codec)` -- the best codec this OpenCV build will actually open.
+
+    Asking for a fourcc is not the same as getting it: OpenCV happily returns a
+    writer that never opened, or silently substitutes. So each candidate is
+    verified with `isOpened()` before use, and the codec that won is returned so
+    the caller knows whether a transcode is still needed.
+    """
+    for codec in _CODEC_PREFERENCE:
+        try:
+            w = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*codec),
+                                fps, (width, height))
+        except Exception:                                        # noqa: BLE001
+            continue
+        if w is not None and w.isOpened():
+            return w, codec
+        if w is not None:
+            w.release()
+    return None, ""
+
+
+def _transcode_to_h264(path: str, *, verbose: bool = False) -> bool:
+    """Re-encode a non-playable overlay video in place. True if it now is H.264.
+
+    Only reached when the OpenCV build could not write H.264 at all. Uses
+    `train_extraction.video_io.compress_video`, which exists for exactly this --
+    its docstring says "e.g. a bulky mp4v-codec overlay video" -- and was never
+    wired to a caller. It tries NVENC and falls back to libx264, and its size cap
+    shrinks the file as a side benefit.
+
+    Failure is not fatal: an unplayable video is worse than a playable one but
+    better than a failed train, so the original is left in place.
+    """
+    import logging
+    import shutil
+    import tempfile
+
+    if not shutil.which("ffmpeg"):
+        if verbose:
+            print(f"  [{os.path.basename(path)}] no ffmpeg: staying mp4v "
+                  f"(will not play in a browser)")
+        return False
+    try:
+        from train_extraction.video_io import compress_video
+        tmp = os.path.join(tempfile.mkdtemp(), os.path.basename(path))
+        out = compress_video(path, tmp, logging.getLogger("wagon_eye.rendering"))
+        if out and os.path.isfile(out) and os.path.getsize(out) > 0:
+            shutil.move(out, path)
+            return True
+    except Exception as e:                                       # noqa: BLE001
+        if verbose:
+            print(f"  [{os.path.basename(path)}] H.264 transcode failed: {e}")
+    return False
+
+
 def _map_wagon_to_local_frames(
     wagon: GlobalWagon, local_fps: float, local_total_frames: int,
     time_offset: float = 0.0,
@@ -357,10 +430,9 @@ def _render_one_camera(
                   or cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc,
-                             src_fps if src_fps > 0 else 25.0, (width, height))
-    if not writer.isOpened():
+    writer, codec = _open_browser_playable_writer(
+        output_path, src_fps if src_fps > 0 else 25.0, width, height)
+    if writer is None:
         cap.release()
         raise RuntimeError(f"cannot open writer for {output_path}")
 
@@ -420,8 +492,11 @@ def _render_one_camera(
 
     cap.release()
     writer.release()
+    # The file must be closed before ffmpeg reads it.
+    if codec == _FALLBACK_CODEC:
+        _transcode_to_h264(output_path, verbose=verbose)
     if verbose:
-        print(f"[RENDER/{camera_id}] done ({written} frames)")
+        print(f"[RENDER/{camera_id}] done ({written} frames, codec={codec})")
     return output_path
 
 
