@@ -686,6 +686,70 @@ def _move_evidence(evidence_root: str, src_gw: str, dst_gw: str,
     return new_slot
 
 
+#: Fields this module OWNS and may therefore write onto an evidence track.
+#: Everything else already in the evidence metadata is preserved untouched.
+_BOUNDARY_FIELDS = ("boundary_side", "boundary_reason", "boundary_ambiguous",
+                    "moved_from_global_id", "evidence_slot")
+
+#: Identity of one damage observation, for matching a state record to the
+#: evidence track it describes. `track_idx` is NOT part of it -- the whole
+#: problem here is that the state record has no `track_idx` at all.
+_TRACK_IDENTITY = ("camera_id", "track_id")
+
+
+def _merged_evidence_tracks(existing: Any, details: Any) -> List[Dict[str, Any]]:
+    """Overlay boundary verdicts onto the EXISTING evidence tracks.
+
+    The bug this replaces rebuilt the list by projecting fields out of
+    `top_damage_details`, the wagon_states record. That record does not carry
+    `track_idx` -- features/damage/processor.py documents its shape as
+    `{class_name, confidence, bbox, frame_idx, camera_id, track_id}` -- so
+    `r.get("track_idx")` was None for every row and the rebuild NULLED OUT the
+    index the damage processor had correctly written into the evidence metadata.
+
+    That one nulled field caused both failures we saw in production:
+
+      * `int(None)` in `damage_track_slot` failed the whole top-camera document
+        for four trains (the crash), and
+      * with that guarded, a damage finding whose index is gone can no longer
+        name its own JPEG, so the problem frame is published with no image URL.
+
+    The index is the only handle on the file -- the picture on disk is
+    `track_<idx>__<CAMERA>.jpg` -- so losing it orphans a snapshot that exists.
+
+    Merging keyed on (camera_id, track_id) keeps every field the evidence
+    metadata already had and writes only the fields this module owns. A record
+    with no matching evidence track (a MOVED observation, which carries its own
+    freshly-assigned `track_idx`) is appended as-is; if it somehow has no index
+    either, one is assigned rather than left null.
+    """
+    by_identity: Dict[tuple, Dict[str, Any]] = {}
+    for t in (existing or []):
+        if isinstance(t, dict):
+            by_identity[tuple(t.get(k) for k in _TRACK_IDENTITY)] = dict(t)
+
+    used = max([int(t.get("track_idx") or 0)
+                for t in by_identity.values()] or [0])
+    out: List[Dict[str, Any]] = []
+    for r in (details or []):
+        if not isinstance(r, dict):
+            continue
+        base = by_identity.get(tuple(r.get(k) for k in _TRACK_IDENTITY))
+        track = dict(base) if base else {}
+        # The state record is authoritative for the measurement fields it has;
+        # it is authoritative for NOTHING it lacks.
+        for k, val in r.items():
+            if k in _BOUNDARY_FIELDS or val is not None:
+                track[k] = val
+        if track.get("track_idx") is None:
+            used += 1
+            track["track_idx"] = used
+        else:
+            used = max(used, int(track["track_idx"]))
+        out.append(track)
+    return out
+
+
 def apply_verdicts(
     *,
     result: BoundaryResult,
@@ -814,13 +878,8 @@ def apply_verdicts(
         ev_meta = _load(ev_meta_path)
         if ev_meta is not None:
             ev_meta["top_damage"] = doc.get("top_damage")
-            ev_meta["tracks"] = [
-                {k: r.get(k) for k in
-                 ("track_idx", "camera_id", "track_id", "class_name",
-                  "confidence", "best_confidence", "best_frame_idx", "bbox",
-                  "boundary_side", "boundary_reason", "boundary_ambiguous")}
-                for r in (doc.get("top_damage_details") or [])
-            ]
+            ev_meta["tracks"] = _merged_evidence_tracks(
+                ev_meta.get("tracks"), doc.get("top_damage_details"))
             _save(ev_meta_path, ev_meta)
 
     out = {"wagons_rewritten": sorted(touched), "deduplicated_dropped": dropped}

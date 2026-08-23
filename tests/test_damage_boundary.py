@@ -677,3 +677,97 @@ class TestWiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestEvidenceMetadataKeepsItsTrackIndex(unittest.TestCase):
+    """The resolver must not destroy the handle on the snapshot it describes.
+
+    `apply_verdicts` rebuilt `evidence/<GW>/damage/metadata.json`'s `tracks` by
+    projecting fields out of `top_damage_details`, the wagon_states record. That
+    record has no `track_idx` -- features/damage/processor.py documents its shape
+    as `{class_name, confidence, bbox, frame_idx, camera_id, track_id}` -- so the
+    projection wrote `"track_idx": null` over the index the damage processor had
+    correctly stored.
+
+    The index is the only handle on the file: the picture on disk is
+    `track_<idx>__<CAMERA>.jpg`. Losing it orphaned a snapshot that exists, and
+    cost us both production failures -- `int(None)` failing four trains' entire
+    top-camera documents, and then, once that was guarded, damage findings
+    published with no image URL at all.
+    """
+
+    def test_an_unmoved_track_keeps_its_index(self):
+        existing = [{"track_idx": 2, "camera_id": C.CAMERA_RIGHT_UP_TOP,
+                     "track_id": 7, "class_name": "inner_wall_damage",
+                     "bbox": [10, 10, 60, 60], "best_confidence": 0.66,
+                     "best_frame_idx": 804}]
+        details = [{"camera_id": C.CAMERA_RIGHT_UP_TOP, "track_id": 7,
+                    "class_name": "inner_wall_damage", "confidence": 0.66,
+                    "bbox": [10, 10, 60, 60], "frame_idx": 804,
+                    "boundary_side": "AMBIGUOUS",
+                    "boundary_reason": "NO_SUPPORT_GAP"}]
+        got = DB._merged_evidence_tracks(existing, details)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["track_idx"], 2,
+                         "the index that names the JPEG was destroyed")
+
+    def test_the_boundary_verdict_is_still_applied(self):
+        existing = [{"track_idx": 1, "camera_id": C.CAMERA_LEFT_UP_TOP,
+                     "track_id": 3}]
+        details = [{"camera_id": C.CAMERA_LEFT_UP_TOP, "track_id": 3,
+                    "boundary_side": "FOLLOWING",
+                    "boundary_reason": "RESOLVED",
+                    "boundary_ambiguous": False}]
+        got = DB._merged_evidence_tracks(existing, details)[0]
+        self.assertEqual(got["boundary_side"], "FOLLOWING")
+        self.assertEqual(got["boundary_reason"], "RESOLVED")
+        self.assertIs(got["boundary_ambiguous"], False)
+        self.assertEqual(got["track_idx"], 1)
+
+    def test_fields_the_state_record_lacks_are_preserved(self):
+        """The state record is authoritative for what it HAS, not what it lacks."""
+        existing = [{"track_idx": 5, "camera_id": C.CAMERA_RIGHT_UP_TOP,
+                     "track_id": 9, "best_confidence": 0.81,
+                     "best_frame_idx": 1200, "bbox": [1, 2, 3, 4]}]
+        details = [{"camera_id": C.CAMERA_RIGHT_UP_TOP, "track_id": 9,
+                    "class_name": "floor_damage"}]
+        got = DB._merged_evidence_tracks(existing, details)[0]
+        for k, v in (("best_confidence", 0.81), ("best_frame_idx", 1200),
+                     ("bbox", [1, 2, 3, 4]), ("track_idx", 5)):
+            self.assertEqual(got[k], v, f"{k} was lost")
+        self.assertEqual(got["class_name"], "floor_damage")
+
+    def test_a_moved_track_keeps_the_index_it_was_given(self):
+        got = DB._merged_evidence_tracks(
+            [], [{"camera_id": C.CAMERA_RIGHT_UP_TOP, "track_id": 4,
+                  "track_idx": 3, "moved_from_global_id": "GW_38"}])[0]
+        self.assertEqual(got["track_idx"], 3)
+        self.assertEqual(got["moved_from_global_id"], "GW_38")
+
+    def test_no_index_anywhere_is_assigned_not_left_null(self):
+        got = DB._merged_evidence_tracks(
+            [], [{"camera_id": C.CAMERA_LEFT_UP_TOP, "track_id": 1},
+                 {"camera_id": C.CAMERA_LEFT_UP_TOP, "track_id": 2}])
+        self.assertEqual([t["track_idx"] for t in got], [1, 2])
+
+    def test_assigned_indices_never_collide_with_existing_ones(self):
+        existing = [{"track_idx": 4, "camera_id": C.CAMERA_RIGHT_UP_TOP,
+                     "track_id": 1}]
+        got = DB._merged_evidence_tracks(
+            existing,
+            [{"camera_id": C.CAMERA_RIGHT_UP_TOP, "track_id": 1},
+             {"camera_id": C.CAMERA_LEFT_UP_TOP, "track_id": 2}])
+        idxs = [t["track_idx"] for t in got]
+        self.assertEqual(idxs[0], 4)
+        self.assertEqual(len(set(idxs)), len(idxs), f"index collision: {idxs}")
+
+    def test_no_track_idx_is_ever_null(self):
+        """The invariant, stated directly: a null index is what broke this."""
+        got = DB._merged_evidence_tracks(
+            [{"camera_id": C.CAMERA_RIGHT_UP_TOP, "track_id": 1}],
+            [{"camera_id": C.CAMERA_RIGHT_UP_TOP, "track_id": 1},
+             {"camera_id": C.CAMERA_LEFT_UP_TOP, "track_id": 2,
+              "track_idx": None}])
+        for t in got:
+            self.assertIsNotNone(t["track_idx"])
+            self.assertIsInstance(t["track_idx"], int)
