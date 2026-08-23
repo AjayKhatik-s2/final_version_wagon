@@ -112,9 +112,15 @@ class TestCliDispatch(unittest.TestCase):
         p = inspect.signature(process_batch).parameters
         self.assertIn("batch", p)
         self.assertIn("workspace_root", p)
-        self.assertEqual(p["door_sample_stride"].default, 3)
-        self.assertEqual(p["damage_sample_stride"].default, 3)
-        self.assertEqual(p["load_sample_stride"].default, 2)
+        # The parameters stay, so an operator can still opt INTO sampling; what
+        # changed is that nothing does by default.
+        self.assertEqual(p["door_sample_stride"].default, 1)
+        self.assertEqual(p["damage_sample_stride"].default, 1)
+        self.assertEqual(p["load_sample_stride"].default, 1)
+        self.assertEqual(p["door_inference_mode"].default, "legacy")
+        self.assertEqual(p["damage_inference_mode"].default, "legacy")
+        self.assertEqual(p["load_inference_mode"].default, "legacy")
+        self.assertEqual(p["load_every_nth"].default, 1)
 
 
 class TestMainDispatchRouting(unittest.TestCase):
@@ -242,10 +248,17 @@ class TestLiveDispatchIsProtected(unittest.TestCase):
 
 
 class TestStrideConfigUnchanged(unittest.TestCase):
-    def test_camera_runner_uses_3_3_2(self):
+    def test_no_stride_constants_survive_to_be_re_enabled(self):
+        """The strides are REMOVED, not set to 1.
+
+        A dormant `DOOR_STRIDE = 1` is one edit away from resampling; a name that
+        does not exist is not. Frame skipping is now a deliberate act, not a
+        default someone can nudge.
+        """
         from orchestrator import camera_runner as cr
-        self.assertEqual((cr.DOOR_STRIDE, cr.DAMAGE_STRIDE, cr.LOAD_STRIDE),
-                         (3, 3, 2))
+        for name in ("DOOR_STRIDE", "DAMAGE_STRIDE", "LOAD_STRIDE"):
+            self.assertFalse(hasattr(cr, name),
+                             f"camera_runner.{name} still exists")
 
 
 class TestFeatureAuthorityAndOcr(unittest.TestCase):
@@ -301,22 +314,34 @@ class TestFeatureAuthorityAndOcr(unittest.TestCase):
         mod = _feature_module("ocr")
         self.assertEqual(mod.__name__, "features.ocr.processor")
 
-    def test_strides_are_the_approved_values(self):
-        from orchestrator.camera_runner import _feature_plan
-        got = {}
-        for cam in CAMS:
-            for name, _mod, extra in _feature_plan(cam, {"door", "damage",
-                                                         "load"}):
-                got[name] = extra.get("sample_stride")
-        self.assertEqual(got, {"door": 3, "damage": 3, "load": 2})
+    def test_no_feature_skips_a_frame(self):
+        """Every feature runs on EVERY frame -- no stride, anywhere.
 
-    def test_every_feature_uses_the_sampled_mode(self):
+        Asserted as the ABSENCE of `sampled`, not as `sample_stride == 1`: the
+        two are not equivalent. `sampled` runs EvidenceAggregator while `legacy`
+        runs the per-feature tracker, so a stride of 1 would be a different
+        algorithm at full rate rather than the known-good path.
+        """
         from orchestrator.camera_runner import _feature_plan
         for cam in CAMS:
             for name, _mod, extra in _feature_plan(cam, {"door", "damage",
                                                          "load"}):
                 with self.subTest(camera=cam, feature=name):
-                    self.assertEqual(extra.get("inference_mode"), "sampled")
+                    self.assertNotEqual(extra.get("inference_mode"), "sampled")
+                    self.assertNotIn("sample_stride", extra)
+
+    def test_load_is_told_explicitly_not_to_skip(self):
+        """The one case where legacy does NOT mean every frame.
+
+        `features.load.processor.run` has `every_nth: int = 2`, and since the
+        max_frames=0 -> None fix that default takes effect. Passing the mode
+        alone would still have skipped every other frame.
+        """
+        from orchestrator.camera_runner import _feature_plan
+        for cam in CAMS:
+            for name, _mod, extra in _feature_plan(cam, {"load"}):
+                if name == "load":
+                    self.assertEqual(extra.get("every_nth"), 1)
 
 
 class TestArrivalPersistence(unittest.TestCase):
@@ -562,13 +587,16 @@ class TestAssemblyIsTheBatchSequence(unittest.TestCase):
         self.assertEqual(names[0], "load")
         self.assertLess(names.index("load"), names.index("damage"))
 
-    def test_strides_match_the_approved_values(self):
+    def test_assembly_skips_no_frame_either(self):
+        """Batch and sequential must agree, or the modes produce different
+        inspection results from the same footage."""
         from orchestrator.global_assembler import _FEATURE_ORDER
-        strided = {n: e for n, e in _FEATURE_ORDER if e}
-        got = {n: e["sample_stride"] for n, e in strided.items()}
-        self.assertEqual(got, {"door": 3, "damage": 3, "load": 2})
-        for _n, e in strided.items():
-            self.assertEqual(e["inference_mode"], "sampled")
+        for name, extra in _FEATURE_ORDER:
+            with self.subTest(feature=name):
+                self.assertNotEqual(extra.get("inference_mode"), "sampled")
+                self.assertNotIn("sample_stride", extra)
+        self.assertEqual(dict(_FEATURE_ORDER)["load"].get("every_nth"), 1,
+                         "load samples in legacy mode unless told otherwise")
 
     def test_ocr_takes_no_stride_arguments(self):
         """`features.ocr.processor.run` discards `every_nth`/`max_frames`.

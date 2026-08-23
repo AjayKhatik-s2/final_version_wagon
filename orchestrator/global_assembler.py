@@ -140,14 +140,28 @@ def _load_wagon_region(bundle: CameraEvidenceBundle):
 
 #: Stage-3 order and per-feature arguments, identical to master_runner's.
 #: LOAD first -- the damage processor reads the sibling load JSON.
-DOOR_STRIDE = 3
-DAMAGE_STRIDE = 3
-LOAD_STRIDE = 2
-
+#:
+#: NO FRAME IS SKIPPED. Every feature runs on every frame of every wagon.
+#:
+#: This is `inference_mode="legacy"` -- which each processor documents as "every
+#: frame + <feature>Tracker; the known-good path, byte-for-byte the behaviour
+#: benchmarked on EC2". It is also each processor's DEFAULT, so the way to ask
+#: for it is to pass no inference arguments at all, exactly as OCR already does.
+#: Reaching it via `sampled` with sample_stride=1 would NOT be equivalent: that
+#: path uses EvidenceAggregator instead of the tracker, so it is a different
+#: algorithm rather than the same one at full rate.
+#:
+#: `every_nth=1` is passed to LOAD explicitly because load samples even in
+#: legacy mode -- its `every_nth` defaults to 2, and (since the max_frames=0 ->
+#: None fix) that default actually takes effect. Legacy mode alone would still
+#: have skipped every other frame there.
+#:
+#: The strides that were here (door 3, damage 3, load 2) are gone rather than set
+#: to 1, so there is no dormant value to be quietly re-enabled.
 _FEATURE_ORDER = (
-    ("load",   dict(inference_mode="sampled", sample_stride=LOAD_STRIDE)),
-    ("door",   dict(inference_mode="sampled", sample_stride=DOOR_STRIDE)),
-    ("damage", dict(inference_mode="sampled", sample_stride=DAMAGE_STRIDE)),
+    ("load",   dict(every_nth=1)),
+    ("door",   {}),
+    ("damage", {}),
     # OCR takes NO stride arguments -- it discards `every_nth`/`max_frames`
     # because the Rekognition and EasyOCR readers each pick their own frames
     # (banding -> 3-frame vertical sheet), so an empty extras dict is correct

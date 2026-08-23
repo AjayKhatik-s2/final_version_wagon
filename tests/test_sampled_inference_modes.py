@@ -78,14 +78,28 @@ class TestOrchestratorSelectsSampled(unittest.TestCase):
         self.assertEqual(a.damage_inference_mode, "sampled")
         self.assertEqual(a.load_inference_mode, "sampled")
 
-    def test_process_batch_defaults_to_sampled(self):
+    def test_process_batch_defaults_to_every_frame(self):
+        """Reversed 2026-08-23 on operator instruction: skip no frame anywhere.
+
+        The sampled path is NOT removed -- it stays reachable per feature -- but
+        nothing selects it by default. `legacy` is each processor's own default
+        and its every-frame path.
+        """
         from orchestrator.master_runner import process_batch
         p = inspect.signature(process_batch).parameters
         for feat in ("door", "damage", "load"):
-            self.assertEqual(p[f"{feat}_inference_mode"].default, "sampled")
-        self.assertEqual(p["door_sample_stride"].default, 3)
-        self.assertEqual(p["damage_sample_stride"].default, 3)
-        self.assertEqual(p["load_sample_stride"].default, 2)
+            self.assertEqual(p[f"{feat}_inference_mode"].default, "legacy")
+            self.assertEqual(p[f"{feat}_sample_stride"].default, 1)
+        # Load samples even in legacy mode unless told otherwise.
+        self.assertEqual(p["load_every_nth"].default, 1)
+
+    def test_sampling_is_still_reachable_on_request(self):
+        """Removing the capability was not asked for, only the default."""
+        a = self._parse(["--local-only",
+                         "--door-inference-mode", "sampled",
+                         "--door-sample-stride", "3"])
+        self.assertEqual(a.door_inference_mode, "sampled")
+        self.assertEqual(int(a.door_sample_stride), 3)
 
     def test_legacy_is_still_reachable(self):
         """Legacy must never be destroyed -- one flag restores it."""

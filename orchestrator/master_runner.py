@@ -191,12 +191,17 @@ def process_batch(
     skip_email: bool = False,
     verbose: bool = True,
     feature_config: Optional[FeatureConfig] = None,
-    door_inference_mode: str = "sampled",
-    door_sample_stride: int = 3,
-    damage_inference_mode: str = "sampled",
-    damage_sample_stride: int = 3,
-    load_inference_mode: str = "sampled",
-    load_sample_stride: int = 2,
+    # NO FRAME IS SKIPPED. "legacy" is each processor's own default and its
+    # every-frame path ("every frame + <feature>Tracker; the known-good path").
+    # The stride values remain as parameters so an operator can still opt into
+    # sampling deliberately, but nothing in the pipeline does.
+    door_inference_mode: str = "legacy",
+    door_sample_stride: int = 1,
+    damage_inference_mode: str = "legacy",
+    damage_sample_stride: int = 1,
+    load_inference_mode: str = "legacy",
+    load_sample_stride: int = 1,
+    load_every_nth: int = 1,
 ) -> BatchOutcome:
     if feature_config is None:
         feature_config = FeatureConfig.all_on()
@@ -308,20 +313,26 @@ def process_batch(
         verbose=verbose,
     )
 
-    # Per-feature inference mode.  Door and Damage accept an explicit
-    # legacy/sampled selector; Load and OCR do not and are untouched.
+    # Per-feature inference mode.  Defaults run EVERY frame.
+    #
+    # `load_every_nth` is separate and necessary: load samples even in legacy
+    # mode, its own `every_nth` defaulting to 2, and that default does take
+    # effect.  Passing the mode alone would still have skipped every other frame
+    # there, which is the one case where "legacy" does not mean "every frame".
     _feature_extra: Dict[str, Dict[str, Any]] = {
         "door":   dict(inference_mode=door_inference_mode,
                        sample_stride=int(door_sample_stride)),
         "damage": dict(inference_mode=damage_inference_mode,
                        sample_stride=int(damage_sample_stride)),
         "load":   dict(inference_mode=load_inference_mode,
-                       sample_stride=int(load_sample_stride)),
+                       sample_stride=int(load_sample_stride),
+                       every_nth=max(1, int(load_every_nth))),
     }
     print(f"  inference modes : door={door_inference_mode}/"
           f"stride={door_sample_stride}  "
           f"damage={damage_inference_mode}/stride={damage_sample_stride}  "
-          f"load={load_inference_mode}/stride={load_sample_stride}")
+          f"load={load_inference_mode}/stride={load_sample_stride}/"
+          f"every_nth={load_every_nth}")
 
     def _run_feature(name, fn):
         with timer.stage(f"stage3_{name}"):

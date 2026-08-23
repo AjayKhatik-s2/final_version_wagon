@@ -31,9 +31,17 @@ from materializer import wagon_cache_builder
 from orchestrator import camera_pipeline as cp
 
 # Stage-3 configuration -- IDENTICAL to the tuned batch defaults.
-DOOR_STRIDE = 3
-DAMAGE_STRIDE = 3
-LOAD_STRIDE = 2
+# NO FRAME IS SKIPPED in any stage. Each processor's DEFAULT inference_mode is
+# "legacy" -- documented there as "every frame + <feature>Tracker; the known-good
+# path" -- so the way to ask for it is to pass no inference arguments, as OCR
+# already does. `sampled` with sample_stride=1 would NOT be the same thing: it
+# runs EvidenceAggregator instead of the tracker.
+#
+# LOAD additionally needs `every_nth=1`: it samples even in legacy mode, its
+# `every_nth` defaulting to 2, and that default does take effect.
+#
+# The former strides (door 3, damage 3, load 2) are removed rather than set to 1,
+# so no dormant value can be quietly re-enabled.
 
 
 @dataclass
@@ -100,17 +108,13 @@ def _feature_plan(camera_id: str, enabled: set) -> List:
     plan = []
     if camera_id in C.SIDE_CAMERAS and "door" in enabled:
         from features.door import processor as door_proc
-        plan.append(("door", door_proc,
-                     dict(inference_mode="sampled", sample_stride=DOOR_STRIDE)))
+        plan.append(("door", door_proc, {}))
     if camera_id in C.TOP_CAMERAS and "load" in enabled:
         from features.load import processor as load_proc
-        plan.append(("load", load_proc,
-                     dict(inference_mode="sampled", sample_stride=LOAD_STRIDE)))
+        plan.append(("load", load_proc, dict(every_nth=1)))
     if camera_id in C.TOP_CAMERAS and "damage" in enabled:
         from features.damage import processor as damage_proc
-        plan.append(("damage", damage_proc,
-                     dict(inference_mode="sampled",
-                          sample_stride=DAMAGE_STRIDE)))
+        plan.append(("damage", damage_proc, {}))
     return plan
 
 
