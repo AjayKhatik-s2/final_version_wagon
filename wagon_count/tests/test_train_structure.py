@@ -484,11 +484,19 @@ class TestSupportCannotInflate(unittest.TestCase):
 
 class TestTopClassificationMapping(unittest.TestCase):
     def test_camera_to_classifier_mapping(self):
+        """LEFT_UP_TOP moved to its own classifier; the other three did not.
+
+        It shared `top_classification.pt` with RIGHT_UP_TOP until a model was
+        trained for its own overhead view. RIGHT_UP_TOP deliberately stays put --
+        replacing "the top model" for both is the mistake this asserts against.
+        """
         m = ts.CAMERA_CLASSIFICATION_MODEL
         self.assertEqual(m[CAMERA_RIGHT_UP], ts.SIDE_CLASSIFICATION_MODEL)
-        self.assertEqual(m[CAMERA_RIGHT_UP_TOP], ts.TOP_CLASSIFICATION_MODEL)
-        self.assertEqual(m[CAMERA_LEFT_UP_TOP], ts.TOP_CLASSIFICATION_MODEL)
         self.assertEqual(m[CAMERA_LEFT_UP], ts.SIDE_CLASSIFICATION_MODEL)
+        self.assertEqual(m[CAMERA_RIGHT_UP_TOP], ts.TOP_CLASSIFICATION_MODEL)
+        self.assertEqual(m[CAMERA_LEFT_UP_TOP],
+                         ts.LEFT_UP_TOP_CLASSIFICATION_MODEL)
+        self.assertNotEqual(m[CAMERA_LEFT_UP_TOP], m[CAMERA_RIGHT_UP_TOP])
 
     def test_mapping_is_built_from_real_names_not_indices(self):
         """Class IDs are never assumed: 0 is not 'wagon' by fiat."""

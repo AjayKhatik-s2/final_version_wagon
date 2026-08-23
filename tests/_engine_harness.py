@@ -261,6 +261,33 @@ REVIEWED_IN_WORKTREE = (
     # evidence isolation or engine-frame handling.
     # See tests/test_report_completeness.py.
     "reporting/_adapter.py",                # canonical-driven KPI counts
+
+    # LEFT_UP_TOP's own CLASSIFIER, reviewed 2026-08-23. Both top cameras shared
+    # `top_classification.pt`; LEFT_UP_TOP now loads `ltop.pt` and RIGHT_UP_TOP
+    # is unchanged. This EXTENDS the mapping that already existed for exactly
+    # this purpose -- train_structure.CAMERA_CLASSIFICATION_MODEL -- rather than
+    # adding a second loader.
+    #
+    # run_global_count needed a real fix, not just the new name: it resolved ONE
+    # `top_cls_path` and then chose between it and the SIDE model with
+    # `want == TOP_CLASSIFICATION_MODEL`. That test goes False for `ltop.pt`, so
+    # LEFT_UP_TOP would have been handed `side_classification.pt` -- a side-view
+    # classifier on an overhead view, silently, returning confident labels from
+    # the wrong model. Paths are now keyed by model NAME, one entry per distinct
+    # model the mapping names.
+    #
+    # GAP DETECTION IS UNTOUCHED: both top cameras still use `top_gap.pt`, and
+    # `ltop.pt` is deliberately NOT in RECON_MODEL_FILES. Classification remains
+    # optional and never a counting authority -- RIGHT_UP alone decides the
+    # count -- so an absent classifier reduces capability and nothing else. No
+    # change to the tracking algorithm, gap validation, stitching, thresholds,
+    # confidence floors, min-height ratios or inference stride.
+    # See tests/test_left_up_top_model.py.
+    "wagon_count/train_structure.py",       # mapping: LEFT_UP_TOP -> ltop.pt
+    "wagon_count/run_global_count.py",      # name-keyed classifier resolution
+    "wagon_count/tests/test_train_structure.py",   # the mapping's own test
+    "wagon_count/validate_ec2.py",          # ltop.pt in the capability list
+    "wagon_count/README.md",                # per-camera classifier table
 )
 
 

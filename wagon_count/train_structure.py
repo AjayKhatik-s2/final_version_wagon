@@ -56,25 +56,50 @@ from global_train_state import (
 
 SIDE_CLASSIFICATION_MODEL = "side_classification.pt"
 TOP_CLASSIFICATION_MODEL = "top_classification.pt"
+#: LEFT_UP_TOP's OWN classifier, trained on its own overhead view.
+#: RIGHT_UP_TOP keeps `top_classification.pt` -- the two top cameras no longer
+#: share a classifier, so this mapping is now the only thing that decides which
+#: weights each one loads and every reader must go through it.
+LEFT_UP_TOP_CLASSIFICATION_MODEL = "ltop.pt"
 
 #: Which classification model each camera uses.
 #:
 #:   RIGHT_UP      -> side_classification.pt   (master authority, UNCHANGED)
 #:   LEFT_UP       -> side_classification.pt   (a side view, same geometry)
-#:   RIGHT_UP_TOP  -> top_classification.pt    (new)
-#:   LEFT_UP_TOP   -> top_classification.pt    (new)
+#:   RIGHT_UP_TOP  -> top_classification.pt    (UNCHANGED)
+#:   LEFT_UP_TOP   -> ltop.pt                  (its own, trained for its view)
 #:
 #: LEFT_UP keeps the side model because it is a side view with the same geometry
-#: as the master; the top model is trained on the overhead view. Note that
-#: before this change NO support camera was classified at all, so mapping
-#: LEFT_UP to the side model adds capability without altering any existing
-#: behaviour.
+#: as the master; the top models are trained on the overhead view. Note that
+#: before top-camera classification existed NO support camera was classified at
+#: all, so this mapping only ever adds capability.
+#:
+#: LEFT_UP_TOP moved off the shared top model once a classifier was trained for
+#: its own view. Replacing "the top model" would have moved RIGHT_UP_TOP too,
+#: which is wrong: this is a per-camera change, and a classifier applied to the
+#: wrong camera still returns confident ENGINE / WAGON / BRAKE_VAN labels -- just
+#: the wrong ones, which is far worse than a visible failure.
 CAMERA_CLASSIFICATION_MODEL: Dict[str, str] = {
     CAMERA_RIGHT_UP: SIDE_CLASSIFICATION_MODEL,
     CAMERA_LEFT_UP: SIDE_CLASSIFICATION_MODEL,
     CAMERA_RIGHT_UP_TOP: TOP_CLASSIFICATION_MODEL,
-    CAMERA_LEFT_UP_TOP: TOP_CLASSIFICATION_MODEL,
+    CAMERA_LEFT_UP_TOP: LEFT_UP_TOP_CLASSIFICATION_MODEL,
 }
+
+
+def classification_model_for(camera_id: str) -> str:
+    """The classifier `camera_id` must use. Raises on an unknown camera.
+
+    No default: handing a camera another camera's classifier produces confident
+    labels from weights nobody chose, and those labels decide which segments are
+    excluded from wagon synchronization. A KeyError is the cheap failure.
+    """
+    try:
+        return CAMERA_CLASSIFICATION_MODEL[camera_id]
+    except KeyError:
+        raise KeyError(
+            f"no classification model configured for camera {camera_id!r}; "
+            f"known cameras: {sorted(CAMERA_CLASSIFICATION_MODEL)}") from None
 
 TOP_CAMERAS_USING_TOP_MODEL = (CAMERA_RIGHT_UP_TOP, CAMERA_LEFT_UP_TOP)
 

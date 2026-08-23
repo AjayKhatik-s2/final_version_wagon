@@ -38,7 +38,8 @@ wagon_count/
 │   ├── left_up_wagon_gap.pt     # LEFT_UP gap model
 │   ├── top_gap.pt               # top cameras (RIGHT_UP_TOP, LEFT_UP_TOP)
 │   ├── side_classification.pt   # RIGHT_UP + LEFT_UP: ENGINE / WAGON / BRAKE_VAN
-│   └── top_classification.pt    # RIGHT_UP_TOP + LEFT_UP_TOP (optional)
+│   ├── top_classification.pt    # RIGHT_UP_TOP classification (optional)
+│   └── ltop.pt                  # LEFT_UP_TOP classification (optional)
 └── results/                     # created on first run
 ```
 
@@ -560,23 +561,44 @@ Required exact filenames:
 | `left_up.mp4`        | `left_up_wagon_gap.pt`     | LEFT_UP gap detection |
 | `right_up_top.mp4`   | `top_gap.pt`               | both TOP cameras, gap detection |
 | `left_up_top.mp4`    | `side_classification.pt`   | RIGHT_UP (master) + LEFT_UP classification |
-|                      | `top_classification.pt`    | RIGHT_UP_TOP + LEFT_UP_TOP classification — **optional** |
+|                      | `top_classification.pt`    | RIGHT_UP_TOP classification — **optional** |
+|                      | `ltop.pt`                  | LEFT_UP_TOP classification — **optional** |
 
-### `top_classification.pt` (optional)
+### Top-camera classifiers (optional): `top_classification.pt`, `ltop.pt`
 
-Classifies the two overhead cameras into ENGINE / WAGON / BRAKE_VAN. It improves
-support-camera classification, synchronization and PDF/video labels. It is
-**never a counting authority** — RIGHT_UP alone determines the wagon count — so
-if the file is absent the run still completes, the top cameras are simply not
-classified, and `validate_ec2.py` reports the missing capability as a FAIL.
+Each overhead camera has **its own** classifier — they do not share one:
 
-If you keep it in S3, copy it in as a deployment step (the pipeline itself
+| Camera | Classifier |
+|--------|------------|
+| `RIGHT_UP_TOP` | `top_classification.pt` |
+| `LEFT_UP_TOP`  | `ltop.pt` |
+
+They classify that camera's view into ENGINE / WAGON / BRAKE_VAN, which improves
+support-camera classification, synchronization and PDF/video labels. Neither is
+**ever a counting authority** — RIGHT_UP alone determines the wagon count — so if
+a file is absent the run still completes, that camera is simply not classified,
+and `validate_ec2.py` reports the missing capability as a FAIL.
+
+The mapping lives in exactly one place, `train_structure.CAMERA_CLASSIFICATION_MODEL`,
+which both this script and the sequential runner read. Do not add a second
+mapping, and do not "replace the top model": that moves RIGHT_UP_TOP as well.
+
+A missing classifier is **never** substituted with the other top camera's. A
+classifier run on the wrong camera still returns confident labels — just wrong
+ones — and those labels decide which segments are kept out of wagon
+synchronization, so silent substitution is worse than no classification at all.
+
+If you keep them in S3, copy them in as a deployment step (this script itself
 contains no S3 code, by design):
 
 ```bash
 aws s3 cp s3://<your-bucket>/top_classification.pt models/top_classification.pt
-python validate_ec2.py          # confirms it loads and prints its real class names
+aws s3 cp s3://<your-bucket>/ltop.pt               models/ltop.pt
+python validate_ec2.py          # confirms they load and prints their real class names
 ```
+
+The wider `wagon_eye_v4` pipeline does not need this step: `core/model_sync.py`
+fetches both from the configured store automatically.
 
 The semantic mapping is derived from the model's **actual** `model.names` at
 runtime — class indices are never assumed, and an unrecognised class is mapped to

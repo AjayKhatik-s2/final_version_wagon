@@ -58,15 +58,19 @@ REQUIRED_MODELS = [
     ("top_gap.pt",             "gap detection on both TOP cameras",  "detect"),
     ("side_classification.pt", "ENGINE / WAGON / BRAKE_VAN on RIGHT_UP and LEFT_UP",
      None),
-    ("top_classification.pt",  "ENGINE / WAGON / BRAKE_VAN on RIGHT_UP_TOP and "
-                               "LEFT_UP_TOP", None),
+    ("top_classification.pt",  "ENGINE / WAGON / BRAKE_VAN on RIGHT_UP_TOP", None),
+    # The two top cameras do NOT share a classifier: ltop.pt is trained on
+    # LEFT_UP_TOP's own overhead view. Listed separately so a missing one is
+    # reported against the camera that actually loses classification, rather
+    # than both.
+    ("ltop.pt",                "ENGINE / WAGON / BRAKE_VAN on LEFT_UP_TOP", None),
 ]
 
 #: Models whose absence disables a capability but does NOT stop a run. The wagon
 #: count comes from RIGHT_UP alone, so top classification is not count-critical.
 #: It is still reported as a FAIL of the *top classification capability* so a
 #: missing file can never pass unnoticed, and no other model is ever substituted.
-CAPABILITY_ONLY_MODELS = {"top_classification.pt"}
+CAPABILITY_ONLY_MODELS = {"top_classification.pt", "ltop.pt"}
 
 MIN_PYTHON = (3, 10)
 

@@ -168,7 +168,7 @@ wagon_eye_v4/
 │   │                                   (right_up_wagon_gap.pt,
 │   │                                    left_up_wagon_gap.pt, top_gap.pt,
 │   │                                    side_classification.pt,
-│   │                                    top_classification.pt = optional)
+│   │                                    top_classification.pt, ltop.pt = optional)
 │   └── features/                      Stage-3 inspection weights
 │                                       (door_state.pt, loaded.pt,
 │                                        damage.pt, wagon_id_counting.pt)
@@ -256,7 +256,8 @@ pip install -r requirements.txt
 #           left_up_wagon_gap.pt
 #           top_gap.pt
 #           side_classification.pt
-#           top_classification.pt   OPTIONAL — refines TOP-camera
+#           top_classification.pt   OPTIONAL — refines RIGHT_UP_TOP
+#           ltop.pt                 OPTIONAL — refines LEFT_UP_TOP
 #                                   classification; never a counting
 #                                   authority, so a missing file only
 #                                   degrades labelling, never the count.

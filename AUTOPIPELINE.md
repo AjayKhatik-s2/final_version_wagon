@@ -139,7 +139,7 @@ rig rename is a one-line edit and producer and consumer can never drift apart.
 
 ```
 models/reconstruction/   right_up_wagon_gap.pt  left_up_wagon_gap.pt  top_gap.pt
-                         side_classification.pt  top_classification.pt (optional)
+                         side_classification.pt  top_classification.pt  ltop.pt (both optional)
 models/features/         door_state.pt  loaded.pt  damage.pt
                          wagon_number_update.pt        ← V4's plate detector
 models/extraction/       side_classification.pt  top_classification.pt

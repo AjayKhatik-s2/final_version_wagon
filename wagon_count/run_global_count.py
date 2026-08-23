@@ -529,20 +529,37 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
-    # top_classification.pt is OPTIONAL: it refines top-camera classification,
-    # evidence and synchronization, but it is never a counting authority, so a
+    # Top classifiers are OPTIONAL: they refine top-camera classification,
+    # evidence and synchronization, but are never a counting authority, so a
     # missing file degrades capability instead of failing the run.
-    top_cls_path: Optional[str] = None
-    _top_candidate = os.path.join(args.models_dir, ts.TOP_CLASSIFICATION_MODEL)
-    if os.path.exists(_top_candidate):
-        top_cls_path = os.path.abspath(_top_candidate)
-    else:
-        print(f"NOTE: {ts.TOP_CLASSIFICATION_MODEL} not found in {args.models_dir} -- "
-              f"RIGHT_UP_TOP / LEFT_UP_TOP will not be classified. The wagon count "
-              f"is unaffected (RIGHT_UP is the only counting authority). Place the "
-              f"file there to enable top classification, e.g.\n"
-              f"      aws s3 cp s3://<bucket>/{ts.TOP_CLASSIFICATION_MODEL} "
-              f"{args.models_dir}/", file=sys.stderr)
+    #
+    # Resolved BY NAME, one entry per distinct model the mapping names, because
+    # the top cameras no longer share a classifier. The previous code resolved a
+    # single `top_cls_path` and then chose between it and the SIDE model with
+    # `want == TOP_CLASSIFICATION_MODEL` -- so as soon as LEFT_UP_TOP's `want`
+    # became `ltop.pt` that test went False and the camera would have been given
+    # `side_classification.pt`: a side-view classifier on an overhead view,
+    # silently, returning confident labels from the wrong model.
+    cls_paths: Dict[str, Optional[str]] = {}
+    for _want in sorted(set(ts.CAMERA_CLASSIFICATION_MODEL.values())):
+        if _want == ts.SIDE_CLASSIFICATION_MODEL:
+            cls_paths[_want] = side_cls_path
+            continue
+        _cand = os.path.join(args.models_dir, _want)
+        if os.path.exists(_cand):
+            cls_paths[_want] = os.path.abspath(_cand)
+        else:
+            cls_paths[_want] = None
+            _users = [c for c, m in ts.CAMERA_CLASSIFICATION_MODEL.items()
+                      if m == _want]
+            print(f"NOTE: {_want} not found in {args.models_dir} -- "
+                  f"{' / '.join(_users)} will not be classified. The wagon count "
+                  f"is unaffected (RIGHT_UP is the only counting authority), and "
+                  f"no other camera's classifier is substituted. Place the file "
+                  f"there to enable it, e.g.\n"
+                  f"      aws s3 cp s3://<bucket>/{_want} "
+                  f"{args.models_dir}/", file=sys.stderr)
+    top_cls_path = cls_paths.get(ts.TOP_CLASSIFICATION_MODEL)
 
     print(f"  RIGHT_UP video           : {right_up_video}")
     print(f"  LEFT_UP video            : {left_up_video}")
@@ -789,9 +806,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         for cam in ALL_CAMERAS:
             if cam == CAMERA_RIGHT_UP:
                 continue
-            want = ts.CAMERA_CLASSIFICATION_MODEL.get(cam)
-            path = (top_cls_path if want == ts.TOP_CLASSIFICATION_MODEL
-                    else side_cls_path)
+            want = ts.classification_model_for(cam)
+            # Look the resolved path up BY THE MODEL NAME. Anything else has to
+            # re-derive "is this a top model", which is what silently sent
+            # LEFT_UP_TOP to the side classifier.
+            path = cls_paths.get(want)
+            print(f"[MODEL] {cam} classification -> {want} -> {path or 'ABSENT'}")
             if path is None:
                 classification_models[cam] = f"{want} (MISSING)"
                 support_regions[cam] = ts.LocalWagonRegion(
@@ -806,7 +826,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         path, num_samples=args.classification_samples,
                         verbose=verbose)
                 clf, mapping = _cache[path]           # type: ignore[misc]
-                if want == ts.TOP_CLASSIFICATION_MODEL:
+                if want != ts.SIDE_CLASSIFICATION_MODEL:
+                    # Any top classifier's label mapping, not only
+                    # top_classification.pt's -- LEFT_UP_TOP now has its own.
                     top_label_mapping = mapping
                 classification_models[cam] = os.path.basename(path)
 

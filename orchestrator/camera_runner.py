@@ -164,9 +164,31 @@ def run_camera(
         else:
             is_top = camera_id in C.TOP_CAMERAS
             gap_model = "top_gap.pt" if is_top else "left_up_wagon_gap.pt"
-            cls_name = ("top_classification.pt" if is_top
-                        else "side_classification.pt")
+            # Classifier comes from the SINGLE existing mapping that batch mode
+            # uses too (train_structure.CAMERA_CLASSIFICATION_MODEL). It used to
+            # be an `is_top` ternary here, which was fine only while both top
+            # cameras shared a classifier -- LEFT_UP_TOP now has its own, so a
+            # second copy of the rule would put the wrong weights on one camera
+            # in exactly one of the two modes.
+            from train_structure import classification_model_for
+            cls_name = classification_model_for(camera_id)
             cls_path = os.path.join(recon_models_dir, cls_name)
+            _s3 = (f"s3://{C.MODELS_S3_BUCKET}/"
+                   f"{(C.MODELS_S3_PREFIX + '/') if C.MODELS_S3_PREFIX else ''}"
+                   f"{cls_name}")
+            if os.path.exists(cls_path):
+                print(f"[MODEL] {camera_id} classification -> {_s3} -> "
+                      f"{cls_path}")
+            else:
+                # Optional, exactly as top_classification.pt always was: the run
+                # continues unclassified rather than borrowing the other top
+                # camera's weights, which would yield confident labels from a
+                # model trained on a different view.
+                print(f"[MODEL] {camera_id} classification -> {cls_name} "
+                      f"NOT PRESENT at {cls_path} (expected from {_s3}); "
+                      f"continuing WITHOUT top-camera classification. "
+                      f"Another camera's classifier is never substituted. "
+                      f"Run `python -m core.model_sync` to fetch it.")
             out = cp.run_support_camera(
                 camera_id=camera_id, video_path=video_path,
                 gap_model_path=os.path.join(recon_models_dir, gap_model),

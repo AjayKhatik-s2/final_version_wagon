@@ -112,6 +112,19 @@ class ModelReq:
     filename: str          # canonical filename (e.g. damage.pt)
     local_dir: str         # RECON_MODELS_DIR or FEAT_MODELS_DIR
     legacy: Optional[str] = None   # accepted legacy filename fallback
+    optional: bool = False
+    """A model the run can proceed WITHOUT.
+
+    It is still synced -- a store that has it gets it -- but its absence is
+    reported as a capability note rather than a failure, so `SyncReport.ok`
+    stays True. The top-camera classifiers are the case this exists for: they
+    refine classification and overlay labelling but are never a counting
+    authority, so a run without one has an unchanged wagon count.
+
+    Before this flag the optional set was simply not in the requirement list at
+    all, which meant it was never DOWNLOADED either -- the only way to get one
+    onto a box was by hand.
+    """
 
     @property
     def local_path(self) -> str:
@@ -220,6 +233,15 @@ def required_models(enabled_features: Optional[List[str]] = None,
                  legacy=C.RECON_MODEL_LEGACY.get(f))
         for f in C.RECON_MODEL_FILES
     ]
+    # Optional reconstruction models: synced when the store has them, never a
+    # reason to fail. Listing them here is what makes them reachable at all --
+    # they were previously absent from every requirement list, so auto-sync
+    # skipped them entirely.
+    reqs.extend(
+        ModelReq("reconstruction", f, CFG.RECON_MODELS_DIR,
+                 legacy=C.RECON_MODEL_LEGACY.get(f), optional=True)
+        for f in C.RECON_OPTIONAL_MODEL_FILES
+    )
     if include_extraction is None:
         include_extraction = CFG.PIPELINE_SOURCE.requires_extraction
     if include_extraction:
@@ -253,11 +275,23 @@ class SyncReport:
 
     @property
     def ok(self) -> bool:
-        return all(s.present for s in self.statuses)
+        """True when every REQUIRED model is available.
+
+        An absent optional model is a capability note, not a failure: the run
+        proceeds with an unchanged wagon count.
+        """
+        return all(s.present for s in self.statuses if not s.req.optional)
 
     @property
     def missing(self) -> List[ModelStatus]:
-        return [s for s in self.statuses if not s.present]
+        """Required models that are unavailable.  Optional ones are reported by
+        `missing_optional` so they are visible without being fatal."""
+        return [s for s in self.statuses
+                if not s.present and not s.req.optional]
+
+    @property
+    def missing_optional(self) -> List[ModelStatus]:
+        return [s for s in self.statuses if not s.present and s.req.optional]
 
     def summary_lines(self) -> List[str]:
         out: List[str] = []
@@ -266,6 +300,10 @@ class SyncReport:
                 out.append(f"  [downloaded] {s.req.category}/{s.req.filename}  <- {s.req.s3_uri}")
             elif s.present:
                 out.append(f"  [present]    {s.req.category}/{s.req.filename}  ({s.local_path})")
+            elif s.req.optional:
+                out.append(f"  [optional]   {s.req.category}/{s.req.filename}  "
+                           f"absent; expected s3 {s.req.s3_uri}  -- capability "
+                           f"reduced, wagon count unaffected")
             else:
                 out.append(f"  [MISSING]    {s.req.category}/{s.req.filename}  "
                            f"expected s3 {s.req.s3_uri}  -- {s.error}")

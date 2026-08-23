@@ -111,6 +111,11 @@ MODEL_SIDE_CLASSIFICATION = "side_classification.pt"
 # out of wagon synchronization.  Never a counting authority -- RIGHT_UP alone
 # decides the count -- so a missing file degrades capability, never the count.
 MODEL_TOP_CLASSIFICATION  = "top_classification.pt"
+#: LEFT_UP_TOP's OWN classifier. Listed here so core.model_sync fetches it from
+#: the configured store like every other model; WHICH camera uses it is decided
+#: by the single existing mapping, wagon_count/train_structure.py's
+#: CAMERA_CLASSIFICATION_MODEL, not here.
+MODEL_LEFT_UP_TOP_CLASSIFICATION = "ltop.pt"
 
 
 # -----------------------------------------------------------------------------
@@ -168,7 +173,15 @@ RECON_MODEL_FILES = (
 # labelling gracefully when absent, so it is optional -- but it still LIVES in
 # models/reconstruction/, which is what makes its filename collide with the
 # extraction tree below.
-RECON_OPTIONAL_MODEL_FILES = (MODEL_TOP_CLASSIFICATION,)
+#: `ltop.pt` sits alongside `top_classification.pt` and is optional for the same
+#: reason: top-camera classification REFINES the run (it keeps engine/brake-van
+#: segments out of wagon synchronization and labels them in the overlays) but is
+#: never a counting authority -- RIGHT_UP alone decides the count. A run without
+#: it continues with a note and an unchanged wagon count, which is why this is
+#: not promoted to RECON_MODEL_FILES. It is still SYNCED, so a store that has it
+#: gets it; what is forbidden is substituting the other top camera's classifier.
+RECON_OPTIONAL_MODEL_FILES = (MODEL_TOP_CLASSIFICATION,
+                              MODEL_LEFT_UP_TOP_CLASSIFICATION)
 
 # EXTRACTION classify models -- required ONLY when the pipeline source is `raw`
 # (the orchestrator cuts its own trimmed clips).  Same filenames as two of the
@@ -467,6 +480,20 @@ ML_API_SECRET = _env("WAGONEYE_ML_API_SECRET", "your-ml-callback-secret-key")
 # The `version` value carried in each per-camera inspection document.  The
 # dashboard chooses which tab renders the report from this: "v1" -> V1 tab.
 INSPECTION_VERSION = _env("WAGONEYE_INSPECTION_VERSION", "v1")
+
+# Rake settlement.  Clusters already-ingested InspectionRun records into
+# 7-minute rake windows, assigns rake_id, and pairs loaded<->empty clusters by
+# shared 11-digit wagon numbers.  It does NOT ingest anything: it operates on
+# what ingest has already delivered, which is why it runs AFTER delivery.
+#
+# `dry_run` defaults to TRUE in that API, so a call that omits it previews and
+# writes nothing -- and returns 200 while doing so.  delivery/rake_settle.py
+# always sends it explicitly for that reason.
+SETTLE_API_URL = _env(
+    "WAGONEYE_SETTLE_API_URL",
+    "https://ms-pnr-location-notification-api.suvidhaen.com/"
+    "cctv-watcher/settle",
+)
 
 UPLOAD_API_URL = _env("WAGONEYE_UPLOAD_API_URL",
                       "https://reports-api.suvidhaen.com/api/upload-pdf")

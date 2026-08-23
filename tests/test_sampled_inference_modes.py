@@ -394,13 +394,16 @@ class TestStage1IsUntouched(unittest.TestCase):
                          f"Stage-1/protected files modified: {offenders}")
 
     def test_counting_engine_entry_point_untracked_changes_none(self):
-        import subprocess
-        r = subprocess.run(["git", "status", "--porcelain", "wagon_count"],
-                           cwd=V4_ROOT, capture_output=True, text=True)
-        if r.returncode != 0:
+        """Routed through the shared `changed_paths` helper, not a private
+        `git status`: a reviewed-and-waived change must be waived for EVERY
+        guard, or the allow-list means nothing and the honest move (declare the
+        file and say why) is punished while editing a different file is not."""
+        from _engine_harness import changed_paths
+        changed = changed_paths("wagon_count")
+        if changed is None:
             self.skipTest("git unavailable")
-        self.assertEqual(r.stdout.strip(), "",
-                         "wagon_count/ has uncommitted modifications")
+        self.assertEqual(changed, [],
+                         f"wagon_count/ has unreviewed modifications: {changed}")
 
 
 if __name__ == "__main__":

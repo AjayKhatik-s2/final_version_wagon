@@ -478,9 +478,13 @@ class TestOperatorStoreNames(unittest.TestCase):
     """
 
     #: Verified by `aws s3 ls s3://complete-train/new_local/`.
+    #: `ltop.pt` added 2026-08-23 -- LEFT_UP_TOP's own gap model. Confirmed
+    #: present at s3://complete-train/new_local/ltop.pt, which is byte-for-byte
+    #: the URI core.model_sync resolves for it.
     STORE = {"door_state.pt", "left_up_wagon_gap.pt", "load.pt",
              "right_up_wagon_gap.pt", "side_classification.pt",
-             "top_classification.pt", "top_damage.pt", "top_gap.pt"}
+             "top_classification.pt", "top_damage.pt", "top_gap.pt",
+             "ltop.pt"}
 
     def test_accepted_alternatives_cover_the_store_names(self):
         self.assertEqual(C.FEATURE_MODEL_LEGACY[C.MODEL_LOADED], "load.pt")
