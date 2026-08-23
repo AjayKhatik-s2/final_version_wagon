@@ -235,6 +235,32 @@ REVIEWED_IN_WORKTREE = (
     "reporting/combined_train_report.py",   # symmetric camera-scoped panels
     "reporting/camera_reports.py",          # own-camera load snapshot only
     "reporting/_evidence_lookup.py",        # + evidence_snapshot_for_camera()
+
+    # Report COMPLETENESS, reviewed 2026-08-22. Both files selected the report's
+    # wagons with a silent filter over the canonical timeline:
+    #
+    #   combined_train_report:  [unified[w.global_id] for w in state.wagons
+    #                            if w.global_id in unified]
+    #   _adapter:               [u for u in (unified.get(w.global_id)
+    #                            for w in state.wagons) if u]
+    #
+    # Right source and right order, but a wagon absent from `unified` vanished
+    # from doc["wagons"], from summary, from evidence_pages and from the KPI
+    # state counts -- with nothing logged, so an incomplete report looked exactly
+    # like a short train. A wagon with no feature result is still a wagon.
+    #
+    # The canonical Global Wagon timeline is now the iteration source in both,
+    # with any absent state synthesized by the MATERIALIZER'S OWN `_fuse_one`
+    # (every feature None -- its existing "no observations" path), so no second
+    # wagon-counting system exists and the placeholder cannot drift from a real
+    # state. `audit_report_integrity` then checks set, order and multiplicity
+    # before rendering.
+    #
+    # No change to Stage 1, the RIGHT_UP master timeline, global wagon identity,
+    # fusion logic, feature inference, thresholds, snapshot selection, camera
+    # evidence isolation or engine-frame handling.
+    # See tests/test_report_completeness.py.
+    "reporting/_adapter.py",                # canonical-driven KPI counts
 )
 
 

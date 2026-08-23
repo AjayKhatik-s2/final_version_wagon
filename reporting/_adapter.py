@@ -164,7 +164,20 @@ def build_legacy_view_model(
     """Compose the legacy report inputs from v4 backend state."""
     vm = LegacyViewModel(missing_cameras=list(missing_cameras))
 
-    wagons_in_order = [u for u in (unified.get(w.global_id) for w in state.wagons) if u]
+    # Every canonical wagon, never only those with feature results. The `if u`
+    # this replaces silently excluded a wagon absent from `unified` from the
+    # KPI/state counts, so the Detection Summary could disagree with the wagon
+    # table below it on the same page. A wagon with no feature result is still a
+    # real wagon; its states are simply NO_DATA, which the counters already
+    # handle. Built by the materializer's own `_fuse_one` so the placeholder
+    # cannot drift from a real state.
+    wagons_in_order = []
+    for w in state.wagons:
+        u = unified.get(w.global_id)
+        if u is None:
+            from fusion.wagon_state_builder import _fuse_one
+            u = _fuse_one(w, door=None, ocr=None, load=None, damage=None)
+        wagons_in_order.append(u)
 
     # State counts -- used by per-feature Detection Summary tables
     sc: Dict[str, int] = {
@@ -217,7 +230,14 @@ def build_legacy_view_model(
     for idx, gw in enumerate(state.wagons, start=1):
         u = unified.get(gw.global_id)
         if u is None:
-            continue
+            # `continue` here is what shortened the WAGON INSPECTION DETAILS
+            # table: a canonical wagon with no fused state was skipped, and
+            # because `idx` comes from enumerate the rows after it also carried
+            # the wrong SR.NO. A wagon with no feature result is still a wagon --
+            # render it with its NO_DATA states, which every column below
+            # already handles ("NO DOOR DETECTED", and so on).
+            from fusion.wagon_state_builder import _fuse_one
+            u = _fuse_one(gw, door=None, ocr=None, load=None, damage=None)
         is_non_wagon = u.classification in (C.CLASS_ENGINE, C.CLASS_BRAKE_VAN)
         is_loaded    = (u.load_status == C.LOAD_LOADED)
 

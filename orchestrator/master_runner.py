@@ -394,6 +394,8 @@ def process_batch(
         # no invented ids, none dropped.
         _roster_ids = [gw.global_id for gw in recon.state.wagons]
         _fused_ids = set(out.unified)
+        print(f"[REPORT-AUDIT] master timeline wagons={len(_roster_ids)}")
+        print(f"[REPORT-AUDIT] fused/materialized wagons={len(_fused_ids)}")
         if _fused_ids != set(_roster_ids):
             raise RuntimeError(
                 f"fusion changed the wagon set: "

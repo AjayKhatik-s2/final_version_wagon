@@ -454,6 +454,24 @@ def assemble(
                                         verbose=verbose)
     res.timings["fusion_state"] = round(time.perf_counter() - t0, 3)
 
+    # Fusion must produce exactly one UnifiedWagonState per global wagon -- no
+    # invented ids, none dropped. Batch mode has enforced this since it was
+    # written (master_runner, "fusion changed the wagon set"); the sequential
+    # path had NO such check, so a wagon lost here would simply have been absent
+    # downstream with nothing said. Same invariant, same failure, both modes.
+    _roster_ids = [gw.global_id for gw in state.wagons]
+    _fused_ids = set(unified)
+    print(f"[REPORT-AUDIT] master timeline wagons={len(_roster_ids)}")
+    print(f"[REPORT-AUDIT] fused/materialized wagons={len(_fused_ids)}")
+    if _fused_ids != set(_roster_ids):
+        _missing = sorted(set(_roster_ids) - _fused_ids)
+        _extra = sorted(_fused_ids - set(_roster_ids))
+        print(f"[REPORT-AUDIT] SEVERE: fusion changed the wagon set -- "
+              f"missing={_missing} unexpected={_extra}", file=sys.stderr)
+        raise RuntimeError(
+            f"fusion changed the wagon set: missing={_missing[:5]} "
+            f"unexpected={_extra[:5]}")
+
     # ---- Stage 4b: feature overlay rendering ----------------------------
     # The SAME renderer batch mode calls, with the same arguments -- sequential
     # used to skip this entirely, which left `detected_video_url` empty in every

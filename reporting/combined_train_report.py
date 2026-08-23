@@ -97,6 +97,128 @@ def _evidence_pages(evidence_root: Optional[str], wagons) -> Dict[str, Dict[str,
     return pages
 
 
+#: Prefix for the completeness audit. Grepping this in a run log gives the wagon
+#: count at every stage the report touches, plus the exact ids at any mismatch.
+_AUDIT = "[REPORT-AUDIT]"
+
+
+def _strict_integrity() -> bool:
+    """Whether a report-integrity mismatch should RAISE.
+
+    Off by default: a train that got this far should still deliver what it has,
+    and the diagnostic names every offending id either way. Set
+    WAGONEYE_REPORT_STRICT=1 to make a mismatch fail the train, which is what
+    you want in CI or while chasing a regression.
+    """
+    return (os.getenv("WAGONEYE_REPORT_STRICT") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def canonical_wagons(
+    state: GlobalTrainState, unified: Dict[str, UnifiedWagonState],
+) -> "tuple":
+    """`(wagons_in_order, synthesized_ids)` -- EVERY canonical wagon, in order.
+
+    The canonical Global Wagon timeline is the iteration source, never the set of
+    wagons that happen to have feature results. `state.wagons` is that timeline:
+    RIGHT_UP's authoritative master ordering, which this function reads and does
+    not recompute -- there is no second wagon-counting system here.
+
+    What this replaces mattered:
+
+        [unified[w.global_id] for w in state.wagons if w.global_id in unified]
+
+    Right source, right order, and a silent `if`. A wagon absent from `unified`
+    vanished from `doc["wagons"]`, from `summary`, and from `evidence_pages`,
+    with nothing logged -- so an incomplete report was indistinguishable from a
+    short train.
+
+    A wagon with no feature result is still a real wagon. Rather than drop it, a
+    state is synthesized from the GlobalWagon alone by the materializer's OWN
+    `_fuse_one` with every feature None -- which is exactly its "no observations"
+    path, so the placeholder is built by the same code as every other wagon and
+    cannot drift from it. Its ids are returned so the caller can report them
+    instead of hiding them.
+
+    Absence of a supporting camera, an all-OK feature state and a missing
+    snapshot are NOT reasons to omit a wagon; they are things to render.
+    """
+    synthesized: List[str] = []
+    out: List[UnifiedWagonState] = []
+    for w in state.wagons:
+        u = unified.get(w.global_id)
+        if u is None:
+            from fusion.wagon_state_builder import _fuse_one
+            u = _fuse_one(w, door=None, ocr=None, load=None, damage=None)
+            synthesized.append(w.global_id)
+        out.append(u)
+    return out, synthesized
+
+
+def audit_report_integrity(
+    *, state: GlobalTrainState, wagons_in_order: Sequence[UnifiedWagonState],
+    unified: Optional[Dict[str, UnifiedWagonState]] = None,
+    synthesized: Optional[Sequence[str]] = None,
+    strict: bool = False, verbose: bool = True,
+) -> Dict[str, Any]:
+    """Verify the report covers the canonical timeline exactly, and say so.
+
+    Checks the SET, the ORDER and the MULTIPLICITY, because the three fail
+    differently: a filtered iteration drops ids, a reordered one renumbers later
+    wagons, and a merge bug duplicates. Counting alone catches none of them
+    reliably -- two drops and one duplicate still total N.
+
+    Returns the audit. On mismatch it logs every offending id (not just counts)
+    at high severity, and raises when `strict`. It never silently passes.
+    """
+    canonical = [w.global_id for w in state.wagons]
+    reported = [u.global_id for u in wagons_in_order]
+    missing = [g for g in canonical if g not in set(reported)]
+    extra = [g for g in reported if g not in set(canonical)]
+    seen: Dict[str, int] = {}
+    for g in reported:
+        seen[g] = seen.get(g, 0) + 1
+    duplicated = sorted(g for g, n in seen.items() if n > 1)
+    ordered = reported == canonical
+
+    audit = {
+        "canonical_wagons": len(canonical),
+        "report_wagons": len(reported),
+        "missing_from_report": missing,
+        "extra_in_report": extra,
+        "duplicated_in_report": duplicated,
+        "order_matches_master_timeline": ordered,
+        "synthesized_no_evidence": list(synthesized or []),
+        "fused_wagons": (len(unified) if unified is not None else None),
+        "ok": not missing and not extra and not duplicated and ordered,
+    }
+
+    if verbose:
+        print(f"{_AUDIT} canonical (master timeline) wagons="
+              f"{audit['canonical_wagons']}")
+        if unified is not None:
+            print(f"{_AUDIT} fused/materialized wagons={len(unified)}")
+        print(f"{_AUDIT} combined-report input wagons={audit['report_wagons']}")
+        if audit["synthesized_no_evidence"]:
+            print(f"{_AUDIT} rendered with no feature evidence "
+                  f"({len(audit['synthesized_no_evidence'])}): "
+                  f"{audit['synthesized_no_evidence']}")
+
+    if not audit["ok"]:
+        detail = (f"missing_from_report={missing} extra_in_report={extra} "
+                  f"duplicated_in_report={duplicated} "
+                  f"order_matches_master_timeline={ordered}")
+        print(f"{_AUDIT} SEVERE: report does not match the canonical Global "
+              f"Wagon Timeline -- {detail}")
+        if strict:
+            raise RuntimeError(
+                f"combined report integrity check failed: {detail}")
+    elif verbose:
+        print(f"{_AUDIT} OK: every canonical wagon present exactly once, in "
+              f"master order")
+    return audit
+
+
 def _build_json(
     *,
     state: GlobalTrainState,
@@ -108,8 +230,7 @@ def _build_json(
     evidence_root: Optional[str] = None,
     legacy_view_model: Optional[_adapter.LegacyViewModel] = None,
 ) -> Dict[str, Any]:
-    wagons_in_order = [unified[w.global_id] for w in state.wagons
-                       if w.global_id in unified]
+    wagons_in_order, _synth = canonical_wagons(state, unified)
     summary = summarize_wagons(wagons_in_order)
     doc: Dict[str, Any] = {
         "schema":      _REPORT_SCHEMA,
@@ -123,6 +244,11 @@ def _build_json(
             "processed_video_urls":dict(processed_video_urls or {}),
         },
         "summary": summary,
+        # Machine-readable completeness record, so a consumer can tell a short
+        # train from a short report without re-deriving it.
+        "report_integrity": audit_report_integrity(
+            state=state, wagons_in_order=wagons_in_order, unified=unified,
+            synthesized=_synth, strict=False, verbose=False),
         "stage0_fallback_used":    state.fallback_used,
         "stage0_fallback_reason":  state.fallback_reason,
         "stage0_corrections_applied": list(state.corrections_applied),
@@ -1250,10 +1376,20 @@ def build(
     """Stage 5 public entry.  Writes JSON always; PDF if reportlab is OK.
 
     Returns:
-        {"json_path": "...", "pdf_path": "..." | None}
+        {"json_path": "...", "pdf_path": "..." | None,
+         "report_integrity": {...}}   # completeness vs the canonical timeline
     """
     os.makedirs(output_dir, exist_ok=True)
     missing_cameras = list(missing_cameras or [])
+
+    # Completeness audit BEFORE rendering, so an incomplete report is reported
+    # as such rather than produced silently. `strict` is opt-in: a train that
+    # reached Stage 5 should still deliver whatever it has, and a loud
+    # high-severity diagnostic naming the ids beats refusing to write anything.
+    _wagons_in_order, _synth = canonical_wagons(state, unified)
+    integrity = audit_report_integrity(
+        state=state, wagons_in_order=_wagons_in_order, unified=unified,
+        synthesized=_synth, strict=_strict_integrity(), verbose=verbose)
 
     # Always build the view-model.  Even if the PDF fails, the JSON has it.
     vm = _adapter.build_legacy_view_model(
@@ -1300,4 +1436,5 @@ def build(
 
     if verbose:
         print(f"[STAGE5] done in {time.time() - t0:.1f}s")
-    return {"json_path": json_path, "pdf_path": pdf_path}
+    return {"json_path": json_path, "pdf_path": pdf_path,
+            "report_integrity": integrity}
