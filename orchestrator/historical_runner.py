@@ -767,6 +767,15 @@ def run(
                 # old input-only reclaim still applies -- there is nothing to
                 # verify, and `downloads/` is re-stageable regardless.
                 if deliver:
+                    # Settle BEFORE reclaiming, so the rake grouping is updated
+                    # while the train's artifacts are still on disk -- if
+                    # settlement reveals a problem, everything needed to look at
+                    # it is still there. Settlement never fails a train: a
+                    # delivered train is delivered, and settle is re-runnable
+                    # with the command its own failure line prints.
+                    from delivery import rake_settle as RS
+                    RS.settle_batch(batch_key=batch.batch_key, verbose=verbose)
+
                     from delivery import cleanup as CU
                     CU.cleanup_batch(
                         batch_root=batch_root, batch_key=batch.batch_key,
@@ -816,6 +825,15 @@ def run(
             # twice.  And when `deliver` is False, `skip_upload=True` makes
             # `process_batch` return before Stage 6 / 6b, so a non-delivering
             # historical run reaches no external endpoint at all.
+            #
+            # Settlement is the exception, and only when delivering: it is not
+            # part of `process_batch`, it acts on runs ingest has ALREADY
+            # written, and it is what leaves the rake grouping current instead
+            # of waiting for someone to run it by hand. Same call, same
+            # never-fails-a-train contract, as the sequential branch above.
+            if deliver:
+                from delivery import rake_settle as RS
+                RS.settle_batch(batch_key=batch.batch_key, verbose=verbose)
             _cleanup_inputs(batch_root, keep_inputs=keep_inputs)
         else:
             failures.append(batch.batch_key)
