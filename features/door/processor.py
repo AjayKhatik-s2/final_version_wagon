@@ -576,24 +576,61 @@ def _pick_side_state(track_decisions: List[Dict[str, Any]]) -> Tuple[str, float]
     return C.NO_DATA, 0.0
 
 
+def evidence_label(frame_state: str, confidence: float, *,
+                   matched: bool, reported_state: str) -> str:
+    """The text stamped on a door snapshot.
+
+    It states what THIS FRAME shows. When that differs from the state the wagon
+    is reported as having, it says so, because the two can legitimately differ:
+    `run` sets a side to CLOSED at confidence 0.0 whenever the tracker confirms
+    no track, and `_resolve_evidence` then has no CLOSED frame to show and falls
+    back to whatever was captured.
+
+    That combination produced a report page reading "Left Door: CLOSED" beside a
+    picture stamped "DAMAGED 0.90" -- a raw detection the tracker never
+    confirmed, illustrating a verdict that was a default rather than a
+    measurement. Neither half was wrong alone; together they contradicted each
+    other and gave the reader nothing to decide with.
+
+    An unconfirmed detection is still worth showing. It is worth showing as
+    unconfirmed.
+    """
+    label = f"{frame_state or '?'} {float(confidence or 0.0):.2f}"
+    if matched:
+        return label
+    return f"{label} UNCONFIRMED (reported {reported_state or '?'})"
+
+
 def _resolve_evidence(
     cands: Dict[str, "BestFrameTracker"], reported_state: str,
-) -> "BestFrameTracker":
-    """Pick the evidence frame for one side.
+) -> "tuple":
+    """`(frame, matched)` -- the evidence frame for one side, and whether it
+    actually SHOWS the reported state.
 
-    Prefer the highest snapshot-quality frame that actually shows the wagon's
-    reported side-state (anomaly-central: an OPEN/DAMAGED snapshot for an
-    OPEN/DAMAGED door).  If no frame of that state was captured, fall back to
-    the globally best-scored frame on the camera.
+    Prefer the highest snapshot-quality frame that shows the wagon's reported
+    side-state (anomaly-central: an OPEN/DAMAGED snapshot for an OPEN/DAMAGED
+    door).  If no frame of that state was captured, fall back to the globally
+    best-scored frame on the camera.
+
+    `matched` exists because the fallback is not cosmetic. The reported state
+    can be a DEFAULT rather than a measurement: when the tracker confirms no
+    track at all, `run` sets the side to CLOSED at confidence 0.0. If the only
+    captured frame carried an unconfirmed DAMAGED detection, this returns that
+    frame -- and labelling it with its own state produced a report page reading
+    "Left Door: CLOSED" beside a picture stamped "DAMAGED 0.90".
+
+    Neither half was wrong on its own terms; together they contradicted each
+    other with nothing to say which to believe. The caller uses `matched` to
+    label the picture honestly instead.
     """
     bucket = cands.get(reported_state)
     if bucket is not None and bucket.has_data():
-        return bucket
+        return bucket, True
     best = BestFrameTracker()
     for b in cands.values():
         if b.has_data() and b.score > best.score:
             best = b
-    return best
+    return best, False
 
 
 # -----------------------------------------------------------------------------
@@ -727,8 +764,8 @@ def run(
             # Resolve the evidence frame per side now that the reported state
             # is known: prefer the best-quality frame that shows that state
             # (anomaly-central), else the globally best-scored frame.
-            l_best = _resolve_evidence(l_cands, l_state)
-            r_best = _resolve_evidence(r_cands, r_state)
+            l_best, l_matched = _resolve_evidence(l_cands, l_state)
+            r_best, r_matched = _resolve_evidence(r_cands, r_state)
 
             # Persist evidence: best left + right door snapshot (full
             # frame + bbox crop) into evidence/<gw>/door/.
@@ -738,20 +775,30 @@ def run(
                 meta: Dict[str, Any] = {"global_id": gw_id,
                                         "feature": FEATURE_NAME,
                                         "sides": {}}
-                for side_key, side_best, cam in (
-                    ("left",  l_best, C.CAMERA_LEFT_UP),
-                    ("right", r_best, C.CAMERA_RIGHT_UP),
+                for side_key, side_best, cam, matched, reported in (
+                    ("left",  l_best, C.CAMERA_LEFT_UP,  l_matched, l_state),
+                    ("right", r_best, C.CAMERA_RIGHT_UP, r_matched, r_state),
                 ):
                     if not side_best.has_data():
                         continue
                     full_p = os.path.join(ev_dir, f"{side_key}_best.jpg")
                     crop_p = os.path.join(ev_dir, f"{side_key}_crop.jpg")
-                    # full frame with annotation drawn for the report
+                    # Full frame, annotated for the report.
+                    #
+                    # The label says what this FRAME shows. When that differs
+                    # from the state the wagon is REPORTED as having, it is
+                    # marked UNCONFIRMED and the reported state is named, so the
+                    # picture can no longer appear to contradict the row and the
+                    # table beside it. A detection the tracker did not confirm
+                    # is worth showing -- it is worth showing as unconfirmed.
+                    _label = evidence_label(
+                        side_best.meta.get("state", "?"),
+                        side_best.meta.get("confidence", 0.0),
+                        matched=matched, reported_state=reported)
                     annotated = draw_annotated_bbox(
                         side_best.frame, side_best.bbox,
-                        label=f"{side_best.meta.get('state','?')} "
-                              f"{side_best.meta.get('confidence',0.0):.2f}",
-                        color=(0, 255, 255),
+                        label=_label,
+                        color=(0, 255, 255) if matched else (0, 165, 255),
                     )
                     save_jpeg(full_p, annotated)
                     crop_img = safe_crop(side_best.frame, side_best.bbox, pad=12)
@@ -768,6 +815,13 @@ def run(
                         "confidence": side_best.meta.get("confidence"),
                         "raw_class":  side_best.meta.get("raw_class"),
                         "quality":    side_best.meta.get("quality"),
+                        # Does this picture actually show the reported state?
+                        # False means it is a fallback: no frame of the reported
+                        # state was captured, so a consumer must not read the
+                        # snapshot as evidence OF that state.
+                        "reported_state":         reported,
+                        "matches_reported_state": bool(matched),
+                        "evidence_is_fallback":   not bool(matched),
                     }
                 write_metadata(os.path.join(ev_dir, "metadata.json"), meta)
 
