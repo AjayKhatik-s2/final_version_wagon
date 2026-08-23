@@ -482,36 +482,95 @@ def _bounding_box(bbox: Optional[Sequence[float]], *, schema: str,
     }
 
 
+#: How far to search when recovering a damage snapshot positionally. The damage
+#: processor numbers tracks from 1 within a wagon and a wagon with more than a
+#: handful of distinct damage tracks does not occur in practice.
+_MAX_DAMAGE_TRACK_PROBE = 12
+
+
 def _damage_track_url(url_for: Callable[..., Optional[str]], gw_id: str,
-                     camera: str, raw_idx: Any) -> Optional[str]:
+                      camera: str, track: Dict[str, Any],
+                      claimed: Optional[set] = None) -> Optional[str]:
     """URL for one damage track's snapshot, or None -- never an exception.
 
-    `track_idx` is not guaranteed to be a usable integer. Real evidence trees
-    carry ``"track_idx": null``, and `dict.get(key, 1)` does NOT default in that
-    case: the default applies only when the KEY IS ABSENT, so a present-but-null
-    index arrives here as None. Handing that to `damage_track_slot` raises
-    TypeError from `int(None)`.
+    Resolution is by DISCOVERY, not by arithmetic, because the index is the one
+    field that has proved unreliable and the picture is worth more than the
+    bookkeeping. In production this wagon showed the failure exactly:
 
-    This is not hypothetical. It took out the WHOLE top-camera document for four
-    trains in production -- the exception escaped the per-track loop, the
-    document build failed, and only the two side cameras reached the dashboard.
-    An image URL is the least important field in the document; it must never be
-    able to sink the other 57 wagons' worth of findings with it.
+        wagon_frames   -> .../damage/track_1__LEFT_UP_TOP.jpg     (found)
+        problem_frames -> null                                     (lost)
 
-    So: one unusable track costs that track's picture and nothing else.
+    Same wagon, same camera, same file. `wagon_frames` brute-forces the fixed
+    names `track_1..3__<CAM>`; `problem_frames` computed the name from
+    `track_idx`, which had been nulled upstream. One strategy survived a bad
+    field and the other did not, so this now uses the surviving one.
+
+    Order: the track's own index first, since that is the correct answer when
+    the field is sound; then each index in turn, skipping any file an earlier
+    track in this wagon already claimed, so two tracks never publish one photo;
+    then the legacy unscoped name, which is safe because `_project_camera_view`
+    has already dropped every track belonging to another camera.
+
+    `track_idx` may be absent, null, or non-numeric -- `int(None)` raising here
+    is what failed four trains' entire top-camera documents. One unusable track
+    must cost that track's picture and nothing else.
     """
+    claimed = claimed if claimed is not None else set()
+
+    def _try(idx: int) -> Optional[str]:
+        slot = damage_track_slot(idx, camera)
+        if slot in claimed:
+            return None
+        u = url_for(gw_id=gw_id, feature="damage", camera=camera,
+                    filename=f"{slot}.jpg")
+        if u:
+            claimed.add(slot)
+        return u
+
     try:
-        idx = int(raw_idx)
+        own = int(track.get("track_idx"))
     except (TypeError, ValueError):
-        return None
-    # `_project_camera_view` has already dropped every track whose `camera_id`
-    # is not this camera, so the legacy unscoped name is a safe LAST resort:
-    # reaching it means this camera owns the track. It exists only for evidence
-    # trees written before the slots carried the camera.
-    return (url_for(gw_id=gw_id, feature="damage", camera=camera,
-                    filename=f"{damage_track_slot(idx, camera)}.jpg")
-            or url_for(gw_id=gw_id, feature="damage", camera=camera,
-                       filename=f"{legacy_damage_track_slot(idx)}.jpg"))
+        own = None
+    if own is not None:
+        got = _try(own)
+        if got:
+            return got
+
+    for idx in range(1, _MAX_DAMAGE_TRACK_PROBE + 1):
+        if idx == own:
+            continue
+        got = _try(idx)
+        if got:
+            return got
+
+    if own is not None:
+        legacy = legacy_damage_track_slot(own)
+        if legacy not in claimed:
+            u = url_for(gw_id=gw_id, feature="damage", camera=camera,
+                        filename=f"{legacy}.jpg")
+            if u:
+                claimed.add(legacy)
+                return u
+    return None
+
+
+def _damage_frame_number(track: Dict[str, Any]) -> Optional[int]:
+    """The frame this damage was best seen in.
+
+    The damage processor records it as `best_frame_idx`
+    (features/damage/processor.py's `track_meta`); there is no `frame_idx` key,
+    so reading that one alone published `frame_number: null` for every damage
+    problem frame. Both names are accepted -- the state record's
+    `top_damage_details` does use `frame_idx`.
+    """
+    for key in ("best_frame_idx", "frame_idx"):
+        try:
+            v = track.get(key)
+            if v is not None:
+                return int(v)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _problem_frame(*, wagon_count: Optional[int], segment_type: str,
@@ -749,16 +808,19 @@ def build_inspection_json(
 
             # ---- problem frames: one per confirmed damage track ----
             dmeta = _evidence_meta(evidence_root, gw_id, "damage", camera)
+            # Per WAGON: two tracks on one wagon must not publish the same photo.
+            claimed_damage_slots: set = set()
             for track in (dmeta.get("tracks") or []):
                 cls = str(track.get("class_name") or "damage").lower()
                 ptype = _V4_TOP_PROBLEM_TYPE.get(cls, cls)
                 _bump(ptype)
-                dmg_url = _damage_track_url(url_for, gw_id, camera,
-                                            track.get("track_idx"))
+                dmg_url = _damage_track_url(url_for, gw_id, camera, track,
+                                            claimed_damage_slots)
                 problem_frames.append(_problem_frame(
                     wagon_count=wagon_count, segment_type=display,
                     segment_number=segment_type_map[str(seg_id)].get("number"),
-                    problem_type=ptype, frame_number=track.get("frame_idx"),
+                    problem_type=ptype,
+                    frame_number=_damage_frame_number(track),
                     url=dmg_url,
                     bbox=track.get("bbox"), schema=schema,
                     confidence=track.get("best_confidence", track.get("confidence")),

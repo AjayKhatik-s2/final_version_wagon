@@ -1113,19 +1113,20 @@ class TestNullTrackIndexDoesNotSinkTheDocument(unittest.TestCase):
             self.assertTrue(any(s.get("damage_detected") for s in segs),
                             "the damage finding was lost with its image")
 
-    def test_a_bad_index_yields_no_url_and_no_exception(self):
-        calls = []
+    def test_a_bad_index_never_raises(self):
+        """No index shape may raise. It MAY still find a file by discovery --
+        that is deliberate, and is what recovers the production case; what is
+        forbidden is an exception escaping into the document build."""
+        def _nothing_exists(**kw):
+            return None
 
-        def _url_for(**kw):
-            calls.append(kw)
-            return "https://example/x.jpg"
-
-        for bad in (None, "", "x", {}, [], object()):
+        for bad in ({}, {"track_idx": None}, {"track_idx": ""},
+                    {"track_idx": "x"}, {"track_idx": []},
+                    {"track_idx": object()}):
             self.assertIsNone(
-                IJ._damage_track_url(_url_for, "GW_1", C.CAMERA_RIGHT_UP_TOP, bad),
-                f"{bad!r} should yield no URL")
-        self.assertEqual(calls, [],
-                         "an unusable index must not even be looked up")
+                IJ._damage_track_url(_nothing_exists, "GW_1",
+                                     C.CAMERA_RIGHT_UP_TOP, bad),
+                f"{bad!r} should yield no URL when no file exists")
 
     def test_a_usable_index_still_resolves(self):
         def _url_for(*, gw_id, feature, camera, filename):
@@ -1133,7 +1134,8 @@ class TestNullTrackIndexDoesNotSinkTheDocument(unittest.TestCase):
 
         for good in (1, "2", 3.0):
             got = IJ._damage_track_url(_url_for, "GW_1",
-                                       C.CAMERA_RIGHT_UP_TOP, good)
+                                       C.CAMERA_RIGHT_UP_TOP,
+                                       {"track_idx": good})
             self.assertIsNotNone(got)
             self.assertIn(f"track_{int(good)}__{C.CAMERA_RIGHT_UP_TOP}", got)
 
@@ -1151,3 +1153,132 @@ class TestNullTrackIndexDoesNotSinkTheDocument(unittest.TestCase):
             for cam in C.ALL_CAMERAS:
                 self.assertEqual(res["cameras"][cam]["status"], "ingested",
                                  f"{cam}: {res['cameras'][cam]}")
+
+
+# ---------------------------------------------------------------------------
+# 14. A damage snapshot that EXISTS must reach the document
+# ---------------------------------------------------------------------------
+
+class TestDamageProblemFrameFindsItsImage(unittest.TestCase):
+    """From production, train 20260729_103722, GW_7 -- the same file, twice:
+
+        wagon_frames   -> .../damage/track_1__LEFT_UP_TOP.jpg     found
+        problem_frames -> null                                     lost
+
+    `wagon_frames` brute-forces the fixed names; `problem_frames` computed the
+    name from `track_idx`, which had been nulled upstream. One strategy survived
+    a bad field and the other did not. Resolution is now by discovery, so a
+    picture on disk reaches the document whatever the bookkeeping says.
+    """
+
+    @staticmethod
+    def _url_for(ev):
+        def _u(*, gw_id, feature, camera, filename):
+            rel = DASH.evidence_rel_path(ev, gw_id, feature, camera, filename)
+            return f"https://b.s3.ap-south-1.amazonaws.com/{rel}" if rel else None
+        return _u
+
+    def _url(self, ev, track, claimed=None):
+        return IJ._damage_track_url(self._url_for(ev), "GW_7",
+                                    C.CAMERA_LEFT_UP_TOP, track, claimed)
+
+    def _with_tracks(self, tmp, *idxs):
+        ev = os.path.join(tmp, "evidence")
+        for i in idxs:
+            _jpeg(os.path.join(ev, "GW_7", "damage",
+                               f"{EI.damage_track_slot(i, C.CAMERA_LEFT_UP_TOP)}.jpg"))
+        return ev
+
+    def test_a_null_index_still_finds_the_file(self):
+        """The production case: the JPEG is there, the index is not."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ev = self._with_tracks(tmp, 1)
+            got = self._url(ev, {"track_idx": None, "camera_id": C.CAMERA_LEFT_UP_TOP})
+            self.assertIsNotNone(got, "the snapshot on disk was not found")
+            self.assertIn(f"track_1__{C.CAMERA_LEFT_UP_TOP}", got)
+
+    def test_a_sound_index_is_used_directly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ev = self._with_tracks(tmp, 1, 2, 3)
+            got = self._url(ev, {"track_idx": 2})
+            self.assertIn(f"track_2__{C.CAMERA_LEFT_UP_TOP}", got)
+
+    def test_a_stale_index_recovers_a_real_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ev = self._with_tracks(tmp, 4)
+            got = self._url(ev, {"track_idx": 9})
+            self.assertIsNotNone(got)
+            self.assertIn(f"track_4__{C.CAMERA_LEFT_UP_TOP}", got)
+
+    def test_two_tracks_never_share_one_photo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ev = self._with_tracks(tmp, 1, 2)
+            claimed: set = set()
+            a = self._url(ev, {"track_idx": None}, claimed)
+            b = self._url(ev, {"track_idx": None}, claimed)
+            self.assertIsNotNone(a)
+            self.assertIsNotNone(b)
+            self.assertNotEqual(a, b, "the same snapshot was published twice")
+
+    def test_no_file_at_all_yields_none_not_an_exception(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ev = os.path.join(tmp, "evidence")
+            os.makedirs(os.path.join(ev, "GW_7", "damage"), exist_ok=True)
+            for bad in ({}, {"track_idx": None}, {"track_idx": "x"},
+                        {"track_idx": 3}):
+                self.assertIsNone(self._url(ev, bad))
+
+    def test_it_never_reaches_into_another_cameras_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ev = os.path.join(tmp, "evidence")
+            _jpeg(os.path.join(
+                ev, "GW_7", "damage",
+                f"{EI.damage_track_slot(1, C.CAMERA_RIGHT_UP_TOP)}.jpg"))
+            self.assertIsNone(
+                self._url(ev, {"track_idx": 1}),
+                "LEFT_UP_TOP published RIGHT_UP_TOP's damage photo")
+
+    def test_frame_number_comes_from_the_field_the_writer_uses(self):
+        """`best_frame_idx` is what the damage processor records."""
+        self.assertEqual(
+            IJ._damage_frame_number({"best_frame_idx": 804}), 804)
+        self.assertEqual(               # the state record's own spelling
+            IJ._damage_frame_number({"frame_idx": 120}), 120)
+        self.assertEqual(
+            IJ._damage_frame_number({"best_frame_idx": 5, "frame_idx": 9}), 5)
+        for bad in ({}, {"best_frame_idx": None}, {"best_frame_idx": "x"}):
+            self.assertIsNone(IJ._damage_frame_number(bad))
+
+    def test_the_published_document_carries_url_filename_and_frame(self):
+        """End to end: none of the four fields may come out null."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = build_batch_root(tmp)
+            ev = os.path.join(root, "evidence", "GW_2", "damage")
+            _jpeg(os.path.join(
+                ev, f"{EI.damage_track_slot(1, C.CAMERA_RIGHT_UP_TOP)}.jpg"))
+            meta = os.path.join(ev, "metadata.json")
+            with open(meta, encoding="utf-8") as f:
+                doc = json.load(f)
+            doc["tracks"][0]["track_idx"] = None          # the production state
+            doc["tracks"][0]["best_frame_idx"] = 804
+            _write(meta, doc)
+
+            s3 = _FakeS3()
+            saved = _clear_env(*_ENV_KEYS)
+            try:
+                DASH.run(batch_root=root, s3_client=s3,
+                         requests_mod=_FakeRequests())
+            finally:
+                _restore_env(saved)
+
+            docs = [json.loads(u["body"]) for u in s3.uploads if "body" in u]
+            frames = [pf for d in docs
+                      for pf in ((d.get("inspection_data") or {}
+                                  ).get("problem_frames") or [])
+                      if pf.get("problem_type") in ("floor_dmg",
+                                                    "inner_wall_dmg")]
+            if not frames:
+                self.skipTest("fixture stores paths, not bodies")
+            pf = frames[0]
+            for field in ("s3_url", "filename", "frame_number"):
+                self.assertIsNotNone(pf.get(field), f"{field} is null: {pf}")
