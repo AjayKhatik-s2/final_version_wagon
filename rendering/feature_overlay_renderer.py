@@ -18,9 +18,26 @@ the legacy WagonEye `_tracked.mp4` output as closely as possible:
           label bar and white "{class}: {conf}" text.
         * a green top-left info block: "Frame: N", "Damages: K", "Type: CLASS".
 
-There are NO v4-only HUD additions here: no info side panel, no magenta
-wagon-boundary flash, no bottom anomaly/gap banners, no OCR overlay -- none of
-those existed in old_system's processed videos.
+On top of that legacy layer, a v4 HUD is drawn on EVERY camera:
+    * cyan gap boxes, replayed from the Stage-1 tracking JSON;
+    * a magenta wagon-boundary flash + "GW_BOUNDARY" banner at each canonical
+      wagon start, matching the batch counting renderer;
+    * a translucent panel: frame, wagon-active-region state, the canonical
+      GW id / classification / position out of the total, the fused LOAD
+      verdict, live gap count and damage count;
+    * an "ACTIVE-REGION START/END" banner on the boundary frames.
+
+Every element is REPLAYED from artifacts already on disk. There is no second
+count and no second tracker: gap boxes come from the tracking JSON, wagon ids
+and boundaries from the canonical roster, the region from the master's own
+`wagon_window`, and the load verdict from the fused state. The gap interpolator
+is the counting engine's `_interp_gap_bbox`, CALLED rather than copied.
+
+One limitation, stated rather than papered over: LOAD has no per-frame boxes
+because the load processor never persisted per-frame detections -- only
+`load/best_frame.jpg` and a fused per-wagon status. Drawing per-frame load boxes
+would mean running inference again, which this module must never do, so the load
+verdict is shown per wagon in the panel instead.
 
 This module NEVER invokes any detector / YOLO / OCR model.  Every box is
 replayed from artifacts Stage 3 already persisted:
@@ -44,7 +61,7 @@ import os
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 
@@ -81,6 +98,11 @@ _DAMAGE_COLORS: Dict[str, Tuple[int, int, int]] = {
 }
 
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+#: Last render's per-camera audit, keyed by camera id. Written beside each mp4
+#: as `<CAMERA>_processed_render_audit.json` too, so the annotations on a video
+#: can be traced back to their source camera, tracks and canonical wagons.
+RENDER_AUDITS: Dict[str, Any] = {}
 
 
 # -----------------------------------------------------------------------------
@@ -360,6 +382,152 @@ def _transcode_to_h264(path: str, *, verbose: bool = False) -> bool:
     return False
 
 
+#: v4 HUD colours. Cyan gaps and a magenta boundary flash match the batch
+#: counting renderer (`wagon_count/video_segmenter.py`) so the two look alike.
+_GAP_COLOR = (255, 255, 0)
+_BOUNDARY_COLOR = (255, 0, 255)
+_REGION_COLOR = (0, 200, 255)
+_PANEL_BG = (0, 0, 0)
+
+
+_NONWAGON_COLOR = (0, 140, 255)
+_UNRESOLVED_COLOR = (0, 165, 255)
+
+
+def _non_wagon_spans(state: Any, src_fps: float, total: int,
+                     time_offset: float) -> List[Tuple[int, int, str, str]]:
+    """`(start_frame, end_frame, classification, position)` per non-wagon object.
+
+    Read from the master's `wagon_window`, which is where leading and trailing
+    ENGINE / BRAKE_VAN objects are already preserved with their frame ranges.
+    They are drawn so the video shows them as real, identified vehicles -- and
+    labelled as non-wagon, because they must never carry a GW id.
+    """
+    win = dict(getattr(state, "wagon_window", None) or {})
+    out: List[Tuple[int, int, str, str]] = []
+    if src_fps <= 0:
+        return out
+    for key, position in (("leading_non_wagon_objects", "leading"),
+                          ("trailing_non_wagon_objects", "trailing")):
+        for o in (win.get(key) or []):
+            if not isinstance(o, dict):
+                continue
+            st_t, en_t = o.get("start_time"), o.get("end_time")
+            if st_t is None or en_t is None:
+                continue
+            # `end_time` is EXCLUSIVE -- the pipeline writes it as
+            # (end_frame + 1) / fps -- so the last frame is one before it.
+            # Treating it as inclusive stretched every span by one frame and
+            # made an ENGINE appear to overlap the first wagon.
+            sf = int(round((float(st_t) - time_offset) * src_fps))
+            ef = int(round((float(en_t) - time_offset) * src_fps)) - 1
+            sf, ef = max(0, sf), min(max(0, total - 1), ef)
+            if ef < sf:
+                continue
+            out.append((sf, ef, str(o.get("classification") or "NON_WAGON"),
+                        position))
+    return out
+
+
+def _gap_tracks_for(tracking: Dict[str, Any], camera_id: str) -> List[Dict[str, Any]]:
+    """This camera's gap tracks, from the tracking JSON Stage 1 already wrote.
+
+    Replayed, never recomputed: no gap model runs here. Only gaps carrying the
+    full-fidelity `hit_frames` + `bbox_history` arrays can be drawn per frame --
+    `GapEvent.to_dict()` is a REPORTING view that drops them, so a gap
+    serialized through that path is skipped rather than guessed at.
+    """
+    cam = (tracking or {}).get(camera_id) or {}
+    out: List[Dict[str, Any]] = []
+    for g in (cam.get("gaps") or []):
+        if not isinstance(g, dict):
+            continue
+        # A gap WITHOUT the trajectory arrays is kept and marked unresolved,
+        # not dropped. Silently omitting it would make the video look like the
+        # reconstruction found no boundary there, which is a different claim
+        # from "the boundary is known but its image position is not".
+        g = dict(g)
+        g["_resolved"] = bool(g.get("hit_frames") and g.get("bbox_history"))
+        out.append(g)
+    return out
+
+
+def _draw_gap_boxes(frame, gaps: List[Dict[str, Any]], frame_idx: int) -> int:
+    """Cyan box for every gap live on this frame. Returns how many were drawn.
+
+    Interpolation between recorded hits comes from the counting engine's own
+    `_interp_gap_bbox` -- CALLED, not copied, so the repository keeps one
+    interpolation algorithm rather than two that can drift.
+    """
+    drawn = 0
+    try:
+        from video_segmenter import _interp_gap_bbox        # type: ignore
+    except Exception:                                        # noqa: BLE001
+        _interp_gap_bbox = None                              # type: ignore
+    for g in gaps:
+        sf, ef = g.get("start_frame"), g.get("end_frame")
+        if sf is None or ef is None or not (int(sf) <= frame_idx <= int(ef)):
+            continue
+        if not g.get("_resolved", True):
+            # Known boundary, unknown image position. Say exactly that.
+            cv2.putText(frame,
+                        f"GAP {g.get('track_id', '?')} UNRESOLVED "
+                        f"(no trajectory)", (20, frame.shape[0] - 60),
+                        _FONT, 0.55, _UNRESOLVED_COLOR, 2, cv2.LINE_AA)
+            continue
+        bbox = None
+        hits = g.get("hit_frames") or []
+        hist = g.get("bbox_history") or []
+        if frame_idx in hits:
+            bbox = hist[hits.index(frame_idx)]
+        elif _interp_gap_bbox is not None:
+            try:
+                bbox = _interp_gap_bbox(g, frame_idx)
+            except Exception:                                # noqa: BLE001
+                bbox = None
+        if not bbox or len(bbox) < 4:
+            continue
+        x1, y1, x2, y2 = (int(round(float(v))) for v in bbox[:4])
+        cv2.rectangle(frame, (x1, y1), (x2, y2), _GAP_COLOR, 2)
+        cv2.putText(frame, f"GAP {g.get('track_id', '')}", (x1, max(12, y1 - 6)),
+                    _FONT, 0.5, _GAP_COLOR, 1, cv2.LINE_AA)
+        drawn += 1
+    return drawn
+
+
+def _draw_boundary_flash(frame, boundary_frames: Sequence[int],
+                         frame_idx: int) -> None:
+    """Magenta flash + GW_BOUNDARY banner within +/-3 frames of a boundary."""
+    for b in boundary_frames:
+        if abs(frame_idx - int(b)) > 3:
+            continue
+        h, w = frame.shape[:2]
+        cv2.line(frame, (0, 0), (w, 0), _BOUNDARY_COLOR, 4)
+        cv2.line(frame, (0, h - 1), (w, h - 1), _BOUNDARY_COLOR, 4)
+        label = "GW_BOUNDARY"
+        (tw, th), _ = cv2.getTextSize(label, _FONT, 0.7, 2)
+        tx, ty = (w - tw) // 2, 40
+        cv2.rectangle(frame, (tx - 8, ty - th - 8), (tx + tw + 8, ty + 8),
+                      _BOUNDARY_COLOR, -1)
+        cv2.putText(frame, label, (tx, ty), _FONT, 0.7, (255, 255, 255), 2,
+                    cv2.LINE_AA)
+        return
+
+
+def _draw_v4_panel(frame, lines: Sequence[tuple]) -> None:
+    """Translucent top-left panel, same shape as the batch renderer's."""
+    if not lines:
+        return
+    panel_w, panel_h = 430, 22 * len(lines) + 16
+    ov = frame.copy()
+    cv2.rectangle(ov, (10, 10), (10 + panel_w, 10 + panel_h), _PANEL_BG, -1)
+    cv2.addWeighted(ov, 0.55, frame, 0.45, 0, frame)
+    y = 30
+    for text, color in lines:
+        cv2.putText(frame, text, (20, y), _FONT, 0.55, color, 1, cv2.LINE_AA)
+        y += 22
+
+
 def _map_wagon_to_local_frames(
     wagon: GlobalWagon, local_fps: float, local_total_frames: int,
     time_offset: float = 0.0,
@@ -411,8 +579,13 @@ def _render_one_camera(
     enabled_features: Optional[set] = None,
     verbose: bool = True,
     time_offset: float = 0.0,
+    camera_tracking: Optional[Dict[str, Any]] = None,
 ) -> str:
-    del unified  # legacy videos carry no fused-state HUD
+    # `unified` IS drawn now: the per-wagon LOAD verdict comes from it. Load
+    # never persisted per-frame detections -- only `load/best_frame.jpg` and a
+    # fused per-wagon status -- so a per-frame load BOX is not available without
+    # re-running inference, which this module must never do. The verdict is
+    # shown per wagon in the panel instead, which is the evidence that exists.
 
     if not os.path.isfile(video_path):
         raise RuntimeError(f"raw video missing for {camera_id}: {video_path}")
@@ -439,16 +612,40 @@ def _render_one_camera(
     is_side = camera_id in C.SIDE_CAMERAS
     is_top  = camera_id in C.TOP_CAMERAS
 
-    # The legacy top-camera info block prints the wagon TYPE; map frame -> wagon
-    # class for that line only (side cameras don't draw it).
+    # frame -> canonical wagon, for EVERY camera now (the legacy block used it
+    # only on the tops). This is the existing projection -- master time mapped
+    # through this camera's offset -- not a new local->global matcher.
     frame_to_wagon: Dict[int, GlobalWagon] = {}
-    if is_top:
-        for w in state.wagons:
-            sf, ef = _map_wagon_to_local_frames(w, src_fps, total, time_offset)
-            if ef < sf:
-                continue        # wagon not visible on this camera
-            for f in range(sf, ef + 1):
-                frame_to_wagon[f] = w
+    boundary_frames: List[int] = []
+    for w in state.wagons:
+        sf, ef = _map_wagon_to_local_frames(w, src_fps, total, time_offset)
+        if ef < sf:
+            continue            # wagon not visible on this camera
+        for f in range(sf, ef + 1):
+            frame_to_wagon[f] = w
+        if sf > 0:
+            boundary_frames.append(sf)
+    boundary_frames = sorted(set(boundary_frames))
+
+    # Wagon-ACTIVE-REGION edges, projected into this camera's frames. Read from
+    # the master's `wagon_window` -- the canonical source -- so the video cannot
+    # disagree with the report about where the region is.
+    _win = dict(getattr(state, "wagon_window", None) or {})
+    _region_frames: Dict[str, Optional[int]] = {"start": None, "end": None}
+    for _key, _t in (("start", _win.get("wagon_start_time")),
+                     ("end", _win.get("wagon_end_time"))):
+        if _t is None or src_fps <= 0:
+            continue
+        _f = int(round((float(_t) - time_offset) * src_fps))
+        if _key == "end":
+            # EXCLUSIVE, as above: the region's last frame is one before the
+            # time the window reports. Off by one here would put the END marker
+            # on the first frame AFTER the region.
+            _f -= 1
+        if 0 <= _f < max(1, total):
+            _region_frames[_key] = _f
+    _region_found = bool(_win.get("found"))
+    _total_wagons = len(state.wagons)
 
     overlay = _OverlayRegistry(
         camera_id=camera_id, evidence_root=evidence_root, wagons=state.wagons,
@@ -460,6 +657,52 @@ def _render_one_camera(
         print(f"[RENDER/{camera_id}] writing -> {output_path}  "
               f"({total} frames, {n_boxes} box-instances)")
 
+    gap_tracks = _gap_tracks_for(camera_tracking or {}, camera_id)
+    non_wagon_spans = _non_wagon_spans(state, src_fps, total, time_offset)
+    _frame_to_nonwagon: Dict[int, Tuple[str, str]] = {}
+    for _sf, _ef, _cls, _pos in non_wagon_spans:
+        for _f in range(_sf, _ef + 1):
+            _frame_to_nonwagon[_f] = (_cls, _pos)
+
+    # Per-camera audit, so every annotation is traceable to its source.
+    _audit: Dict[str, Any] = {
+        "camera_id": camera_id,
+        "output": output_path,
+        "total_frames": total,
+        "fps": src_fps,
+        "time_offset_sec": round(float(time_offset), 4),
+        "canonical_wagons_total": len(state.wagons),
+        "global_wagon_ids_shown": sorted(
+            {w.global_id for w in state.wagons
+             if _map_wagon_to_local_frames(w, src_fps, total,
+                                           time_offset)[1] >= 0},
+            key=lambda g: int(str(g).split("_")[-1]) if str(g).split("_")[-1].isdigit() else 0),
+        "gap_tracks_total": len(gap_tracks),
+        "gap_tracks_resolved": sum(1 for g in gap_tracks if g.get("_resolved")),
+        "gap_tracks_unresolved": sum(1 for g in gap_tracks
+                                     if not g.get("_resolved")),
+        "boundary_frames": list(boundary_frames),
+        "active_region_found": _region_found,
+        "active_region_start_frame": _region_frames["start"],
+        "active_region_end_frame": _region_frames["end"],
+        "non_wagon_objects": [
+            {"start_frame": a, "end_frame": b, "classification": c,
+             "position": d, "global_wagon_id": None}
+            for (a, b, c, d) in non_wagon_spans],
+        "gap_markers_drawn": 0,
+        "door_detections_drawn": 0,
+        "damage_detections_drawn": 0,
+        "load_status_frames": 0,
+        "load_per_frame_boxes": "unavailable: load persists no per-frame "
+                                "detections; drawing them would require a "
+                                "second inference pass",
+        "features_enabled": sorted(enabled_features) if enabled_features else "all",
+    }
+    if verbose:
+        print(f"  [{camera_id}] HUD: {len(gap_tracks)} gap track(s), "
+              f"{len(boundary_frames)} boundary frame(s), "
+              f"region={_region_frames['start']}..{_region_frames['end']}")
+
     frame_idx = 0
     written = 0
     while True:
@@ -468,12 +711,16 @@ def _render_one_camera(
             break
 
         n_damages = 0
+        n_doors = 0
         for item in overlay.boxes_by_frame.get(frame_idx, []):
             if item.get("kind") == "door":
                 _draw_door_track(frame, item)
+                n_doors += 1
             else:
                 _draw_damage_det(frame, item)
                 n_damages += 1
+        _audit["door_detections_drawn"] += n_doors
+        _audit["damage_detections_drawn"] += n_damages
 
         if is_side:
             evs = overlay.events_by_frame.get(frame_idx)
@@ -483,6 +730,63 @@ def _render_one_camera(
             w = frame_to_wagon.get(frame_idx)
             frame_class = str(w.classification).upper() if w else "WAGON"
             _draw_damage_info(frame, frame_idx, n_damages, frame_class)
+
+        # ---- v4 HUD: gaps, boundaries, canonical GW, active region -------
+        # Every element is REPLAYED from artifacts already on disk. No model,
+        # no tracker, no second count: gaps come from the Stage-1 tracking JSON,
+        # wagon ids and boundaries from the canonical roster, the region from the
+        # master's own `wagon_window`, and the load verdict from the fused state.
+        n_gaps = _draw_gap_boxes(frame, gap_tracks, frame_idx)
+        _audit["gap_markers_drawn"] += n_gaps
+        _draw_boundary_flash(frame, boundary_frames, frame_idx)
+
+        _cur = frame_to_wagon.get(frame_idx)
+        if _region_frames["start"] is not None and frame_idx < _region_frames["start"]:
+            _state_name = "BEFORE_WAGON_REGION"
+        elif _region_frames["end"] is not None and frame_idx > _region_frames["end"]:
+            _state_name = "AFTER_WAGON_REGION"
+        elif _region_found:
+            _state_name = "WAGON_REGION_ACTIVE"
+        else:
+            _state_name = "BEFORE_WAGON_REGION"
+
+        _lines = [(f"Frame: {frame_idx}", (255, 255, 255)),
+                  (f"Region: {_state_name}", _REGION_COLOR)]
+        if _cur is not None:
+            _u = (unified or {}).get(_cur.global_id)
+            _load = str(getattr(_u, "load_status", "") or "-")
+            _lines.append((f"{_cur.global_id}  {_cur.classification}  "
+                           f"({_cur.wagon_index}/{_total_wagons})",
+                           (0, 255, 0)))
+            _lines.append((f"Load: {_load}", (0, 255, 0)))
+            if _load and _load != "-":
+                _audit["load_status_frames"] += 1
+        else:
+            _nw = _frame_to_nonwagon.get(frame_idx)
+            if _nw is not None:
+                # A real, identified vehicle -- shown as such, and explicitly
+                # WITHOUT a GW id, which is the whole point of the region gate.
+                _lines.append((f"{_nw[0]}  ({_nw[1]} non-wagon)  GW: none",
+                               _NONWAGON_COLOR))
+            else:
+                _lines.append((f"No canonical wagon (outside region)  "
+                               f"total={_total_wagons}", (180, 180, 180)))
+        if n_gaps:
+            _lines.append((f"Gaps live: {n_gaps}", _GAP_COLOR))
+        if n_damages:
+            _lines.append((f"Damages: {n_damages}", (0, 0, 255)))
+        _draw_v4_panel(frame, _lines)
+
+        for _k, _f in _region_frames.items():
+            if _f is not None and abs(frame_idx - _f) <= 3:
+                _txt = f"ACTIVE-REGION {_k.upper()}"
+                (_tw, _th), _ = cv2.getTextSize(_txt, _FONT, 0.8, 2)
+                _h, _w = frame.shape[:2]
+                _x, _y = (_w - _tw) // 2, _h - 24
+                cv2.rectangle(frame, (_x - 10, _y - _th - 10),
+                              (_x + _tw + 10, _y + 10), _REGION_COLOR, -1)
+                cv2.putText(frame, _txt, (_x, _y), _FONT, 0.8, (0, 0, 0), 2,
+                            cv2.LINE_AA)
 
         writer.write(frame)
         written += 1
@@ -495,8 +799,23 @@ def _render_one_camera(
     # The file must be closed before ffmpeg reads it.
     if codec == _FALLBACK_CODEC:
         _transcode_to_h264(output_path, verbose=verbose)
+    _audit["frames_written"] = written
+    _audit["codec"] = codec
+    try:
+        _ap = os.path.splitext(output_path)[0] + "_render_audit.json"
+        with open(_ap, "w", encoding="utf-8") as _f:
+            json.dump(_audit, _f, indent=2, default=str)
+        _audit["audit_path"] = _ap
+    except Exception as e:                                       # noqa: BLE001
+        print(f"[RENDER/{camera_id}] audit not written: {e}")
     if verbose:
-        print(f"[RENDER/{camera_id}] done ({written} frames, codec={codec})")
+        print(f"[RENDER/{camera_id}] done ({written} frames, codec={codec}); "
+              f"GW shown={len(_audit['global_wagon_ids_shown'])} "
+              f"gaps={_audit['gap_markers_drawn']} "
+              f"doors={_audit['door_detections_drawn']} "
+              f"damages={_audit['damage_detections_drawn']} "
+              f"non-wagon={len(_audit['non_wagon_objects'])}")
+    RENDER_AUDITS[camera_id] = _audit
     return output_path
 
 
@@ -562,6 +881,7 @@ def render_all_cameras(
                 enabled_features=enabled_features,
                 verbose=verbose,
                 time_offset=float(offsets.get(cam, 0.0) or 0.0),
+                camera_tracking=tracking,
             ): cam
             for cam, cfg in jobs.items()
         }
