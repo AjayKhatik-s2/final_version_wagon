@@ -393,6 +393,10 @@ _PANEL_BG = (0, 0, 0)
 _NONWAGON_COLOR = (0, 140, 255)
 _UNRESOLVED_COLOR = (0, 165, 255)
 
+#: Above this y, a gap label would be drawn over the top banners (the info panel
+#: and the magenta GW_BOUNDARY strip), so it is placed under the box instead.
+_LABEL_TOP_MARGIN = 46
+
 
 def _non_wagon_spans(state: Any, src_fps: float, total: int,
                      time_offset: float) -> List[Tuple[int, int, str, str]]:
@@ -513,10 +517,32 @@ def _gap_neighbour_pair(boundary_map: Dict[int, Tuple[str, str]],
     Taken from the canonical roster's own frame ranges -- the wagons the
     reconstruction actually placed either side of this boundary -- never from
     wagon numbering or an assumed spacing.
+
+    The match is a boundary frame falling anywhere INSIDE the gap's own span, and
+    that is the whole point. A real gap is visible for a dozen-odd frames as it
+    crosses the view (measured: GAP_2 on RIGHT_UP spans frames 249..262) while
+    the roster's boundary between GW_1 and GW_2 is the single frame 255/256.
+    Requiring the gap's FIRST or LAST frame to equal a boundary frame -- which is
+    what this did -- therefore missed every real gap, and the label silently fell
+    back to a bare `GAP_n` with no wagons named. On synthetic fixtures the two
+    coincided, so only real footage showed it.
+
+    When several boundaries fall inside one span, the nearest to the gap's centre
+    wins: an over-long track that brushes two boundaries belongs to the one it is
+    actually centred on.
     """
-    for f in (gap.get("start_frame"), gap.get("end_frame")):
-        if f is not None and int(f) in boundary_map:
-            return boundary_map[int(f)]
+    sf, ef = gap.get("start_frame"), gap.get("end_frame")
+    if sf is None or ef is None:
+        for f in (sf, ef):
+            if f is not None and int(f) in boundary_map:
+                return boundary_map[int(f)]
+        return ("", "")
+    sf, ef = int(sf), int(ef)
+    centre = (sf + ef) / 2.0
+    inside = [b for b in boundary_map if sf <= b <= ef]
+    if inside:
+        best = min(inside, key=lambda b: abs(b - centre))
+        return boundary_map[best]
     return ("", "")
 
 
@@ -609,7 +635,13 @@ def _draw_gap_boxes(frame, gaps: List[Dict[str, Any]], frame_idx: int,
         x1, y1, x2, y2 = (int(round(float(v))) for v in bbox[:4])
         cv2.rectangle(frame, (x1, y1), (x2, y2), _GAP_COLOR, 2)
         label = _gap_neighbours(boundary_map or {}, g)
-        cv2.putText(frame, label, (x1, max(12, y1 - 6)),
+        # Above the box normally, BELOW it when the box starts near the top of
+        # the frame: the GW_BOUNDARY banner lives up there, and a gap crossing a
+        # wagon boundary is exactly when both are drawn -- so the label that
+        # matters most was the one being overprinted.
+        _ly = (y1 - 6) if y1 > _LABEL_TOP_MARGIN else min(frame.shape[0] - 6,
+                                                          y2 + 18)
+        cv2.putText(frame, label, (x1, _ly),
                     _FONT, 0.5, _GAP_COLOR, 1, cv2.LINE_AA)
         drawn += 1
         if drawn_provenance is not None:

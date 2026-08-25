@@ -592,3 +592,97 @@ class TestBothModesRenderTheSameWay(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ===========================================================================
+# 11. Adjacency on REAL spans, not just coincident ones
+# ===========================================================================
+
+class TestAdjacencyMatchesRealGapSpans(unittest.TestCase):
+    """A regression from real footage.
+
+    A real gap is visible for a dozen-odd frames as it crosses the view, while
+    the roster's boundary between two wagons is a single frame inside that span.
+    The lookup used to require the gap's FIRST or LAST frame to equal a boundary
+    frame; on real data neither ever did, so every label fell back to a bare
+    `GAP_n` with no wagons named. Synthetic fixtures happened to line the two up,
+    which is exactly why only the rendered video showed it.
+    """
+
+    #: RIGHT_UP, real numbers: GW_1 ends 255, GW_2 starts 256, GAP_2 spans
+    #: 249..262 -- straddling the boundary, coincident with neither end.
+    BOUNDARY = {255: ("GW_1", "GW_2"), 256: ("GW_1", "GW_2")}
+
+    def test_a_straddling_gap_names_both_wagons(self):
+        gap = {"track_id": 2, "start_frame": 249, "end_frame": 262}
+        self.assertEqual(R._gap_neighbour_pair(self.BOUNDARY, gap),
+                         ("GW_1", "GW_2"))
+
+    def test_the_label_is_the_full_triple(self):
+        gap = {"track_id": 2, "global_gap_id": 2,
+               "start_frame": 249, "end_frame": 262}
+        self.assertEqual(R._gap_neighbours(self.BOUNDARY, gap),
+                         "GW_1 | GAP_2 | GW_2")
+
+    def test_a_gap_nowhere_near_a_boundary_names_nobody(self):
+        gap = {"track_id": 9, "start_frame": 600, "end_frame": 612}
+        self.assertEqual(R._gap_neighbour_pair(self.BOUNDARY, gap), ("", ""))
+        self.assertEqual(R._gap_neighbours(self.BOUNDARY, gap), "GAP_9")
+
+    def test_the_nearest_boundary_to_the_centre_wins(self):
+        """An over-long track brushing two boundaries belongs to the one it is
+        centred on, not to whichever was scanned first."""
+        bmap = {100: ("GW_1", "GW_2"), 400: ("GW_2", "GW_3")}
+        # Centres chosen well clear of the midpoint: a span centred at exactly
+        # 250 is equidistant from both and the answer would be arbitrary, so
+        # asserting one would be testing dict iteration order.
+        gap = {"track_id": 5, "start_frame": 200, "end_frame": 410}   # c=305
+        self.assertEqual(R._gap_neighbour_pair(bmap, gap), ("GW_2", "GW_3"))
+        gap = {"track_id": 5, "start_frame": 90, "end_frame": 300}    # c=195
+        self.assertEqual(R._gap_neighbour_pair(bmap, gap), ("GW_1", "GW_2"))
+
+    def test_the_exactly_coincident_case_still_works(self):
+        gap = {"track_id": 2, "start_frame": 255, "end_frame": 255}
+        self.assertEqual(R._gap_neighbour_pair(self.BOUNDARY, gap),
+                         ("GW_1", "GW_2"))
+
+    def test_a_gap_with_no_span_falls_back_to_the_old_exact_match(self):
+        gap = {"track_id": 2, "start_frame": 255, "end_frame": None}
+        self.assertEqual(R._gap_neighbour_pair(self.BOUNDARY, gap),
+                         ("GW_1", "GW_2"))
+
+    def test_the_rendered_label_names_both_wagons_on_a_real_span(self):
+        """End to end: a gap straddling the GW_1/GW_2 boundary, rendered."""
+        g = moving_gap(track_id=2, sf=27, ef=33)
+        prov = render(RU, gaps=[g], gg=canonical_gaps({2: {RU: 2}})
+                      )["gap_marker_provenance_sample"]
+        self.assertTrue(prov)
+        for p in prov:
+            self.assertEqual(p["label"], "GW_1 | GAP_2 | GW_2")
+
+
+class TestGapLabelStaysReadable(unittest.TestCase):
+    """The label is drawn below the box when the box starts near the top of the
+    frame. A gap crossing a wagon boundary is exactly when the magenta
+    GW_BOUNDARY banner is also drawn, so the label that matters most was the one
+    being overprinted."""
+
+    def test_a_high_box_puts_its_label_underneath(self):
+        self.assertGreater(R._LABEL_TOP_MARGIN, 0)
+        g = moving_gap(sf=28, ef=32)
+        g["bbox_history"] = [[100.0, 4.0, 140.0, 120.0]
+                             for _ in g["hit_frames"]]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, f"{RU}_processed.mp4")
+            render_one(RU, tmp, gaps=[g])
+        # Drawn at all, and the audit still records the box we asked for.
+        prov = R.RENDER_AUDITS[RU]["gap_marker_provenance_sample"]
+        self.assertTrue(prov)
+        self.assertEqual(prov[0]["bbox"][1], 4.0)
+
+    def test_a_low_box_keeps_its_label_above(self):
+        g = moving_gap(sf=28, ef=32)
+        g["bbox_history"] = [[100.0, 150.0, 140.0, 230.0]
+                             for _ in g["hit_frames"]]
+        a = render(RU, gaps=[g])
+        self.assertGreater(a["gap_markers_drawn"], 0)
