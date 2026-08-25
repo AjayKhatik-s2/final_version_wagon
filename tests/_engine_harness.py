@@ -285,6 +285,20 @@ REVIEWED_IN_WORKTREE = (
     # See tests/test_left_up_top_model.py.
     "wagon_count/train_structure.py",       # mapping: LEFT_UP_TOP -> ltop.pt
     "wagon_count/run_global_count.py",      # name-keyed classifier resolution
+    #
+    # ALSO, 2026-08-25: vehicle-TYPE resolution. Type was already side-camera
+    # only -- `initial_classifications` is built from the master alone, and the
+    # fixed-master invariant already forbids a support camera from creating a
+    # GW id or extending the timeline. What was missing was LEFT_UP (unused for
+    # type), a fallback when RIGHT_UP has nothing, and any record of WHY a wagon
+    # carries its type. This file now retains each support camera's smoothed
+    # classifications (previously reduced to `labels` and dropped) and calls
+    # `core.vehicle_type.resolve_train` -- THE SAME function sequential mode
+    # calls, so the two cannot diverge.
+    #
+    # No counting change is possible: RIGHT_UP always wins, so where it has an
+    # opinion the resolved type equals the existing one, and the resolver
+    # iterates `state.wagons` so it can neither add nor drop a wagon. Asserted.
     "wagon_count/tests/test_train_structure.py",   # the mapping's own test
     "wagon_count/validate_ec2.py",          # ltop.pt in the capability list
     "wagon_count/README.md",                # per-camera classifier table

@@ -795,6 +795,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Support cameras are never counting authorities.
     # ------------------------------------------------------------------
     support_regions: Dict[str, ts.LocalWagonRegion] = {}
+    support_classifications: Dict[str, List[Any]] = {}
     classification_models: Dict[str, str] = {CAMERA_RIGHT_UP: os.path.basename(side_cls_path)}
     top_label_mapping = None
     if not args.no_support_classification:
@@ -845,6 +846,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                         verbose=verbose)
                     temporal_results[cam] = tres
                     labels = [c.label for c in cls]
+                    # Retained for vehicle-type resolution. LEFT_UP's
+                    # classification was previously reduced to `labels` and
+                    # dropped; the resolver needs the records themselves
+                    # (frames + confidence) to corroborate or stand in for
+                    # RIGHT_UP. Top cameras are retained too, but only so the
+                    # audit can show what they predicted and that it was
+                    # ignored.
+                    support_classifications[cam] = list(cls)
                 support_regions[cam] = ts.build_local_wagon_region(
                     cam, segs, labels, t.fps,
                     classifier_model=os.path.basename(path),
@@ -972,6 +981,53 @@ def main(argv: Optional[List[str]] = None) -> int:
             verbose=verbose,
         )
         state.fusion_mode = "legacy"
+
+    # ---- Wagon-ACTIVE-REGION audit + gate -------------------------------
+    # THE SAME function sequential mode calls. The region is the master's
+    # `wagon_window`, already computed above; this narrates it, records
+    # top-camera corroboration read-only, and asserts the gate held.
+    try:
+        from core import active_region as AR
+        _tops_ar = {c: support_classifications[c]
+                    for c in (CAMERA_RIGHT_UP_TOP, CAMERA_LEFT_UP_TOP)
+                    if c in support_classifications}
+        _fps_ar = {c: float(getattr(tracks.get(c, None), "fps", 0.0) or 0.0)
+                   for c in ALL_CAMERAS}
+        state.active_region_audit = AR.resolve(
+            state, top_classifications=_tops_ar, camera_fps=_fps_ar,
+            camera_offsets=state.camera_time_offsets(),
+            verbose=verbose).to_dict()
+    except Exception as e:  # noqa: BLE001 -- an audit must not fail a batch
+        print(f"[ACTIVE-REGION] FAILED: {type(e).__name__}: {e}",
+              file=sys.stderr)
+
+    # ---- Vehicle TYPE resolution (identity is already fixed) -------------
+    # THE SAME function sequential mode calls, so the two pipelines cannot
+    # answer differently for the same camera evidence. Identity -- which objects
+    # exist and in what order -- was settled above by the master reconstruction
+    # and is not revisited: the resolver iterates `state.wagons` and can neither
+    # add nor drop one.
+    #
+    # RIGHT_UP is primary and always wins; LEFT_UP corroborates, dissents, or --
+    # only where RIGHT_UP has no classification -- becomes the source. The top
+    # cameras' predictions are passed in ONLY to be recorded as ignored.
+    try:
+        from core import vehicle_type as VT
+        _side = {CAMERA_RIGHT_UP: list(initial_classifications or [])}
+        if CAMERA_LEFT_UP in support_classifications:
+            _side[CAMERA_LEFT_UP] = support_classifications[CAMERA_LEFT_UP]
+        _tops = {c: support_classifications[c]
+                 for c in (CAMERA_RIGHT_UP_TOP, CAMERA_LEFT_UP_TOP)
+                 if c in support_classifications}
+        _fps = {c: float(getattr(tracks.get(c, None), "fps", 0.0) or 0.0)
+                for c in ALL_CAMERAS}
+        state.vehicle_type_resolution = VT.resolve_train(
+            state, side_classifications=_side, camera_fps=_fps,
+            camera_offsets=state.camera_time_offsets(),
+            top_classifications=_tops, verbose=verbose)
+    except Exception as e:  # noqa: BLE001 -- provenance must not fail a batch
+        print(f"[TYPE-RESOLUTION] FAILED: {type(e).__name__}: {e}",
+              file=sys.stderr)
 
     # ---- attach validation / classification diagnostics to the state ----
     state.gap_validation_statistics = {

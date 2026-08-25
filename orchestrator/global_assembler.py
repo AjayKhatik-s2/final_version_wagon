@@ -65,6 +65,14 @@ class AssemblyResult:
     failed_cameras: List[str] = field(default_factory=list)
     mapping_by_camera: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     wagon_regions_applied: List[str] = field(default_factory=list)
+    #: `core.vehicle_type.resolve_train` summary: per-wagon resolved type,
+    #: source camera, confidence, corroboration/dissent, and what the top
+    #: cameras predicted (recorded as ignored).
+    type_resolution: Dict[str, Any] = field(default_factory=dict)
+    #: `core.active_region.resolve` summary: the BEFORE/ACTIVE/AFTER lifecycle,
+    #: both boundaries with provenance, excluded leading/trailing non-wagons,
+    #: ignored out-of-region predictions, and whether the gate held.
+    active_region: Dict[str, Any] = field(default_factory=dict)
     cache_summary: Any = None
     feature_summary: Dict[str, Any] = field(default_factory=dict)
     missing_cameras: List[str] = field(default_factory=list)
@@ -97,6 +105,42 @@ def _load_master_classifications(bundle: CameraEvidenceBundle) -> List[Any]:
         except (KeyError, TypeError, ValueError):
             continue
     return out
+
+
+def _load_classifications(bundle: CameraEvidenceBundle):
+    """This camera's persisted segment classifications, as plain records.
+
+    Sequential cameras are processed and sealed independently, so a side
+    camera's classification is on disk long before the others arrive. Reading it
+    back here is what lets final assembly resolve type against the canonical
+    timeline without needing all four feeds at camera time.
+
+    Returns [] for a camera that has not been processed -- absence must mean
+    "no evidence", never "not a wagon".
+    """
+    rows = bundle.read_json("classification.json") or []
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        out.append(_Cls(segment_index=r.get("segment_index"),
+                        start_frame=r.get("start_frame"),
+                        end_frame=r.get("end_frame"),
+                        label=r.get("label") or "",
+                        confidence=float(r.get("confidence") or 0.0)))
+    return out
+
+
+@dataclass
+class _Cls:
+    """The four fields the type resolver reads. Deliberately not the engine's
+    own class: this module must not depend on wagon_count internals to read a
+    JSON file it wrote itself."""
+    segment_index: Any = None
+    start_frame: Any = None
+    end_frame: Any = None
+    label: str = ""
+    confidence: float = 0.0
 
 
 def _load_wagon_region(bundle: CameraEvidenceBundle):
@@ -325,6 +369,56 @@ def assemble(
         f.write(engine_state.to_json())
 
     state = parse_global_train_state(engine_state.to_dict())
+
+    # ---- Wagon-ACTIVE-REGION audit + gate -------------------------------
+    # The region itself is the master's `wagon_window`, already computed and
+    # already denying a GW id to anything outside it. This narrates it as
+    # BEFORE -> ACTIVE -> AFTER, records top-camera corroboration (read-only,
+    # so a top camera can neither move a boundary nor reopen a closed region),
+    # lists every out-of-region prediction it ignored, and ASSERTS the gate
+    # held. Same function batch mode calls.
+    try:
+        from core import active_region as AR
+        _top_cls = {c: _load_classifications(bundles[c])
+                    for c in C.TOP_CAMERAS if c in bundles}
+        _fps = {c: float(getattr(tracks.get(c, None), "fps", 0.0) or 0.0)
+                for c in C.ALL_CAMERAS}
+        res.active_region = AR.resolve(
+            state, top_classifications=_top_cls, camera_fps=_fps,
+            camera_offsets=state.camera_time_offsets(), verbose=verbose).to_dict()
+    except Exception as e:  # noqa: BLE001 -- an audit must not fail a train
+        print(f"[ACTIVE-REGION] FAILED: {type(e).__name__}: {e}", file=sys.stderr)
+        res.active_region = {}
+
+    # ---- Vehicle TYPE resolution (identity is already fixed) -------------
+    # Global Wagon IDENTITY is settled above by the RIGHT_UP master
+    # reconstruction and is NOT revisited here. This resolves what each
+    # already-established object IS, from the SIDE cameras only, and records
+    # why. `core.vehicle_type` is the same function batch mode calls, so the two
+    # pipelines cannot answer differently for the same evidence.
+    #
+    # RIGHT_UP is primary and always wins; LEFT_UP corroborates, dissents, or --
+    # only when RIGHT_UP has no classification for that wagon -- becomes the
+    # source. Top-camera predictions are passed in solely to be RECORDED as
+    # ignored, so an audit can show what they said and that it carried no
+    # weight. They cannot change a type, and iterating `state.wagons` means the
+    # resolver can neither add nor drop a wagon.
+    try:
+        from core import vehicle_type as VT
+        _side_cls = {c: _load_classifications(bundles[c])
+                     for c in C.SIDE_CAMERAS if c in bundles}
+        _top_cls = {c: _load_classifications(bundles[c])
+                    for c in C.TOP_CAMERAS if c in bundles}
+        _fps = {c: float(getattr(tracks.get(c, None), "fps", 0.0) or 0.0)
+                for c in C.ALL_CAMERAS}
+        res.type_resolution = VT.resolve_train(
+            state, side_classifications=_side_cls,
+            camera_fps=_fps, camera_offsets=state.camera_time_offsets(),
+            top_classifications=_top_cls, verbose=verbose)
+    except Exception as e:  # noqa: BLE001 -- provenance must not fail a train
+        print(f"[TYPE-RESOLUTION] FAILED: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        res.type_resolution = {}
     res.total_wagons = state.total_wagons
     offsets_meta = state.camera_offsets or {}
     resolved = state.camera_time_offsets()
