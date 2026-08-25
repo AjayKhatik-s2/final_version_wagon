@@ -98,28 +98,70 @@ def _feature_frame_count(states_dir: str, feature: str) -> int:
     return n
 
 
-def _feature_plan(camera_id: str, enabled: set) -> List:
+def stage3_extras(opts: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+    """Per-feature Stage-3 inference arguments. ONE builder, both pipelines.
+
+    Defaults come from `core.constants.STAGE3_*` -- the same source batch mode's
+    argparse and `process_batch` read -- and `opts` (threaded from the CLI)
+    overrides them. Sequential used to hardcode these literals, so
+    --door-sample-stride and friends were silently ignored in sequential mode:
+    the run printed the requested stride and then sampled at a different one.
+
+    LOAD gets `every_nth` as well as `sample_stride`, because load samples even
+    in legacy mode -- its own `every_nth` defaults to 2 and that default does
+    take effect. Passing the mode alone would leave the stride wrong for load
+    only, which is the kind of asymmetry nobody notices.
+    """
+    o = dict(opts or {})
+    out: Dict[str, Dict[str, Any]] = {}
+    for feature, dflt_mode, dflt_stride in (
+        ("door", C.STAGE3_DOOR_MODE, C.STAGE3_DOOR_STRIDE),
+        ("damage", C.STAGE3_DAMAGE_MODE, C.STAGE3_DAMAGE_STRIDE),
+        ("load", C.STAGE3_LOAD_MODE, C.STAGE3_LOAD_STRIDE),
+    ):
+        mode = str(o.get(f"{feature}_inference_mode") or dflt_mode)
+        try:
+            stride = max(1, int(o.get(f"{feature}_sample_stride", dflt_stride)))
+        except (TypeError, ValueError):
+            stride = dflt_stride
+        extra: Dict[str, Any] = {"inference_mode": mode,
+                                 "sample_stride": stride}
+        if feature == "load":
+            # Load samples even in LEGACY mode -- its own `every_nth` defaults
+            # to 2 and that default takes effect -- so the stride must be set
+            # on both keys or load alone would run at the wrong rate.
+            extra["every_nth"] = stride
+        out[feature] = extra
+    # OCR takes no stride arguments: its readers pick their own frames.
+    out["ocr"] = {}
+    return out
+
+
+def _feature_plan(camera_id: str, enabled: set,
+                  inference_opts: Optional[Dict[str, Any]] = None) -> List:
     """Which features this camera is AUTHORITATIVE for.
 
     Door lives on the side cameras; Load and Damage on the top cameras. Running
     every feature on every camera would quadruple the work and produce
     meaningless results, so each camera runs only its own.
     """
+    _extras = stage3_extras(inference_opts)
     plan = []
     if camera_id in C.SIDE_CAMERAS and "door" in enabled:
         from features.door import processor as door_proc
-        plan.append(("door", door_proc, {}))
+        plan.append(("door", door_proc, dict(_extras["door"])))
     if camera_id in C.TOP_CAMERAS and "load" in enabled:
         from features.load import processor as load_proc
-        plan.append(("load", load_proc, dict(every_nth=1)))
+        plan.append(("load", load_proc, dict(_extras["load"])))
     if camera_id in C.TOP_CAMERAS and "damage" in enabled:
         from features.damage import processor as damage_proc
-        plan.append(("damage", damage_proc, {}))
+        plan.append(("damage", damage_proc, dict(_extras["damage"])))
     return plan
 
 
 def run_camera(
     *,
+    inference_opts: Optional[Dict[str, Any]] = None,
     camera_id: str,
     video_path: str,
     recon_models_dir: str,
@@ -293,7 +335,8 @@ def run_camera(
                       output_dir=states_dir,
                       evidence_root=os.path.join(bundle.dir, "evidence"),
                       segments=roster, verbose=verbose)
-        plan = _feature_plan(camera_id, enabled) if camera_local_features else []
+        plan = (_feature_plan(camera_id, enabled, inference_opts)
+                if camera_local_features else [])
         if not plan and verbose:
             print(f"[SEQ/{camera_id}] camera-local features SKIPPED -- "
                   f"inference runs at global assembly, over the materialized "

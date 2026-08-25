@@ -122,6 +122,25 @@ MODEL_LEFT_UP_TOP_CLASSIFICATION = "ltop.pt"
 # Feature model filenames (in models/features/)
 # -----------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------------
+# Stage-3 inference sampling. ONE definition, read by BOTH pipelines.
+#
+# These lived in three places -- argparse defaults, `process_batch`'s signature,
+# and hardcoded literals in `camera_runner`/`global_assembler` -- which is how
+# the two modes came to disagree: argparse still sent 3/3/2 while the sequential
+# literals had been changed, so the same command sampled in batch and did not in
+# sequential. One tuple now, so that cannot recur.
+#
+# `sampled` runs every Nth frame through EvidenceAggregator; `legacy` runs every
+# frame through the per-feature tracker. LOAD additionally honours `every_nth`,
+# which is why its stride is expressed once here and applied to both.
+STAGE3_DOOR_MODE = "sampled"
+STAGE3_DOOR_STRIDE = 3
+STAGE3_DAMAGE_MODE = "sampled"
+STAGE3_DAMAGE_STRIDE = 3
+STAGE3_LOAD_MODE = "sampled"
+STAGE3_LOAD_STRIDE = 2
+
 MODEL_DOOR_STATE        = "door_state.pt"
 MODEL_LOADED            = "loaded.pt"
 MODEL_DAMAGE            = "damage.pt"

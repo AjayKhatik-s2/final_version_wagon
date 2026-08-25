@@ -573,6 +573,7 @@ def process_batch_sequential(
     recon_models_dir: str,
     feat_models_dir: str,
     feature_config=None,
+    inference_opts=None,
     deliver: bool = False,
     deliver_per_camera: bool = False,
     send_email: bool = False,
@@ -618,6 +619,7 @@ def process_batch_sequential(
             continue
         log.info("[HISTORICAL/%s] --- ARRIVAL (sequential) ---", cam)
         results.append(camera_runner.run_camera(
+            inference_opts=inference_opts,
             camera_id=cam, video_path=vp,
             recon_models_dir=recon_models_dir,
             feat_models_dir=feat_models_dir,
@@ -642,6 +644,7 @@ def process_batch_sequential(
 
     log.info("[HISTORICAL] --- GLOBAL ASSEMBLY %s ---", batch.batch_key)
     asm = global_assembler.assemble(
+            inference_opts=inference_opts,
         evidence_root=evidence_root, output_root=hist_root,
         batch_key=batch.batch_key, feat_models_dir=feat_models_dir,
         deliver=deliver, send_email=send_email, s3_client=s3_client,
@@ -741,6 +744,12 @@ def run(
                 asm = process_batch_sequential(
                     batch,
                     hist_root=hist_root,
+                    # Stage-3 sampling, threaded so --door-sample-stride and
+                    # friends actually apply in SEQUENTIAL mode. They never did:
+                    # only the batch branch received `inference_opts`, so a run
+                    # printed the requested stride and then sampled at the
+                    # hardcoded one.
+                    inference_opts=inference_opts,
                     s3_client=s3_client,
                     recon_models_dir=recon_models_dir,
                     feat_models_dir=feat_models_dir,

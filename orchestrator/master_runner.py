@@ -191,17 +191,17 @@ def process_batch(
     skip_email: bool = False,
     verbose: bool = True,
     feature_config: Optional[FeatureConfig] = None,
-    # NO FRAME IS SKIPPED. "legacy" is each processor's own default and its
-    # every-frame path ("every frame + <feature>Tracker; the known-good path").
-    # The stride values remain as parameters so an operator can still opt into
-    # sampling deliberately, but nothing in the pipeline does.
-    door_inference_mode: str = "legacy",
-    door_sample_stride: int = 1,
-    damage_inference_mode: str = "legacy",
-    damage_sample_stride: int = 1,
-    load_inference_mode: str = "legacy",
-    load_sample_stride: int = 1,
-    load_every_nth: int = 1,
+    # Stage-3 sampling defaults come from `core.constants.STAGE3_*`, the SAME
+    # source the sequential plan and the argparse defaults read, so the two modes
+    # cannot disagree. They were previously duplicated in three places, which is
+    # exactly how they drifted apart.
+    door_inference_mode: str = C.STAGE3_DOOR_MODE,
+    door_sample_stride: int = C.STAGE3_DOOR_STRIDE,
+    damage_inference_mode: str = C.STAGE3_DAMAGE_MODE,
+    damage_sample_stride: int = C.STAGE3_DAMAGE_STRIDE,
+    load_inference_mode: str = C.STAGE3_LOAD_MODE,
+    load_sample_stride: int = C.STAGE3_LOAD_STRIDE,
+    load_every_nth: int = C.STAGE3_LOAD_STRIDE,
 ) -> BatchOutcome:
     if feature_config is None:
         feature_config = FeatureConfig.all_on()
@@ -1324,22 +1324,22 @@ def _build_parser() -> argparse.ArgumentParser:
     # `--door-inference-mode legacy --damage-inference-mode legacy` to restore
     # the pre-optimization pipeline exactly.  Load and OCR are unaffected.
     p.add_argument("--door-inference-mode", choices=("sampled", "legacy"),
-                   default="sampled",
+                   default=C.STAGE3_DOOR_MODE,
                    help="Door Stage-3 inference mode (default: sampled)")
-    p.add_argument("--door-sample-stride", type=int, default=3,
+    p.add_argument("--door-sample-stride", type=int, default=C.STAGE3_DOOR_STRIDE,
                    help="Door frame stride when sampled (default: 3)")
     p.add_argument("--damage-inference-mode", choices=("sampled", "legacy"),
-                   default="sampled",
+                   default=C.STAGE3_DAMAGE_MODE,
                    help="Damage Stage-3 inference mode (default: sampled)")
-    p.add_argument("--damage-sample-stride", type=int, default=3,
+    p.add_argument("--damage-sample-stride", type=int, default=C.STAGE3_DAMAGE_STRIDE,
                    help="Damage frame stride when sampled (default: 3)")
     p.add_argument("--load-inference-mode", choices=("sampled", "legacy"),
-                   default="sampled",
+                   default=C.STAGE3_LOAD_MODE,
                    help="Load Stage-3 inference mode (default: sampled). NOTE: "
                         "Load already sampled at every_nth=2, so sampled/2 is "
                         "behaviourally identical to legacy -- the flag only "
                         "makes the stride explicit.")
-    p.add_argument("--load-sample-stride", type=int, default=2,
+    p.add_argument("--load-sample-stride", type=int, default=C.STAGE3_LOAD_STRIDE,
                    help="Load frame stride when sampled (default: 2)")
     p.add_argument("--mode", choices=("batch", "sequential"),
                    default="sequential",

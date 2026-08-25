@@ -78,20 +78,34 @@ class TestOrchestratorSelectsSampled(unittest.TestCase):
         self.assertEqual(a.damage_inference_mode, "sampled")
         self.assertEqual(a.load_inference_mode, "sampled")
 
-    def test_process_batch_defaults_to_every_frame(self):
-        """Reversed 2026-08-23 on operator instruction: skip no frame anywhere.
+    def test_process_batch_defaults_to_the_production_sampling(self):
+        """Production defaults: Door sampled/3, Damage sampled/3, Load sampled/2.
 
-        The sampled path is NOT removed -- it stays reachable per feature -- but
-        nothing selects it by default. `legacy` is each processor's own default
-        and its every-frame path.
+        Read from `core.constants.STAGE3_*` rather than repeated here, because
+        duplicating them is how the modes drifted apart in the first place: the
+        argparse defaults, this signature and the sequential plan each carried
+        their own copy.
         """
         from orchestrator.master_runner import process_batch
         p = inspect.signature(process_batch).parameters
-        for feat in ("door", "damage", "load"):
-            self.assertEqual(p[f"{feat}_inference_mode"].default, "legacy")
-            self.assertEqual(p[f"{feat}_sample_stride"].default, 1)
-        # Load samples even in legacy mode unless told otherwise.
-        self.assertEqual(p["load_every_nth"].default, 1)
+        self.assertEqual(p["door_inference_mode"].default, C.STAGE3_DOOR_MODE)
+        self.assertEqual(p["door_sample_stride"].default, C.STAGE3_DOOR_STRIDE)
+        self.assertEqual(p["damage_inference_mode"].default, C.STAGE3_DAMAGE_MODE)
+        self.assertEqual(p["damage_sample_stride"].default,
+                         C.STAGE3_DAMAGE_STRIDE)
+        self.assertEqual(p["load_inference_mode"].default, C.STAGE3_LOAD_MODE)
+        self.assertEqual(p["load_sample_stride"].default, C.STAGE3_LOAD_STRIDE)
+        # Load samples even in legacy mode, so its every_nth must match.
+        self.assertEqual(p["load_every_nth"].default, C.STAGE3_LOAD_STRIDE)
+
+    def test_the_production_values_are_3_3_2(self):
+        self.assertEqual((C.STAGE3_DOOR_MODE, C.STAGE3_DOOR_STRIDE),
+                         ("sampled", 3))
+        self.assertEqual((C.STAGE3_DAMAGE_MODE, C.STAGE3_DAMAGE_STRIDE),
+                         ("sampled", 3))
+        self.assertEqual((C.STAGE3_LOAD_MODE, C.STAGE3_LOAD_STRIDE),
+                         ("sampled", 2))
+
 
     def test_sampling_is_still_reachable_on_request(self):
         """Removing the capability was not asked for, only the default."""

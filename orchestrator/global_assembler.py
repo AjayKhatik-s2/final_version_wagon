@@ -202,6 +202,21 @@ def _load_wagon_region(bundle: CameraEvidenceBundle):
 #:
 #: The strides that were here (door 3, damage 3, load 2) are gone rather than set
 #: to 1, so there is no dormant value to be quietly re-enabled.
+def stage3_order(inference_opts=None):
+    """Stage-3 order + per-feature args, from the ONE shared builder.
+
+    Order is fixed -- LOAD first, because the damage processor reads the sibling
+    load JSON -- while the arguments come from
+    `camera_runner.stage3_extras`, the same builder the per-camera plan uses. A
+    second copy of these literals here is what let assembly and camera
+    processing sample differently.
+    """
+    from orchestrator.camera_runner import stage3_extras
+    e = stage3_extras(inference_opts)
+    return (("load", e["load"]), ("door", e["door"]),
+            ("damage", e["damage"]), ("ocr", e["ocr"]))
+
+
 _FEATURE_ORDER = (
     ("load",   dict(every_nth=1)),
     ("door",   {}),
@@ -258,6 +273,7 @@ def _feature_module(name: str):
 
 def assemble(
     *,
+    inference_opts: Optional[Dict[str, Any]] = None,
     evidence_root: str,
     output_root: str,
     batch_key: str,
@@ -488,7 +504,7 @@ def assemble(
                           evidence_root=global_evidence, verbose=verbose)
     t0 = time.perf_counter()
     wanted = (None if enabled_features is None else set(enabled_features))
-    for name, extra in _FEATURE_ORDER:
+    for name, extra in stage3_order(inference_opts):
         if wanted is not None and name not in wanted:
             print(f"[ASSEMBLY/{name}] DISABLED by feature config -- skipped")
             res.feature_summary[name] = {}
