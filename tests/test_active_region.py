@@ -40,6 +40,7 @@ from core import active_region as AR                              # noqa: E402
 from core.global_state_loader import parse_global_train_state      # noqa: E402
 import train_structure as ts                                      # noqa: E402
 from global_train_state import GlobalWagon, SegmentClass           # noqa: E402
+RU_M = C.CAMERA_RIGHT_UP
 
 FPS = 15.0
 SEG = 60                        # frames per segment -> 4.0 s
@@ -405,3 +406,143 @@ class TestBothPipelinesUseTheOneResolver(unittest.TestCase):
         audit = CTR.audit_report_integrity(state=st, wagons_in_order=wagons,
                                            verbose=False)
         self.assertTrue(audit["ok"])
+
+
+# ---------------------------------------------------------------------------
+# The reported failure: "the region says not-active though a wagon has started"
+# ---------------------------------------------------------------------------
+
+class TestTheFirstWagonIsNeverLostToALateStart(unittest.TestCase):
+    """The START carries no delay, and the diagnostic proves it per train.
+
+    `train_structure` sets `wagon_start_frame = wagon_units[0].start_frame_master`
+    -- the first canonical wagon's OWN start. So GW_1 cannot fall outside the
+    region: the region's start IS GW_1's start. `frames_after_first_wagon` is
+    reported anyway, so a future regression that introduced a delay would show
+    up as a number rather than have to be inferred.
+    """
+
+    def test_the_start_equals_the_first_canonical_wagons_own_frame(self):
+        for labels in ([E, W, W, W, B], [E, B, W, W], [W, W, W],
+                       [E, E, E, W, W, B, E]):
+            st, _ = _state_from(labels)
+            r = _resolve(st)
+            self.assertEqual(r.start.frame, st.wagons[0].start_frame_master,
+                             f"{labels}: the region opened after its own GW_1")
+            self.assertEqual(r.start.frames_after_first_wagon, 0)
+            self.assertEqual(r.start.first_wagon_global_id, "GW_1")
+            self.assertEqual(r.start.reason, "first_canonical_wagon")
+
+    def test_the_first_wagon_at_frame_100_is_gw_1(self):
+        """The reported scenario: first wagon begins well into the train."""
+        labels = [E, B] + [W] * 4          # segments 0,1 non-wagon; 2.. wagons
+        st, _ = _state_from(labels)
+        self.assertEqual(st.wagons[0].start_frame_master, 2 * SEG)
+        r = _resolve(st)
+        self.assertEqual(r.start.frame, 2 * SEG)
+        self.assertEqual(r.eligible_global_ids[0], "GW_1")
+        self.assertEqual(len(r.eligible_global_ids), 4,
+                         "a wagon was lost at the leading edge")
+
+    def test_the_start_diagnostic_names_the_first_wagon_and_the_delta(self):
+        st, _ = _state_from([E, W, W])
+        line = _resolve(st).start.render()
+        for bit in ("master_first_wagon_frame=", "first_wagon=GW_1",
+                    "frames_after_first_wagon=0",
+                    "reason=first_canonical_wagon"):
+            self.assertIn(bit, line)
+
+    def test_a_brief_first_wagon_is_still_gw_1(self):
+        """Short but canonical: the window takes the FIRST wagon segment, not
+        the first sustained run, so brevity cannot push the start later."""
+        st, _ = _state_from([E, W, W, W, W])
+        r = _resolve(st)
+        self.assertEqual(r.start.frame, st.wagons[0].start_frame_master)
+        self.assertEqual(len(r.eligible_global_ids), 4)
+
+    def test_a_top_camera_wagon_run_before_the_start_cannot_open_it(self):
+        st, _ = _state_from([E, E, W, W])
+        r = _resolve(st, {RUT: _recs([W, W, W, W])})
+        self.assertEqual(r.start.frame, 2 * SEG, "a top camera opened the region")
+        self.assertEqual(r.start.frames_after_first_wagon, 0)
+
+
+class TestTheMissedGapDiagnostic(unittest.TestCase):
+    """A loco+wagon merged into ONE segment by a missed gap is the real cause of
+    a lost first wagon -- and cannot be fixed by relabelling, because there is
+    no boundary to split. This surfaces it with numbers instead."""
+
+    def _merged(self, lead_segments=3):
+        """A leading ENGINE segment `lead_segments` wagon-lengths long."""
+        from global_train_state import GlobalWagon
+        segs = []
+        # one long leading ENGINE, then 4 normal wagons
+        segs.append(GlobalWagon(
+            global_id="S_0", wagon_index=0,
+            start_frame_master=0, end_frame_master=SEG * lead_segments - 1,
+            start_time=0.0, end_time=SEG * lead_segments / FPS,
+            classification=E, classification_confidence=0.71,
+            supporting_cameras=list(C.ALL_CAMERAS)))
+        for i in range(4):
+            sf = SEG * lead_segments + i * SEG
+            segs.append(GlobalWagon(
+                global_id=f"S_{i+1}", wagon_index=i + 1,
+                start_frame_master=sf, end_frame_master=sf + SEG - 1,
+                start_time=sf / FPS, end_time=(sf + SEG) / FPS,
+                classification=W, classification_confidence=0.97,
+                supporting_cameras=list(C.ALL_CAMERAS)))
+        win = ts.get_master_wagon_window(segs, verbose=False)
+        doc = {"total_wagons": len(win.wagon_units), "master_camera": RU_M,
+               "master_fps": FPS,
+               "master_total_frames": SEG * (lead_segments + 4),
+               "wagon_window": win.summary(),
+               "wagons": [{
+                   "global_id": w.global_id, "wagon_index": w.wagon_index,
+                   "start_frame_master": w.start_frame_master,
+                   "end_frame_master": w.end_frame_master,
+                   "start_time": w.start_time, "end_time": w.end_time,
+                   "classification": w.classification,
+                   "classification_confidence": w.classification_confidence,
+                   "supporting_cameras": list(C.ALL_CAMERAS)}
+                   for w in win.wagon_units]}
+        return parse_global_train_state(doc)
+
+    def test_an_over_long_leading_segment_is_flagged(self):
+        st = self._merged(lead_segments=3)
+        r = _resolve(st)
+        self.assertEqual(len(r.suspect_merged_segments), 1,
+                         "a 3-wagon-long leading ENGINE was not flagged")
+        sm = r.suspect_merged_segments[0]
+        self.assertEqual(sm["position"], "leading")
+        self.assertEqual(sm["classification"], E)
+        self.assertEqual(sm["reason"], AR.REASON_SUSPECT_MISSED_GAP)
+        self.assertGreater(sm["wagon_lengths"], 1.8)
+        self.assertIn("missed gap", sm["note"])
+
+    def test_a_normal_length_locomotive_is_not_flagged(self):
+        """A real loco is roughly one wagon long -- flagging it would cry wolf
+        on every train."""
+        st = self._merged(lead_segments=1)
+        self.assertEqual(_resolve(st).suspect_merged_segments, [])
+
+    def test_the_diagnostic_changes_no_count(self):
+        st = self._merged(lead_segments=3)
+        before = [w.global_id for w in st.wagons]
+        r = _resolve(st)
+        self.assertEqual([w.global_id for w in st.wagons], before)
+        self.assertEqual(len(r.eligible_global_ids), 4)
+        self.assertTrue(r.gate_held)
+
+    def test_it_is_measured_against_this_trains_own_wagons(self):
+        """Ratio, not an absolute frame count, so it scales with fps and speed."""
+        self.assertGreater(AR.DEFAULT_SUSPECT_LENGTH_RATIO, 1.0)
+        st = self._merged(lead_segments=3)
+        sm = _resolve(st).suspect_merged_segments[0]
+        self.assertAlmostEqual(sm["median_wagon_sec"], SEG / FPS, places=3)
+
+    def test_the_audit_exposes_it(self):
+        st = self._merged(lead_segments=3)
+        d = _resolve(st).to_dict()
+        self.assertIn("suspect_merged_segments", d)
+        self.assertIn("start_reason", d)
+        self.assertEqual(d["start_reason"], "first_canonical_wagon")

@@ -452,12 +452,39 @@ def _gap_tracks_for(tracking: Dict[str, Any], camera_id: str) -> List[Dict[str, 
     return out
 
 
-def _draw_gap_boxes(frame, gaps: List[Dict[str, Any]], frame_idx: int) -> int:
+def _gap_neighbours(boundary_map: Dict[int, Tuple[str, str]],
+                    gap: Dict[str, Any]) -> str:
+    """`GW_n | GAP_id | GW_n+1` for a gap, or just the gap id.
+
+    The adjacency comes from the canonical roster's own frame ranges, so the
+    label names the wagons the reconstruction actually put either side of this
+    boundary. It is NOT derived from wagon arithmetic or an assumed spacing.
+    """
+    gid = gap.get("track_id", "?")
+    key = None
+    for f in (gap.get("start_frame"), gap.get("end_frame")):
+        if f is not None and int(f) in boundary_map:
+            key = int(f)
+            break
+    if key is None:
+        return f"GAP_{gid}"
+    prev_gw, next_gw = boundary_map[key]
+    if prev_gw and next_gw:
+        return f"{prev_gw} | GAP_{gid} | {next_gw}"
+    return f"GAP_{gid}"
+
+
+def _draw_gap_boxes(frame, gaps: List[Dict[str, Any]], frame_idx: int,
+                    boundary_map: Optional[Dict[int, Tuple[str, str]]] = None,
+                    drawn_provenance: Optional[List[Dict[str, Any]]] = None,
+                    camera_id: str = "") -> int:
     """Cyan box for every gap live on this frame. Returns how many were drawn.
 
-    Interpolation between recorded hits comes from the counting engine's own
-    `_interp_gap_bbox` -- CALLED, not copied, so the repository keeps one
-    interpolation algorithm rather than two that can drift.
+    The geometry is the gap's OWN recorded trajectory -- `bbox_history` at a
+    recorded hit, otherwise the counting engine's `_interp_gap_bbox`, CALLED not
+    copied. Nothing is placed at an assumed x-coordinate and nothing is derived
+    from wagon numbers, so the marker tracks the real object across frames and
+    each camera uses its own image-plane geometry.
     """
     drawn = 0
     try:
@@ -489,9 +516,24 @@ def _draw_gap_boxes(frame, gaps: List[Dict[str, Any]], frame_idx: int) -> int:
             continue
         x1, y1, x2, y2 = (int(round(float(v))) for v in bbox[:4])
         cv2.rectangle(frame, (x1, y1), (x2, y2), _GAP_COLOR, 2)
-        cv2.putText(frame, f"GAP {g.get('track_id', '')}", (x1, max(12, y1 - 6)),
+        label = _gap_neighbours(boundary_map or {}, g)
+        cv2.putText(frame, label, (x1, max(12, y1 - 6)),
                     _FONT, 0.5, _GAP_COLOR, 1, cv2.LINE_AA)
         drawn += 1
+        if drawn_provenance is not None:
+            drawn_provenance.append({
+                "camera_id": camera_id,
+                "local_gap_track_id": g.get("track_id"),
+                "global_gap_id": g.get("global_gap_id",
+                                       g.get("master_track_id")),
+                "frame": frame_idx,
+                "bbox": [round(float(v), 2) for v in bbox[:4]],
+                "center_x": round((float(bbox[0]) + float(bbox[2])) / 2.0, 2),
+                "label": label,
+                "geometry": ("recorded_hit" if frame_idx in hits
+                             else "interpolated"),
+                "resolved": True,
+            })
     return drawn
 
 
@@ -627,6 +669,24 @@ def _render_one_camera(
             boundary_frames.append(sf)
     boundary_frames = sorted(set(boundary_frames))
 
+    # boundary frame -> (previous GW, next GW), from the canonical roster's own
+    # frame ranges. This is what lets a gap be labelled "GW_25 | GAP_x | GW_26"
+    # using the wagons the reconstruction actually placed either side of it --
+    # never inferred from wagon numbering or an assumed spacing.
+    _boundary_map: Dict[int, Tuple[str, str]] = {}
+    _ordered = []
+    for w in state.wagons:
+        sf, ef = _map_wagon_to_local_frames(w, src_fps, total, time_offset)
+        if ef >= sf:
+            _ordered.append((sf, ef, w.global_id))
+    _ordered.sort()
+    for _i in range(1, len(_ordered)):
+        _prev, _next = _ordered[_i - 1], _ordered[_i]
+        # A gap sits between the previous wagon's end and the next one's start;
+        # index it under both so a gap track touching either is labelled.
+        for _f in (_prev[1], _next[0]):
+            _boundary_map[int(_f)] = (_prev[2], _next[2])
+
     # Wagon-ACTIVE-REGION edges, projected into this camera's frames. Read from
     # the master's `wagon_window` -- the canonical source -- so the video cannot
     # disagree with the report about where the region is.
@@ -665,6 +725,7 @@ def _render_one_camera(
             _frame_to_nonwagon[_f] = (_cls, _pos)
 
     # Per-camera audit, so every annotation is traceable to its source.
+    _gap_provenance: List[Dict[str, Any]] = []
     _audit: Dict[str, Any] = {
         "camera_id": camera_id,
         "output": output_path,
@@ -685,6 +746,23 @@ def _render_one_camera(
         "active_region_found": _region_found,
         "active_region_start_frame": _region_frames["start"],
         "active_region_end_frame": _region_frames["end"],
+        "active_region": {
+            "start": _region_frames["start"],
+            "end": _region_frames["end"],
+            "start_reason": ("first_canonical_wagon" if _region_found
+                             else "no_wagon_evidence_anywhere"),
+            "end_reason": ("last_canonical_wagon" if _region_found
+                           else "no_wagon_evidence_anywhere"),
+            "found": _region_found,
+        },
+        "unresolved_gaps": [
+            {"local_gap_track_id": g.get("track_id"),
+             "start_frame": g.get("start_frame"),
+             "end_frame": g.get("end_frame"),
+             "status": "UNRESOLVED",
+             "reason": "serialized without bbox_history/hit_frames "
+                       "(GapEvent.to_dict is a reporting view)"}
+            for g in gap_tracks if not g.get("_resolved")],
         "non_wagon_objects": [
             {"start_frame": a, "end_frame": b, "classification": c,
              "position": d, "global_wagon_id": None}
@@ -736,7 +814,10 @@ def _render_one_camera(
         # no tracker, no second count: gaps come from the Stage-1 tracking JSON,
         # wagon ids and boundaries from the canonical roster, the region from the
         # master's own `wagon_window`, and the load verdict from the fused state.
-        n_gaps = _draw_gap_boxes(frame, gap_tracks, frame_idx)
+        n_gaps = _draw_gap_boxes(frame, gap_tracks, frame_idx,
+                                 boundary_map=_boundary_map,
+                                 drawn_provenance=_gap_provenance,
+                                 camera_id=camera_id)
         _audit["gap_markers_drawn"] += n_gaps
         _draw_boundary_flash(frame, boundary_frames, frame_idx)
 
@@ -799,6 +880,13 @@ def _render_one_camera(
     # The file must be closed before ffmpeg reads it.
     if codec == _FALLBACK_CODEC:
         _transcode_to_h264(output_path, verbose=verbose)
+    # Per-marker provenance, capped so a long train's audit stays readable.
+    # Every marker is included in the counts; the sample proves which ACTUAL
+    # local gap track produced a marker and at which frame.
+    _audit["gap_marker_provenance_sample"] = _gap_provenance[:200]
+    _audit["gap_marker_provenance_total"] = len(_gap_provenance)
+    _audit["distinct_gap_tracks_drawn"] = sorted(
+        {str(p["local_gap_track_id"]) for p in _gap_provenance})
     _audit["frames_written"] = written
     _audit["codec"] = codec
     try:

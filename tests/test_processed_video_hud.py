@@ -454,3 +454,131 @@ class TestVideoAndPdfShareTheSameIdentities(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertEqual(len(a["global_wagon_ids_shown"]), 3)
         self.assertEqual(len(a["non_wagon_objects"]), 2)
+
+
+class TestGapsAreTheRealDetectedGaps(unittest.TestCase):
+    """The marker must be the gap's OWN tracked geometry -- not a vertical line
+    at an assumed boundary, and not a fixed x for every gap."""
+
+    def _moving_gap(self, camera_id, x0=60.0, drift=6.0):
+        """A gap whose recorded trajectory MOVES across the frame."""
+        hits = list(range(25, 36))
+        hist = [[x0 + drift * i, 80.0, x0 + drift * i + 40.0, 200.0]
+                for i, _ in enumerate(hits)]
+        return {camera_id: {"fps": FPS, "total_frames": NF,
+                            "width": WH[0], "height": WH[1],
+                            "gaps": [{"track_id": 3, "start_frame": 25,
+                                      "end_frame": 35, "hit_frames": hits,
+                                      "bbox_history": hist}]}}
+
+    def test_the_marker_follows_the_recorded_trajectory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _render(C.CAMERA_RIGHT_UP, tmp,
+                    tracking=self._moving_gap(C.CAMERA_RIGHT_UP))
+        prov = R.RENDER_AUDITS[C.CAMERA_RIGHT_UP]["gap_marker_provenance_sample"]
+        xs = [p["center_x"] for p in sorted(prov, key=lambda p: p["frame"])]
+        self.assertGreater(len(xs), 3)
+        self.assertGreater(xs[-1], xs[0],
+                           "the gap marker did not move with the trajectory")
+        self.assertEqual(len(set(xs)), len(xs),
+                         "the marker sat at one fixed x for every frame")
+
+    def test_the_geometry_source_is_recorded_per_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _render(C.CAMERA_RIGHT_UP, tmp,
+                    tracking=self._moving_gap(C.CAMERA_RIGHT_UP))
+        prov = R.RENDER_AUDITS[C.CAMERA_RIGHT_UP]["gap_marker_provenance_sample"]
+        for p in prov:
+            self.assertIn(p["geometry"], ("recorded_hit", "interpolated"))
+            self.assertEqual(p["camera_id"], C.CAMERA_RIGHT_UP)
+            self.assertEqual(p["local_gap_track_id"], 3)
+            self.assertTrue(p["resolved"])
+
+    def test_two_cameras_do_not_share_a_pixel_coordinate(self):
+        """Their image planes differ, so copying RIGHT_UP's x onto another
+        camera would be wrong even when the global boundary is the same."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _render(C.CAMERA_RIGHT_UP, tmp,
+                    tracking=self._moving_gap(C.CAMERA_RIGHT_UP, x0=40.0))
+            a = [p["center_x"] for p in
+                 R.RENDER_AUDITS[C.CAMERA_RIGHT_UP]["gap_marker_provenance_sample"]]
+        with tempfile.TemporaryDirectory() as tmp:
+            _render(C.CAMERA_LEFT_UP, tmp,
+                    tracking=self._moving_gap(C.CAMERA_LEFT_UP, x0=180.0))
+            b = [p["center_x"] for p in
+                 R.RENDER_AUDITS[C.CAMERA_LEFT_UP]["gap_marker_provenance_sample"]]
+        self.assertTrue(a and b)
+        self.assertNotEqual(a, b,
+                            "two cameras rendered identical gap coordinates")
+
+    def test_the_gap_is_labelled_with_its_adjacent_canonical_wagons(self):
+        st = _state_with_engine()          # GW_1..GW_3 at 20-49
+        tracking = {C.CAMERA_RIGHT_UP: {
+            "fps": FPS, "total_frames": NF,
+            "gaps": [{"track_id": 9, "start_frame": 29, "end_frame": 31,
+                      "hit_frames": [29, 30, 31],
+                      "bbox_history": [[100.0, 80.0, 140.0, 200.0]] * 3}]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            _render(C.CAMERA_RIGHT_UP, tmp, state=st, tracking=tracking)
+        prov = R.RENDER_AUDITS[C.CAMERA_RIGHT_UP]["gap_marker_provenance_sample"]
+        labels = {p["label"] for p in prov}
+        self.assertTrue(any("GW_1" in l and "GW_2" in l for l in labels),
+                        f"the gap was not labelled with its neighbours: {labels}")
+        self.assertTrue(any("GAP_9" in l for l in labels))
+
+    def test_no_marker_where_the_gap_is_not_live(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _render(C.CAMERA_RIGHT_UP, tmp,
+                    tracking=self._moving_gap(C.CAMERA_RIGHT_UP))
+        prov = R.RENDER_AUDITS[C.CAMERA_RIGHT_UP]["gap_marker_provenance_sample"]
+        frames = {p["frame"] for p in prov}
+        self.assertFalse(frames & {0, 5, 20, 50, 59},
+                         "a gap marker was drawn outside the gap's own range")
+
+    def test_the_audit_separates_resolved_from_unresolved(self):
+        mixed = {C.CAMERA_RIGHT_UP: {
+            "fps": FPS, "total_frames": NF,
+            "gaps": [
+                {"track_id": 1, "start_frame": 25, "end_frame": 27,
+                 "hit_frames": [25, 26, 27],
+                 "bbox_history": [[10.0, 10.0, 50.0, 90.0]] * 3},
+                {"track_id": 2, "start_frame": 40, "end_frame": 42},
+            ]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            _render(C.CAMERA_RIGHT_UP, tmp, tracking=mixed)
+        a = R.RENDER_AUDITS[C.CAMERA_RIGHT_UP]
+        self.assertEqual(a["gap_tracks_total"], 2)
+        self.assertEqual(a["gap_tracks_resolved"], 1)
+        self.assertEqual(a["gap_tracks_unresolved"], 1)
+        self.assertEqual([u["local_gap_track_id"] for u in a["unresolved_gaps"]],
+                         [2])
+        self.assertEqual(a["distinct_gap_tracks_drawn"], ["1"])
+
+    def test_the_active_region_block_has_both_reasons(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _render(C.CAMERA_RIGHT_UP, tmp, state=_state_with_engine())
+        ar = R.RENDER_AUDITS[C.CAMERA_RIGHT_UP]["active_region"]
+        self.assertEqual(ar["start"], 20)
+        self.assertEqual(ar["end"], 49)
+        self.assertEqual(ar["start_reason"], "first_canonical_wagon")
+        self.assertEqual(ar["end_reason"], "last_canonical_wagon")
+
+    def test_region_markers_and_gap_markers_are_different_things(self):
+        """The active-region edge must not be drawn as, or replace, a gap."""
+        st = _state_with_engine()
+        tracking = {C.CAMERA_RIGHT_UP: {
+            "fps": FPS, "total_frames": NF,
+            "gaps": [{"track_id": 4, "start_frame": 29, "end_frame": 31,
+                      "hit_frames": [29, 30, 31],
+                      "bbox_history": [[100.0, 80.0, 140.0, 200.0]] * 3}]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            out = _render(C.CAMERA_RIGHT_UP, tmp, state=st, tracking=tracking)
+            fr = _frames(out, {20, 30})
+        # frame 20 = region START, no gap live -> region colour, no gap colour
+        self.assertTrue(_has_colour(fr[20], R._REGION_COLOR))
+        self.assertFalse(_has_colour(fr[20], R._GAP_COLOR),
+                         "a gap box was drawn at the region boundary")
+        # frame 30 = a real gap, not a region edge
+        self.assertTrue(_has_colour(fr[30], R._GAP_COLOR))
+        prov = R.RENDER_AUDITS[C.CAMERA_RIGHT_UP]["gap_marker_provenance_sample"]
+        self.assertTrue(all(p["frame"] in (29, 30, 31) for p in prov))

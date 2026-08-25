@@ -40,6 +40,7 @@ from core.unified_wagon_state import UnifiedWagonState, summarize_wagons
 from . import _brand
 from . import _adapter
 from . import _evidence_lookup as ev
+from . import wagon_evidence_grid as WG
 
 
 _REPORT_SCHEMA = "wagon_eye.combined_report.v4"
@@ -219,6 +220,27 @@ def audit_report_integrity(
     return audit
 
 
+def _camera_meta_for_manifest(state, wagon_states_root):
+    """`{camera: {fps, total_frames}}` for frame selection.
+
+    Read from the per-camera tracking JSON the pipeline already wrote; falls
+    back to the master's fps/frames, which is what the historical shared-t=0
+    assumption implies. Nothing is derived from video here.
+    """
+    out = {}
+    master_fps = float(getattr(state, "master_fps", 0.0) or 0.0)
+    master_total = int(getattr(state, "master_total_frames", 0) or 0)
+    counts = dict(getattr(state, "per_camera_local_counts", None) or {})
+    for cam in C.ALL_CAMERAS:
+        meta = counts.get(cam) if isinstance(counts.get(cam), dict) else {}
+        out[cam] = {
+            "fps": float((meta or {}).get("fps") or master_fps),
+            "total_frames": int((meta or {}).get("total_frames")
+                                or master_total),
+        }
+    return out
+
+
 def _build_json(
     *,
     state: GlobalTrainState,
@@ -273,6 +295,7 @@ def _build_json(
 
 def _build_pdf(
     *,
+    report_manifest: Optional[Dict[str, Any]] = None,
     state: GlobalTrainState,
     unified: Dict[str, UnifiedWagonState],
     vm: _adapter.LegacyViewModel,
@@ -580,6 +603,25 @@ def _build_pdf(
     if evidence_blocks:
         elements.append(PageBreak())
         elements.extend(evidence_blocks)
+
+    # ----- 8. WAGON EVIDENCE GRID: every canonical GW, all four cameras -----
+    # Driven by the MANIFEST, which is driven by `state.wagons`, so a wagon with
+    # no feature finding still gets its sixteen slots and cannot drop out. The
+    # PDF and the audit read the same selection, so they cannot disagree about
+    # which image is on which page.
+    if report_manifest:
+        try:
+            elements.extend(build_wagon_grid_section(report_manifest, styles))
+        except Exception as e:  # noqa: BLE001 -- a section must not kill the PDF
+            print(f"[REPORT] wagon evidence grid failed: "
+                  f"{type(e).__name__}: {e}")
+
+        # ----- 9. FINAL: damage only, grouped by canonical GW -----
+        try:
+            elements.extend(build_damage_summary_section(report_manifest,
+                                                        styles))
+        except Exception as e:  # noqa: BLE001
+            print(f"[REPORT] damage summary failed: {type(e).__name__}: {e}")
 
     doc.build(elements)
     return output_pdf
@@ -1414,9 +1456,30 @@ def build(
     if verbose:
         print(f"[STAGE5] wrote {json_path}")
 
+    # ---- report manifest: the AUTHORITATIVE record of PDF evidence ----
+    # Built once, consumed by the PDF, and written to disk. The PDF selects
+    # nothing on its own, so the audit cannot disagree with the pages.
+    report_manifest: Dict[str, Any] = {}
+    try:
+        _dmg = WG.damage_from_evidence(evidence_root=evidence_root,
+                                       state=state, verbose=verbose)
+        report_manifest = WG.build_manifest(
+            state=state, cache_root=cache_root,
+            camera_meta=_camera_meta_for_manifest(state, wagon_states_root),
+            damage_by_wagon=_dmg, verbose=verbose)
+        _mp = os.path.join(output_dir, "combined_report_manifest.json")
+        with open(_mp, "w", encoding="utf-8") as f:
+            json.dump(report_manifest, f, indent=2, default=str)
+        if verbose:
+            print(f"[STAGE5] wrote {_mp}")
+    except Exception as e:  # noqa: BLE001 -- the PDF must still be attempted
+        print(f"[STAGE5] report manifest FAILED: {type(e).__name__}: {e}")
+        report_manifest = {}
+
     pdf_path: Optional[str] = os.path.join(output_dir, "combined_train_report.pdf")
     try:
         _build_pdf(
+            report_manifest=report_manifest,
             state=state, unified=unified, vm=vm,
             batch_key=batch_key, output_pdf=pdf_path,
             evidence_root=evidence_root,
@@ -1437,4 +1500,264 @@ def build(
     if verbose:
         print(f"[STAGE5] done in {time.time() - t0:.1f}s")
     return {"json_path": json_path, "pdf_path": pdf_path,
+            "report_manifest": report_manifest,
             "report_integrity": integrity}
+
+
+# -----------------------------------------------------------------------------
+# Wagon-by-wagon evidence grid: TOP cameras, then SIDE cameras, per canonical GW
+# -----------------------------------------------------------------------------
+
+def _grid_image(path, styles, *, cell_w, cell_h):
+    """One evidence cell. Never scales an image beyond the cell."""
+    from reportlab.platypus import Image, Paragraph
+    from reportlab.lib.units import inch
+    try:
+        img = Image(path, width=cell_w, height=cell_h, kind="proportional")
+        img.hAlign = "CENTER"
+        return img
+    except Exception:                                            # noqa: BLE001
+        return Paragraph("<b>IMAGE UNREADABLE</b>", styles["_gridmiss"])
+
+
+def _grid_placeholder(reason, styles):
+    """An explicitly EMPTY slot. Never a repeated image.
+
+    Four copies of one frame reads as four pieces of evidence, so a missing slot
+    says so and names the reason the manifest recorded.
+    """
+    from reportlab.platypus import Paragraph
+    return Paragraph(
+        f"<b>NO VALID FRAME</b><br/><font size=6>{reason or 'unavailable'}</font>",
+        styles["_gridmiss"])
+
+
+def _camera_row(cam_slots, camera_id, styles, *, cell_w, cell_h):
+    """`[label, cell, cell, cell, cell]` for one camera's four slots."""
+    from reportlab.platypus import Paragraph
+    row = [Paragraph(f"<b>{camera_id}</b>", styles["_gridcam"])]
+    for s in cam_slots:
+        if s.get("available") and s.get("image_path"):
+            row.append(_grid_image(s["image_path"], styles,
+                                   cell_w=cell_w, cell_h=cell_h))
+        else:
+            row.append(_grid_placeholder(s.get("unavailable_reason"), styles))
+    while len(row) < 1 + WG.SLOTS_PER_CAMERA:
+        row.append(_grid_placeholder("missing slot", styles))
+    return row
+
+
+def _caption_row(cam_slots, styles):
+    """Per-image caption: camera, frame, timestamp. The frame number printed
+    here is read from the manifest, which read it from the FILENAME -- so the
+    number under an image is provably the file above it."""
+    from reportlab.platypus import Paragraph
+    row = [Paragraph("", styles["_gridcap"])]
+    for s in cam_slots:
+        if s.get("available"):
+            t = s.get("timestamp_sec")
+            row.append(Paragraph(
+                f"{s['camera_id']}<br/>f{s.get('source_frame')}"
+                + (f" @ {float(t):.2f}s" if t is not None else ""),
+                styles["_gridcap"]))
+        else:
+            row.append(Paragraph(f"{s['camera_id']}<br/>-", styles["_gridcap"]))
+    while len(row) < 1 + WG.SLOTS_PER_CAMERA:
+        row.append(Paragraph("", styles["_gridcap"]))
+    return row
+
+
+def _camera_block(entry, cameras, title, styles, *, cell_w, cell_h):
+    """A titled 2x4 grid for one camera pair (TOP or SIDE)."""
+    from reportlab.platypus import Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+
+    data = [[Paragraph(f"<b>{title}</b>", styles["_gridsec"])]
+            + [""] * WG.SLOTS_PER_CAMERA]
+    for cam in cameras:
+        slots = entry["cameras"].get(cam, [])
+        data.append(_camera_row(slots, cam, styles,
+                                cell_w=cell_w, cell_h=cell_h))
+        data.append(_caption_row(slots, styles))
+
+    t = Table(data, colWidths=[0.95 * inch] + [cell_w + 6] * WG.SLOTS_PER_CAMERA)
+    t.setStyle(TableStyle([
+        ("SPAN", (0, 0), (-1, 0)),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#12233f")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+        ("GRID", (0, 1), (-1, -1), 0.4, colors.HexColor("#b9c4d4")),
+        ("BOX", (0, 0), (-1, -1), 0.9, colors.HexColor("#12233f")),
+        ("TOPPADDING", (0, 1), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 3),
+    ]))
+    return [t, Spacer(1, 0.10 * inch)]
+
+
+def _wagon_header(entry, styles):
+    from reportlab.platypus import Table, TableStyle, Paragraph
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+    gw = entry["global_id"]
+    sub = (f"{entry.get('classification') or '-'}   "
+           f"wagon {entry.get('wagon_index')} of {entry.get('total_wagons')}   "
+           f"evidence {entry.get('available_images')}/"
+           f"{entry.get('expected_images')}")
+    t = Table([[Paragraph(f"<b>GLOBAL WAGON {gw}</b>", styles["_gridhdr"])],
+               [Paragraph(sub, styles["_gridsub"])]],
+              colWidths=[10.6 * inch])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f2038")),
+        ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#e8edf4")),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    return t
+
+
+def _register_grid_styles(styles):
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib import colors
+    for name, kw in (
+        ("_gridhdr", dict(fontSize=17, textColor=colors.white,
+                          alignment=TA_CENTER, fontName="Helvetica-Bold")),
+        ("_gridsub", dict(fontSize=9, textColor=colors.HexColor("#33465f"),
+                          alignment=TA_CENTER)),
+        ("_gridsec", dict(fontSize=11, textColor=colors.white,
+                          alignment=TA_CENTER, fontName="Helvetica-Bold")),
+        ("_gridcam", dict(fontSize=8, alignment=TA_CENTER,
+                          fontName="Helvetica-Bold")),
+        ("_gridcap", dict(fontSize=6.5, alignment=TA_CENTER,
+                          textColor=colors.HexColor("#44556b"))),
+        ("_gridmiss", dict(fontSize=7, alignment=TA_CENTER,
+                           textColor=colors.HexColor("#b03030"))),
+    ):
+        if name in styles:
+            continue
+        st = ParagraphStyle(name, **kw)
+        # `styles` is a plain dict in this module (not a reportlab
+        # StyleSheet1), so assignment is the portable way in. `.add()` is
+        # supported too, for a caller that passes a real stylesheet.
+        try:
+            styles[name] = st
+        except TypeError:
+            styles.add(st)
+    return styles
+
+
+def build_wagon_grid_section(manifest, styles, *, one_page_per_wagon=False):
+    """Wagon-by-wagon pages: header, TOP grid, SIDE grid, next wagon.
+
+    Consumes the MANIFEST rather than selecting frames itself, so the audit and
+    the PDF cannot disagree about which image is on which page.
+
+    Logical order is fixed -- `WG.TOP_ORDER` then `WG.SIDE_ORDER`, from the
+    selector -- and is preserved whether or not a wagon's sixteen images fit on
+    one physical page. `one_page_per_wagon=False` (the default) puts the header
+    and the TOP grid on one page and the SIDE grid on the next, so nothing is
+    shrunk to the point of being unreadable.
+    """
+    from reportlab.platypus import PageBreak, Spacer, Paragraph
+    from reportlab.lib.units import inch
+
+    _register_grid_styles(styles)
+    out = []
+    wagons = manifest.get("wagons") or []
+    if not wagons:
+        return out
+
+    # Sized so four images fit a landscape-A4 row with captions and still be
+    # legible; two rows per page, which is why TOP and SIDE take a page each.
+    cell_w = 2.35 * inch
+    cell_h = 1.55 * inch
+
+    out.append(PageBreak())
+    out.append(Paragraph(
+        "<b>WAGON EVIDENCE &mdash; ALL FOUR CAMERAS PER CANONICAL WAGON</b>",
+        styles["_gridsec"]))
+    out.append(Spacer(1, 0.12 * inch))
+
+    for i, entry in enumerate(wagons):
+        if i:
+            out.append(PageBreak())
+        out.append(_wagon_header(entry, styles))
+        out.append(Spacer(1, 0.08 * inch))
+        out.extend(_camera_block(entry, WG.TOP_ORDER, "TOP CAMERAS",
+                                 styles, cell_w=cell_w, cell_h=cell_h))
+        if not one_page_per_wagon:
+            out.append(PageBreak())
+            out.append(_wagon_header(entry, styles))
+            out.append(Spacer(1, 0.08 * inch))
+        out.extend(_camera_block(entry, WG.SIDE_ORDER, "SIDE CAMERAS",
+                                 styles, cell_w=cell_w, cell_h=cell_h))
+    return out
+
+
+def build_damage_summary_section(manifest, styles):
+    """FINAL section: damage evidence only, grouped by canonical GW_n.
+
+    Only damage. The wagon pages above already carry the 16-image grid, so
+    repeating it here would bury the findings it exists to highlight. Rows come
+    from the manifest's `damage_by_wagon`, which came from Stage-3 evidence --
+    no damage inference, and the same GW_n identity as the main section and the
+    processed videos.
+    """
+    from reportlab.platypus import (Table, TableStyle, Paragraph, Spacer,
+                                    PageBreak)
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+
+    _register_grid_styles(styles)
+    by_wagon = manifest.get("damage_by_wagon") or {}
+    out = [PageBreak(),
+           Paragraph("<b>DAMAGE SUMMARY</b>", styles["_gridsec"]),
+           Spacer(1, 0.14 * inch)]
+    if not by_wagon:
+        out.append(Paragraph(
+            "No damage was detected on any canonical wagon.",
+            styles["_gridsub"]))
+        return out
+
+    for gw in manifest.get("wagons_with_damage") or sorted(by_wagon):
+        rows = by_wagon.get(gw) or []
+        if not rows:
+            continue
+        out.append(_wagon_header({"global_id": gw, "classification": "",
+                                  "wagon_index": "", "total_wagons": "",
+                                  "available_images": len(rows),
+                                  "expected_images": len(rows)}, styles))
+        out.append(Spacer(1, 0.06 * inch))
+        data = [[Paragraph("<b>CAMERA</b>", styles["_gridcam"]),
+                 Paragraph("<b>CLASS</b>", styles["_gridcam"]),
+                 Paragraph("<b>CONF</b>", styles["_gridcam"]),
+                 Paragraph("<b>FRAME</b>", styles["_gridcam"]),
+                 Paragraph("<b>EVIDENCE</b>", styles["_gridcam"])]]
+        for r in rows:
+            conf = r.get("confidence")
+            cell = (_grid_image(r["image_path"], styles,
+                                cell_w=2.6 * inch, cell_h=1.7 * inch)
+                    if r.get("image_available")
+                    else _grid_placeholder(r.get("unavailable_reason"), styles))
+            data.append([
+                Paragraph(str(r.get("camera_id") or "-"), styles["_gridcap"]),
+                Paragraph(str(r.get("class_name") or "-"), styles["_gridcap"]),
+                Paragraph(f"{float(conf):.2f}" if conf is not None else "-",
+                          styles["_gridcap"]),
+                Paragraph(str(r.get("frame") if r.get("frame") is not None
+                              else "-"), styles["_gridcap"]),
+                cell])
+        t = Table(data, colWidths=[1.5 * inch, 1.9 * inch, 0.8 * inch,
+                                   0.9 * inch, 2.8 * inch])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#7a1c1c")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c8b0b0")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ]))
+        out.append(t)
+        out.append(Spacer(1, 0.16 * inch))
+    return out

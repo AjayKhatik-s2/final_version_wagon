@@ -38,15 +38,30 @@ from core.evidence_identity import (
 def wagon_local_frames(
     wagon_start_time: float, wagon_end_time: float,
     local_fps: float, local_total_frames: int,
+    time_offset: float = 0.0,
 ) -> Tuple[int, int]:
-    """Same arithmetic as wagon_count/video_segmenter.py:70.
+    """Master time -> this camera's local frames. Inclusive, clipped.
 
-    Returns (start_frame, end_frame) inclusive, clipped into the camera.
+    `time_offset` is the camera's clock delta (`t_global = t_local + delta`) and
+    MUST match what the materializer used when it named the cache files:
+
+        materializer/wagon_cache_builder.py:92
+            sf = int(round((wagon.start_time - time_offset) * local_fps))
+
+    Omitting it was a real defect. The cache filenames are offset-corrected
+    local indices, so a reader computing UN-corrected ones looked for files that
+    do not exist and got None -- and the PDF rendered a placeholder for every
+    support-camera frame of every wagon, while the frames sat on disk. It failed
+    silently and looked like missing evidence rather than a lookup bug.
+
+    Defaults to 0.0, which is correct for the master and for any camera whose
+    offset the counter could not resolve, so existing callers keep their
+    behaviour exactly.
     """
     if local_fps <= 0 or local_total_frames <= 0:
         return (0, -1)
-    sf = int(round(wagon_start_time * local_fps))
-    ef = int(round(wagon_end_time * local_fps)) - 1
+    sf = int(round((wagon_start_time - time_offset) * local_fps))
+    ef = int(round((wagon_end_time - time_offset) * local_fps)) - 1
     sf = max(0, min(local_total_frames - 1, sf))
     ef = max(0, min(local_total_frames - 1, ef))
     if ef < sf:
@@ -106,15 +121,22 @@ def quartile_cache_paths(
     wagon_end_time: float,
     local_fps: float,
     local_total_frames: int,
+    time_offset: float = 0.0,
 ) -> List[Optional[str]]:
-    """Return four paths (12.5/37.5/62.5/87.5%) into the wagon_cache for
-    one (wagon, camera) pair.  Entries that don't exist on disk are
-    returned as None so the caller can render placeholders.
+    """Four paths (12.5/37.5/62.5/87.5%) into the wagon_cache for one
+    (wagon, camera) pair.  Entries absent from disk come back as None, so a
+    caller renders a placeholder rather than repeating an image it does have.
+
+    `time_offset` is this camera's clock delta and must be supplied for support
+    cameras: without it the computed frame indices do not match the names the
+    materializer wrote, and every path resolves to None. See
+    `wagon_local_frames`.
     """
     if not cache_root:
         return [None, None, None, None]
     sf, ef = wagon_local_frames(
         wagon_start_time, wagon_end_time, local_fps, local_total_frames,
+        time_offset,
     )
     if ef <= sf:
         return [None, None, None, None]

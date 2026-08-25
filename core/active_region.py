@@ -97,10 +97,19 @@ class Boundary:
     reason: str = ""
     corroborated_by: List[str] = field(default_factory=list)
     dissent: Dict[str, Any] = field(default_factory=dict)
+    #: START only: the first canonical wagon's own frame and id, plus the delta.
+    #: A non-zero delta means the region opened AFTER its first wagon, which
+    #: would be the "lost first wagon" failure -- reported, never inferred.
+    master_first_wagon_frame: Optional[int] = None
+    first_wagon_global_id: str = ""
+    frames_after_first_wagon: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "kind": self.kind, "frame": self.frame,
+            "master_first_wagon_frame": self.master_first_wagon_frame,
+            "first_wagon_global_id": self.first_wagon_global_id,
+            "frames_after_first_wagon": self.frames_after_first_wagon,
             "time": (round(self.time, 4) if self.time is not None else None),
             "source_camera": self.source_camera, "evidence": self.evidence,
             "confidence": round(float(self.confidence or 0.0), 4),
@@ -118,7 +127,92 @@ class Boundary:
         bits.append(f"camera={self.source_camera or '-'}")
         bits.append(f"evidence={self.evidence or '-'}")
         bits.append(f"confidence={float(self.confidence or 0.0):.3f}")
+        if self.kind == "start" and self.master_first_wagon_frame is not None:
+            bits.append(f"master_first_wagon_frame="
+                        f"{self.master_first_wagon_frame}")
+            bits.append(f"first_wagon={self.first_wagon_global_id}")
+            bits.append(f"frames_after_first_wagon="
+                        f"{self.frames_after_first_wagon}")
+        bits.append(f"reason={self.reason or '-'}")
         return "  ".join(bits)
+
+
+#: A leading/trailing non-wagon segment this many times the median canonical
+#: wagon length is long enough to plausibly CONTAIN one or more wagons. Derived
+#: from the train's own wagons, not a fixed frame count, so it scales with wagon
+#: length, camera fps and train speed.
+DEFAULT_SUSPECT_LENGTH_RATIO = 1.8
+
+REASON_SUSPECT_MISSED_GAP = "SUSPECT_MISSED_GAP"
+
+
+def _suspect_merged_segments(
+    win: Dict[str, Any], wagons: Sequence[Any],
+    ratio: float = DEFAULT_SUSPECT_LENGTH_RATIO,
+) -> List[Dict[str, Any]]:
+    """Leading/trailing non-wagon objects long enough to hide a real wagon.
+
+    The failure this surfaces: if the gap between the locomotive and the first
+    wagon is never DETECTED, there is no segment boundary there, so the loco and
+    wagon 1 are ONE segment. That segment classifies as ENGINE (the loco
+    dominates), lands in `leading_non_wagon_objects`, and the wagon inside it is
+    lost -- while the region correctly reports "not active", because by the
+    master's own structure the wagon sequence has not started yet.
+
+    No leading-edge LABEL rule can recover that wagon: it is not a separate
+    segment to relabel. Only a boundary the gap model did not find would split
+    it, and inventing one here would mean creating a GW_n from classification
+    instead of from a validated master gap -- a different architecture, and not
+    this module's decision to make.
+
+    What IS decidable from persisted evidence is that the segment is suspiciously
+    long. A locomotive is roughly one wagon-length; a leading segment measuring
+    two or three canonical wagons is consistent with a missed gap. This reports
+    that, with the numbers, and changes no count.
+
+    Measured against the median canonical wagon of THIS train, so it needs no
+    absolute threshold and adapts to fps and train speed.
+    """
+    out: List[Dict[str, Any]] = []
+    durations = []
+    for w in wagons:
+        st, en = getattr(w, "start_time", None), getattr(w, "end_time", None)
+        if st is not None and en is not None and float(en) > float(st):
+            durations.append(float(en) - float(st))
+    if not durations:
+        return out
+    durations.sort()
+    median = durations[len(durations) // 2]
+    if median <= 0:
+        return out
+
+    for key, position in (("leading_non_wagon_objects", "leading"),
+                          ("trailing_non_wagon_objects", "trailing")):
+        for o in (win.get(key) or []):
+            if not isinstance(o, dict):
+                continue
+            st, en = o.get("start_time"), o.get("end_time")
+            if st is None or en is None:
+                continue
+            dur = float(en) - float(st)
+            if dur < median * ratio:
+                continue
+            out.append({
+                "position": position,
+                "classification": o.get("classification"),
+                "classification_confidence": o.get("classification_confidence"),
+                "start_frame": o.get("start_frame"),
+                "end_frame": o.get("end_frame"),
+                "duration_sec": round(dur, 3),
+                "median_wagon_sec": round(median, 3),
+                "wagon_lengths": round(dur / median, 2),
+                "reason": REASON_SUSPECT_MISSED_GAP,
+                "note": ("this non-wagon segment is long enough to contain "
+                         "canonical wagon(s); a missed gap between the "
+                         "non-wagon object and the first/last wagon would "
+                         "produce exactly this. NOT counted -- reported only."),
+            })
+    return out
 
 
 @dataclass
@@ -135,6 +229,7 @@ class ActiveRegionResult:
     ignored_predictions: List[Dict[str, Any]] = field(default_factory=list)
     gate_held: bool = True
     gate_violations: List[str] = field(default_factory=list)
+    suspect_merged_segments: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -150,6 +245,9 @@ class ActiveRegionResult:
             "ignored_predictions": list(self.ignored_predictions),
             "gate_held": self.gate_held,
             "gate_violations": list(self.gate_violations),
+            "suspect_merged_segments": list(self.suspect_merged_segments),
+            "start_reason": self.start.reason,
+            "end_reason": self.end.reason,
         }
 
 
@@ -239,12 +337,30 @@ def resolve(
     a_start = win.get("wagon_start_time")
     a_end = win.get("wagon_end_time")
 
+    # The START is the first canonical wagon's own start frame -- there is no
+    # hysteresis or offset between them, and `train_structure` sets it as
+    # `wagon_units[0].start_frame_master`. The delta is reported anyway so a
+    # future regression that introduced a delay would be visible rather than
+    # inferred.
+    _gw1_frame = None
+    if wagons:
+        _gw1_frame = getattr(wagons[0], "start_frame_master", None)
     res.start = Boundary(
         kind="start", frame=win.get("wagon_start_frame"), time=a_start,
         source_camera=str(getattr(state, "master_camera", "") or C.CAMERA_RIGHT_UP),
         evidence=f"first WAGON segment index {win.get('first_wagon_segment_index')}",
         confidence=1.0,
-        reason="RIGHT_UP master is the authority for identity and order")
+        reason="first_canonical_wagon")
+    res.start.master_first_wagon_frame = _gw1_frame
+    res.start.first_wagon_global_id = (
+        str(getattr(wagons[0], "global_id", "")) if wagons else "")
+    try:
+        res.start.frames_after_first_wagon = (
+            int(win.get("wagon_start_frame")) - int(_gw1_frame)
+            if _gw1_frame is not None
+            and win.get("wagon_start_frame") is not None else None)
+    except (TypeError, ValueError):
+        res.start.frames_after_first_wagon = None
     res.end = Boundary(
         kind="end", frame=win.get("wagon_end_frame"), time=a_end,
         source_camera=str(getattr(state, "master_camera", "") or C.CAMERA_RIGHT_UP),
@@ -317,6 +433,7 @@ def resolve(
     res.excluded_leading = list(win.get("leading_non_wagon_objects") or [])
     res.excluded_trailing = list(win.get("trailing_non_wagon_objects") or [])
     res.interior_anomalies = list(win.get("interior_non_wagon_objects") or [])
+    res.suspect_merged_segments = _suspect_merged_segments(win, wagons)
     res.transitions.append(AFTER)
 
     # ---- Did the gate actually hold? ------------------------------------
@@ -370,6 +487,14 @@ def resolve(
             log.info("%s interior anomaly type=%s STILL COUNTED "
                      "(master gaps are authoritative)", _GW_TAG,
                      o.get("classification"))
+        for sm in res.suspect_merged_segments:
+            log.warning("%s SUSPECT_MISSED_GAP %s %s frames %s-%s spans "
+                        "%.2fs = %.2f canonical wagon lengths (median %.2fs) "
+                        "-- may CONTAIN a real wagon; not counted, reported",
+                        _TAG, sm["position"], sm["classification"],
+                        sm["start_frame"], sm["end_frame"],
+                        sm["duration_sec"], sm["wagon_lengths"],
+                        sm["median_wagon_sec"])
         if not res.gate_held:
             log.error("%s SEVERE: gate did not hold -- %s", _TAG,
                       res.gate_violations)
