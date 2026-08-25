@@ -429,7 +429,56 @@ def _non_wagon_spans(state: Any, src_fps: float, total: int,
     return out
 
 
-def _gap_tracks_for(tracking: Dict[str, Any], camera_id: str) -> List[Dict[str, Any]]:
+def _canonical_gap_view(global_gaps: Optional[Sequence[Dict[str, Any]]],
+                        camera_id: str) -> Tuple[Dict[Any, int],
+                                                 List[Dict[str, Any]],
+                                                 Dict[str, Any]]:
+    """How this camera relates to each CANONICAL gap.
+
+    Returns `(local_track_id -> global_gap_id, unobserved, stats)`.
+
+    The canonical sequence is the counting engine's own `state.global_gaps`:
+    every entry has a RIGHT_UP master observation, plus a
+    `support_observations[camera]` for each camera that saw the same boundary.
+    That mapping is what lets a support camera's marker be labelled with the
+    CANONICAL id -- `GAP_25` -- instead of its own local track number, which is
+    a per-camera counter and is not the same number.
+
+    `unobserved` are canonical gaps this camera never observed. They carry no
+    local frames at all, so they are reported in the audit and NOT drawn: the
+    only way to place them would be to project the master time through an offset
+    that may be unresolved, and a marker at a guessed moment is worse than an
+    honest absence.
+    """
+    by_track: Dict[Any, int] = {}
+    unobserved: List[Dict[str, Any]] = []
+    for g in (global_gaps or ()):
+        if not isinstance(g, dict):
+            continue
+        gid = g.get("global_gap_id")
+        if gid is None:
+            continue
+        obs = (g.get("support_observations") or {}).get(camera_id)
+        if isinstance(obs, dict) and obs.get("local_track_id") is not None:
+            by_track[obs.get("local_track_id")] = int(gid)
+            continue
+        if camera_id == str(g.get("master_camera") or ""):
+            mt = g.get("master_track_id")
+            if mt is not None:
+                by_track[mt] = int(gid)
+                continue
+        unobserved.append({"global_gap_id": int(gid),
+                           "reason": "this camera never observed this boundary"})
+    stats = {"canonical_gaps": len([g for g in (global_gaps or ())
+                                    if isinstance(g, dict)]),
+             "mapped_to_local_track": len(by_track),
+             "not_observed_by_this_camera": len(unobserved)}
+    return by_track, unobserved, stats
+
+
+def _gap_tracks_for(tracking: Dict[str, Any], camera_id: str,
+                    track_to_global: Optional[Dict[Any, int]] = None,
+                    ) -> List[Dict[str, Any]]:
     """This camera's gap tracks, from the tracking JSON Stage 1 already wrote.
 
     Replayed, never recomputed: no gap model runs here. Only gaps carrying the
@@ -448,6 +497,11 @@ def _gap_tracks_for(tracking: Dict[str, Any], camera_id: str) -> List[Dict[str, 
         # from "the boundary is known but its image position is not".
         g = dict(g)
         g["_resolved"] = bool(g.get("hit_frames") and g.get("bbox_history"))
+        # Canonical identity where the fusion established one. The local track
+        # id stays on the record for traceability; the LABEL prefers this.
+        gid = (track_to_global or {}).get(g.get("track_id"))
+        if gid is not None:
+            g["global_gap_id"] = gid
         out.append(g)
     return out
 
@@ -474,11 +528,42 @@ def _gap_neighbours(boundary_map: Dict[int, Tuple[str, str]],
     label names the wagons the reconstruction actually put either side of this
     boundary. It is NOT derived from wagon arithmetic or an assumed spacing.
     """
-    gid = gap.get("track_id", "?")
+    # The CANONICAL boundary id when the fusion mapped this track to one --
+    # `GAP_25` means the same physical coupling on all four cameras, whereas a
+    # local track id is a per-camera counter and differs between them.
+    gid = gap.get("global_gap_id")
+    if gid is None:
+        gid = gap.get("track_id", "?")
     prev_gw, next_gw = _gap_neighbour_pair(boundary_map, gap)
     if prev_gw and next_gw:
         return f"{prev_gw} | GAP_{gid} | {next_gw}"
     return f"GAP_{gid}"
+
+
+class _GapView:
+    """Attribute view over a gap dict, for the engine's own interpolator.
+
+    `video_segmenter._interp_gap_bbox` reads `gap.hit_frames`,
+    `gap.bbox_history`, `gap.start_frame`, `gap.end_frame` -- it takes a
+    `GapEvent`, not a mapping. The tracking JSON gives us dicts, and passing one
+    straight in raised `AttributeError` on the first attribute access, which the
+    caller's `except` swallowed into `bbox = None`. The visible effect was that
+    interpolation never happened at all: a marker appeared only on frames that
+    were exact recorded hits and vanished in between, which looks like a
+    flickering detector rather than a type mismatch.
+
+    Reusing the engine's interpolator through this shim keeps ONE interpolation
+    algorithm in the repository, which is the point -- reimplementing it here
+    would have hidden the same bug behind a second copy of the maths.
+    """
+
+    __slots__ = ("hit_frames", "bbox_history", "start_frame", "end_frame")
+
+    def __init__(self, g: Dict[str, Any]) -> None:
+        self.hit_frames = list(g.get("hit_frames") or [])
+        self.bbox_history = list(g.get("bbox_history") or [])
+        self.start_frame = g.get("start_frame")
+        self.end_frame = g.get("end_frame")
 
 
 def _draw_gap_boxes(frame, gaps: List[Dict[str, Any]], frame_idx: int,
@@ -516,7 +601,7 @@ def _draw_gap_boxes(frame, gaps: List[Dict[str, Any]], frame_idx: int,
             bbox = hist[hits.index(frame_idx)]
         elif _interp_gap_bbox is not None:
             try:
-                bbox = _interp_gap_bbox(g, frame_idx)
+                bbox = _interp_gap_bbox(_GapView(g), frame_idx)
             except Exception:                                # noqa: BLE001
                 bbox = None
         if not bbox or len(bbox) < 4:
@@ -640,6 +725,7 @@ def _render_one_camera(
     time_offset: float = 0.0,
     camera_tracking: Optional[Dict[str, Any]] = None,
     camera_regions: Optional[Dict[str, Any]] = None,
+    global_gaps: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> str:
     # `unified` IS drawn now: the per-wagon LOAD verdict comes from it. Load
     # never persisted per-frame detections -- only `load/best_frame.jpg` and a
@@ -780,7 +866,12 @@ def _render_one_camera(
         print(f"[RENDER/{camera_id}] writing -> {output_path}  "
               f"({total} frames, {n_boxes} box-instances)")
 
-    gap_tracks = _gap_tracks_for(camera_tracking or {}, camera_id)
+    # Canonical boundary identity for THIS camera, so a marker can say GAP_25
+    # (the physical coupling) rather than this camera's own track number.
+    _track_to_gid, _unobserved_gaps, _canon_stats = _canonical_gap_view(
+        global_gaps, camera_id)
+    gap_tracks = _gap_tracks_for(camera_tracking or {}, camera_id,
+                                 _track_to_gid)
     # Non-wagon spans come from the master window projected by the offset. When
     # this camera supplied its OWN region, anything outside that region is this
     # camera's non-wagon footage, so the spans are clipped to it -- otherwise the
@@ -806,7 +897,20 @@ def _render_one_camera(
                                            time_offset)[1] >= 0},
             key=lambda g: int(str(g).split("_")[-1]) if str(g).split("_")[-1].isdigit() else 0),
         "gap_tracks_total": len(gap_tracks),
+        "canonical_gap_mapping": dict(_canon_stats),
+        # Canonical boundaries this camera never observed. Reported, never
+        # drawn: placing them would mean guessing a moment from an offset that
+        # may be unresolved.
+        "canonical_gaps_not_observed": [d["global_gap_id"]
+                                        for d in _unobserved_gaps],
         "gap_tracks_resolved": sum(1 for g in gap_tracks if g.get("_resolved")),
+        "gap_tracks_unresolved_detail": [
+            {"local_gap_track_id": g.get("track_id"),
+             "global_gap_id": g.get("global_gap_id"),
+             "start_frame": g.get("start_frame"),
+             "end_frame": g.get("end_frame"),
+             "reason": "no hit_frames / bbox_history for this track"}
+            for g in gap_tracks if not g.get("_resolved")],
         "gap_tracks_unresolved": sum(1 for g in gap_tracks
                                      if not g.get("_resolved")),
         "boundary_frames": list(boundary_frames),
@@ -986,6 +1090,7 @@ def _render_one_camera(
 def render_all_cameras(
     *,
     camera_regions: Optional[Dict[str, Any]] = None,
+    global_gaps: Optional[Sequence[Dict[str, Any]]] = None,
     state: GlobalTrainState,
     unified: Dict[str, UnifiedWagonState],
     evidence_root: str,
@@ -1044,6 +1149,7 @@ def render_all_cameras(
                 time_offset=float(offsets.get(cam, 0.0) or 0.0),
                 camera_tracking=tracking,
                 camera_regions=camera_regions,
+                global_gaps=global_gaps,
             ): cam
             for cam, cfg in jobs.items()
         }

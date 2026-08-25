@@ -191,13 +191,7 @@ class NonWagonObject:
     end_frame: int
     start_time: float
     end_time: float
-    position: str
-    """"leading" | "trailing" | "interior" | "leading_merged".
-
-    `leading_merged` is the end-anchored walk's outcome: a segment the classifier
-    labelled ENGINE that the canonical evidence says also holds the first wagon.
-    It is COUNTED, unlike leading/trailing, and it is not interior either -- it
-    is the region's first unit."""
+    position: str                # "leading" | "trailing" | "interior"
     segment_index: int           # index in the full pre-selection segment list
 
     def to_dict(self) -> Dict[str, Any]:
@@ -247,18 +241,6 @@ class WagonWindow:
     controlling an individual wagon, which it must never do. Classification
     decides only where the window starts and ends."""
 
-    reverse_extended_objects: List[NonWagonObject] = field(default_factory=list)
-    """Segments the END-ANCHORED backward walk pulled back into the region.
-
-    Deliberately NOT in `interior_non_wagon_objects`: these sit at the region's
-    leading edge, not inside it, and calling them interior would misreport where
-    the ambiguity is. They ARE counted (they hold the first wagon), so the
-    `wagons + leading + trailing == total_segments` invariant still balances."""
-
-    reverse_anchor: Optional["ReverseAnchor"] = None
-    """The backward walk's audit trail, forward boundary and disagreement
-    included. None when the reverse derivation did not run."""
-
     total_segments: int = 0
 
     @property
@@ -301,330 +283,7 @@ class WagonWindow:
                                            for o in self.trailing_non_wagon_objects],
             "interior_non_wagon_objects": [o.to_dict()
                                            for o in self.interior_non_wagon_objects],
-            "reverse_extended_count": len(self.reverse_extended_objects),
-            "reverse_extended_objects": [o.to_dict()
-                                         for o in self.reverse_extended_objects],
-            "reverse_anchor": (self.reverse_anchor.to_dict()
-                               if self.reverse_anchor is not None else None),
-            "boundaries_agree": (self.reverse_anchor.boundaries_agree
-                                 if self.reverse_anchor is not None else None),
         }
-
-
-# =============================================================================
-# Reverse / end-anchored boundary derivation
-# =============================================================================
-#
-# WHY THE END IS THE ANCHOR
-# -------------------------
-# Validated on real footage: the trailing WAGON -> BRAKE_VAN/ENGINE transition is
-# reliably detected, while the leading ENGINE -> first-WAGON transition is not.
-# The physical gap between the locomotive and the first wagon is the one most
-# often missed, and when it is missed `build_global_wagons` emits ENGINE and the
-# first wagon as ONE segment. That merged segment inherits the ENGINE label, the
-# forward rule ("the window starts at the first segment labelled WAGON") starts
-# the region at the SECOND wagon, and the first wagon is silently lost into the
-# leading non-wagon region.
-#
-# So the end -- the boundary that can be trusted -- becomes the anchor, and the
-# region is walked backwards from it.
-#
-# WHAT THE REVERSE WALK MAY AND MAY NOT DO
-# ----------------------------------------
-# It is a boundary/validation mechanism, not a second counting algorithm. It only
-# ever RETAINS segments that `build_global_wagons` already produced from the
-# validated RIGHT_UP master gaps. It never splits a segment, never invents a
-# boundary, never renumbers a gap and never consults a support camera. The most
-# it can do is move one already-existing master segment from the leading
-# non-wagon list into the counted region.
-#
-# WHY DURATION ALONE CANNOT DECIDE
-# --------------------------------
-# The tempting test -- "this leading segment is much longer than a wagon, so it
-# must be engine + wagon" -- does not work: a locomotive on its own is ALSO much
-# longer than a wagon. Length cannot separate "long engine" from "engine plus
-# wagon". What separates them is evidence of a BOUNDARY inside the segment, and
-# that evidence already exists: gap validation keeps every candidate it rejected,
-# with the frames it spanned (`GapValidationResult.rejected`, persisted as
-# `gap_validation.json`). A rejected candidate sitting inside the segment is the
-# missed coupling.
-#
-# The existing WAGON_ACTIVE recovery pass cannot find this one, which is exactly
-# why the wagon is lost: it only re-admits soft-failed gaps INSIDE the wagon
-# window, and the engine->first-wagon coupling is by definition at that window's
-# leading edge, outside it.
-
-
-@dataclass(frozen=True)
-class RejectedGapSpan:
-    """One gap candidate that validation rejected, with the frames it spanned.
-
-    Read-only evidence. Nothing here re-admits a gap, changes the master
-    sequence or renumbers anything -- the reverse walk only asks "was a boundary
-    seen and discarded inside this segment?".
-    """
-    frame_start: int
-    frame_end: int
-    reason: str = ""
-    soft: bool = False
-    track_id: Optional[int] = None
-
-    @property
-    def center_frame(self) -> int:
-        return (int(self.frame_start) + int(self.frame_end)) // 2
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {"frame_start": self.frame_start, "frame_end": self.frame_end,
-                "center_frame": self.center_frame, "reason": self.reason,
-                "soft": self.soft, "track_id": self.track_id}
-
-
-def rejected_gap_spans_from_validation(result: Any) -> List[RejectedGapSpan]:
-    """Adapter for an in-memory `gap_validation.GapValidationResult`."""
-    out: List[RejectedGapSpan] = []
-    for r in (getattr(result, "rejected", None) or ()):
-        f = getattr(r, "features", None)
-        fs = getattr(f, "frame_start", None)
-        fe = getattr(f, "frame_end", None)
-        if fs is None or fe is None:
-            continue
-        out.append(RejectedGapSpan(
-            frame_start=int(fs), frame_end=int(fe),
-            reason=str(getattr(r, "reason", "") or ""),
-            soft=bool(getattr(r, "is_soft", False)),
-            track_id=getattr(f, "track_id", None)))
-    return out
-
-
-def rejected_gap_spans_from_json(doc: Any) -> List[RejectedGapSpan]:
-    """Adapter for a persisted `gap_validation.json`.
-
-    Sequential mode reads the same evidence back off disk that batch mode holds
-    in memory, so both pipelines feed the reverse walk identical input.
-    """
-    out: List[RejectedGapSpan] = []
-    if not isinstance(doc, dict):
-        return out
-    for r in (doc.get("rejections") or ()):
-        if not isinstance(r, dict):
-            continue
-        f = r.get("features") or {}
-        fs, fe = f.get("frame_start"), f.get("frame_end")
-        if fs is None or fe is None:
-            continue
-        try:
-            out.append(RejectedGapSpan(
-                frame_start=int(fs), frame_end=int(fe),
-                reason=str(r.get("reason") or ""),
-                soft=bool(r.get("soft", False)),
-                track_id=f.get("track_id")))
-        except (TypeError, ValueError):
-            continue
-    return out
-
-
-@dataclass(frozen=True)
-class ReverseAnchorConfig:
-    """Tunables for the backward walk.
-
-    Every threshold is a RATIO against this train's own median wagon, never a
-    frame count and never a number of seconds: the same train runs at different
-    speeds on different days, so a fixed offset would be right once.
-    """
-
-    merge_duration_ratio: float = 1.4
-    """A leading segment must be at least this many median wagons long before it
-    can be considered to hold the engine AND a wagon. Below it there is no room
-    for two vehicles, whatever the rejected candidate was."""
-
-    min_trailing_wagon_ratio: float = 0.5
-    max_trailing_wagon_ratio: float = 1.5
-    """The stretch from the rejected boundary to the end of the segment has to
-    look like ONE wagon: at least half a median wagon and at most one and a half.
-
-    The lower bound is the obvious one -- there must be room for a wagon behind
-    the coupling. The upper bound is the one that does the real work, and it was
-    added because without it a bare locomotive was being turned into a wagon: a
-    long engine is several median wagons wide, so a soft rejection almost
-    anywhere inside it leaves "at least half a wagon" behind it and passes. A
-    wagon is one wagon long; a remainder of two or three wagons is not one
-    wagon, and one boundary cannot explain it either way."""
-
-    boundary_margin_ratio: float = 0.15
-    """A rejected candidate this close (as a fraction of a median wagon) to
-    either end of the segment is a re-detection of a boundary already there, not
-    a missed interior one."""
-
-
-DEFAULT_REVERSE_CONFIG = ReverseAnchorConfig()
-
-
-REVERSE_REASON_NO_SEGMENTS = "NO_SEGMENTS"
-REVERSE_REASON_NO_WAGON_LABEL = "NO_SEGMENT_LABELLED_WAGON"
-REVERSE_REASON_AGREES = "FORWARD_AND_REVERSE_AGREE"
-REVERSE_REASON_EXTENDED = "REVERSE_RETAINED_MERGED_LEADING_WAGON"
-REVERSE_REASON_NO_EVIDENCE = "NO_REJECTED_BOUNDARY_EVIDENCE"
-
-
-@dataclass
-class ReverseAnchor:
-    """The audit trail of the backward walk, forward boundary included.
-
-    Both boundaries are always reported. When they disagree the disagreement is
-    recorded rather than quietly resolved -- a region that moved is exactly what
-    a reviewer needs to see.
-    """
-
-    found: bool = False
-    reason: str = ""
-
-    # ---- the anchor: the reliable trailing boundary ----
-    end_frame: Optional[int] = None
-    last_wagon_segment_index: Optional[int] = None
-    last_wagon: Optional[str] = None
-
-    # ---- the derived leading boundary ----
-    start_frame: Optional[int] = None
-    first_wagon_segment_index: Optional[int] = None
-    first_wagon: Optional[str] = None
-
-    wagons_retained: int = 0
-    leading_non_wagon: int = 0
-    trailing_non_wagon: int = 0
-
-    # ---- forward vs reverse ----
-    forward_first_wagon_segment_index: Optional[int] = None
-    forward_start_frame: Optional[int] = None
-    boundaries_agree: bool = True
-    disagreement: str = ""
-
-    #: Segments the backward walk pulled back into the region, with why.
-    extended_segments: List[Dict[str, Any]] = field(default_factory=list)
-    #: Candidates considered and refused, with why. Both halves are recorded.
-    rejected_extensions: List[Dict[str, Any]] = field(default_factory=list)
-    median_wagon_frames: Optional[float] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "found": self.found,
-            "reason": self.reason,
-            "end_frame": self.end_frame,
-            "last_wagon_segment_index": self.last_wagon_segment_index,
-            "last_wagon": self.last_wagon,
-            "start_frame": self.start_frame,
-            "first_wagon_segment_index": self.first_wagon_segment_index,
-            "first_wagon": self.first_wagon,
-            "wagons_retained": self.wagons_retained,
-            "leading_non_wagon": self.leading_non_wagon,
-            "trailing_non_wagon": self.trailing_non_wagon,
-            "forward_first_wagon_segment_index":
-                self.forward_first_wagon_segment_index,
-            "forward_start_frame": self.forward_start_frame,
-            "boundaries_agree": self.boundaries_agree,
-            "disagreement": self.disagreement,
-            "extended_segments": list(self.extended_segments),
-            "rejected_extensions": list(self.rejected_extensions),
-            "median_wagon_frames": (round(self.median_wagon_frames, 2)
-                                    if self.median_wagon_frames is not None
-                                    else None),
-        }
-
-    def render(self) -> str:
-        return (
-            f"[ACTIVE-REGION] REVERSE-ANCHOR  "
-            f"end_frame={self.end_frame}  last_wagon={self.last_wagon}  "
-            f"start_frame={self.start_frame}  first_wagon={self.first_wagon}  "
-            f"wagons_retained={self.wagons_retained}  "
-            f"leading_non_wagon={self.leading_non_wagon}  "
-            f"trailing_non_wagon={self.trailing_non_wagon}  "
-            f"reason={self.reason}"
-        )
-
-
-def _segment_frames(seg: GlobalWagon) -> int:
-    """Length of an INCLUSIVE `[start_frame_master, end_frame_master]` span."""
-    return int(seg.end_frame_master) - int(seg.start_frame_master) + 1
-
-
-def _median(values: Sequence[float]) -> Optional[float]:
-    vals = sorted(float(v) for v in values)
-    if not vals:
-        return None
-    mid = len(vals) // 2
-    if len(vals) % 2:
-        return vals[mid]
-    return (vals[mid - 1] + vals[mid]) / 2.0
-
-
-def _merge_evidence(
-    seg: GlobalWagon,
-    *,
-    median_wagon_frames: Optional[float],
-    rejected: Sequence[RejectedGapSpan],
-    cfg: ReverseAnchorConfig,
-) -> Tuple[bool, str, Dict[str, Any]]:
-    """Does this leading non-wagon segment also contain the first wagon?
-
-    Returns `(retain, reason, detail)`. Every refusal carries its reason, so a
-    wagon that stays out can be explained without re-running anything.
-    """
-    detail: Dict[str, Any] = {
-        "segment_start_frame": int(seg.start_frame_master),
-        "segment_end_frame": int(seg.end_frame_master),
-        "segment_frames": _segment_frames(seg),
-        "classification": seg.classification,
-        "classification_confidence": round(seg.classification_confidence, 4),
-    }
-
-    if median_wagon_frames is None or median_wagon_frames <= 0:
-        return False, "NO_WAGON_SCALE", detail
-
-    span = _segment_frames(seg)
-    need = cfg.merge_duration_ratio * median_wagon_frames
-    detail["median_wagon_frames"] = round(median_wagon_frames, 2)
-    detail["required_frames"] = round(need, 2)
-    if span < need:
-        return False, "TOO_SHORT_TO_HOLD_ENGINE_AND_WAGON", detail
-
-    margin = cfg.boundary_margin_ratio * median_wagon_frames
-    min_tail = cfg.min_trailing_wagon_ratio * median_wagon_frames
-    max_tail = cfg.max_trailing_wagon_ratio * median_wagon_frames
-    detail["boundary_margin_frames"] = round(margin, 2)
-    detail["min_trailing_wagon_frames"] = round(min_tail, 2)
-    detail["max_trailing_wagon_frames"] = round(max_tail, 2)
-
-    best: Optional[RejectedGapSpan] = None
-    n_hard_skipped = 0
-    for r in rejected:
-        if not r.soft:
-            # A HARD rejection is not weak evidence of a boundary, it is a
-            # measurement that this is NOT one: no trajectory, static artefact,
-            # travelling against the train, an already-accepted duplicate.
-            # `gap_validation` calls these "the false-positive defences" and
-            # never relaxes them, and `recover_wagon_active_candidates` re-admits
-            # only SOFT failures inside the wagon region. The same rule has to
-            # hold at the leading edge, or this becomes a way to smuggle back
-            # exactly the detections validation exists to throw out -- a long
-            # locomotive produces plenty of them.
-            n_hard_skipped += 1
-            continue
-        c = r.center_frame
-        if not (int(seg.start_frame_master) + margin <= c
-                <= int(seg.end_frame_master) - margin):
-            continue                       # at or outside an existing boundary
-        tail = int(seg.end_frame_master) - c
-        if tail < min_tail or tail > max_tail:
-            continue                       # the remainder is not one wagon
-        # The LAST such boundary is the coupling closest to the first wagon.
-        if best is None or c > best.center_frame:
-            best = r
-    detail["hard_rejections_ignored"] = n_hard_skipped
-    if best is None:
-        return False, REVERSE_REASON_NO_EVIDENCE, detail
-
-    detail["rejected_boundary"] = best.to_dict()
-    detail["trailing_wagon_frames"] = int(seg.end_frame_master) - best.center_frame
-    return True, REVERSE_REASON_EXTENDED, detail
 
 
 def _as_non_wagon(w: GlobalWagon, idx: int, position: str) -> NonWagonObject:
@@ -639,8 +298,6 @@ def _as_non_wagon(w: GlobalWagon, idx: int, position: str) -> NonWagonObject:
 def get_master_wagon_window(
     segments: Sequence[GlobalWagon],
     *,
-    rejected_gap_spans: Optional[Sequence[RejectedGapSpan]] = None,
-    reverse_cfg: ReverseAnchorConfig = DEFAULT_REVERSE_CONFIG,
     verbose: bool = True,
 ) -> WagonWindow:
     """Select the counted wagon region from the master's full segment list.
@@ -696,90 +353,16 @@ def get_master_wagon_window(
             print(f"  [WAGONWIN] {win.reason}")
         return win
 
-    # ---- END-ANCHORED derivation -------------------------------------
-    #
-    # The trailing WAGON -> non-wagon transition is the reliable boundary, so it
-    # anchors the region; the leading edge is then derived by walking BACKWARDS
-    # from it. `lw` is that anchor and is unchanged from the forward rule -- the
-    # end was never the problem. `fw` is what the backward walk may move.
-    lw = wagon_idx[-1]
-    fw_forward = wagon_idx[0]
-
-    anchor = ReverseAnchor(
-        found=True,
-        end_frame=int(segments[lw].end_frame_master),
-        last_wagon_segment_index=lw,
-        forward_first_wagon_segment_index=fw_forward,
-        forward_start_frame=int(segments[fw_forward].start_frame_master),
-    )
-
-    # This train's own wagon scale, measured from the segments the forward rule
-    # already accepts. Taken BEFORE any extension, so a candidate can never
-    # widen the yardstick it is about to be measured against.
-    anchor.median_wagon_frames = _median(
-        [_segment_frames(segments[i]) for i in wagon_idx])
-
-    fw = fw_forward
-    spans = list(rejected_gap_spans or ())
-    i = fw_forward - 1
-    while i >= 0:
-        seg = segments[i]
-        if seg.classification not in NON_WAGON_CLASSES:
-            # Only ENGINE / BRAKE_VAN sit between the video start and the first
-            # wagon. Anything else here is not a boundary question, so the walk
-            # stops rather than guessing.
-            anchor.rejected_extensions.append(
-                {"segment_index": i, "retained": False,
-                 "reason": "NOT_A_NON_WAGON_LABEL",
-                 "classification": seg.classification})
-            break
-        keep, why, detail = _merge_evidence(
-            seg, median_wagon_frames=anchor.median_wagon_frames,
-            rejected=spans, cfg=reverse_cfg)
-        detail["segment_index"] = i
-        detail["retained"] = keep
-        detail["reason"] = why
-        if not keep:
-            anchor.rejected_extensions.append(detail)
-            break
-        anchor.extended_segments.append(detail)
-        fw = i
-        # A segment holding ENGINE + the first wagon IS the leading boundary:
-        # everything before it is pure locomotive. Stopping here is what keeps
-        # the walk from eating its way into the engine.
-        break
-
+    fw, lw = wagon_idx[0], wagon_idx[-1]
     win.found = True
     win.first_wagon_segment_index = fw
     win.last_wagon_segment_index = lw
-
-    anchor.first_wagon_segment_index = fw
-    anchor.start_frame = int(segments[fw].start_frame_master)
-    anchor.boundaries_agree = (fw == fw_forward)
-    if anchor.boundaries_agree:
-        anchor.reason = REVERSE_REASON_AGREES
-    else:
-        anchor.reason = REVERSE_REASON_EXTENDED
-        anchor.disagreement = (
-            f"forward boundary starts at segment {fw_forward} "
-            f"(frame {anchor.forward_start_frame}); the end-anchored walk starts "
-            f"at segment {fw} (frame {anchor.start_frame}), retaining "
-            f"{fw_forward - fw} segment(s) the forward rule placed in the "
-            f"leading non-wagon region")
-    win.reverse_anchor = anchor
-
-    extended_indices = {int(d["segment_index"]) for d in anchor.extended_segments}
 
     for i, s in enumerate(segments):
         if i < fw:
             win.leading_non_wagon_objects.append(_as_non_wagon(s, i, "leading"))
         elif i > lw:
             win.trailing_non_wagon_objects.append(_as_non_wagon(s, i, "trailing"))
-        elif i in extended_indices:
-            # Retained by the backward walk. Counted, and recorded separately
-            # from the interior anomalies so the audit says where it came from.
-            win.reverse_extended_objects.append(_as_non_wagon(s, i, "leading_merged"))
-            win.wagon_units.append(s)
         else:
             # INSIDE the window. Every segment here is bounded by validated
             # RIGHT_UP master gaps, which are authoritative, so it counts as a
@@ -797,24 +380,10 @@ def get_master_wagon_window(
         w.wagon_index = new_index
 
     if win.wagon_units:
-        # Read straight off the retained units, never recomputed: the segments
-        # own the inclusive/exclusive convention (`end_frame_master` inclusive,
-        # `end_time == (end_frame + 1) / fps`) and re-deriving it here is exactly
-        # how an off-by-one gets in.
         win.wagon_start_frame = win.wagon_units[0].start_frame_master
         win.wagon_end_frame = win.wagon_units[-1].end_frame_master
         win.wagon_start_time = win.wagon_units[0].start_time
         win.wagon_end_time = win.wagon_units[-1].end_time
-        if win.reverse_anchor is not None:
-            a = win.reverse_anchor
-            a.wagons_retained = len(win.wagon_units)
-            a.leading_non_wagon = len(win.leading_non_wagon_objects)
-            a.trailing_non_wagon = len(win.trailing_non_wagon_objects)
-            a.first_wagon = win.wagon_units[0].global_id
-            a.last_wagon = win.wagon_units[-1].global_id
-            # The anchor reports the SAME frames the window does.
-            a.start_frame = win.wagon_start_frame
-            a.end_frame = win.wagon_end_frame
     else:
         win.found = False
         win.reason = ("every segment in the wagon region was ENGINE or BRAKE_VAN; "
@@ -823,32 +392,6 @@ def get_master_wagon_window(
     if verbose:
         lead = ", ".join(f"{o.classification}" for o in win.leading_non_wagon_objects) or "none"
         trail = ", ".join(f"{o.classification}" for o in win.trailing_non_wagon_objects) or "none"
-        if win.reverse_anchor is not None:
-            a = win.reverse_anchor
-            print(f"  {a.render()}")
-            if not a.boundaries_agree:
-                print(f"      FORWARD vs REVERSE DISAGREE: {a.disagreement}")
-                for d in a.extended_segments:
-                    rb = d.get("rejected_boundary") or {}
-                    print(f"      retained segment {d['segment_index']} "
-                          f"({d['classification']}, {d['segment_frames']} frames, "
-                          f"median wagon {d.get('median_wagon_frames')}): "
-                          f"rejected boundary at frame {rb.get('center_frame')} "
-                          f"[{rb.get('reason')}] leaves "
-                          f"{d.get('trailing_wagon_frames')} frames of wagon")
-            else:
-                print(f"      forward and reverse boundaries agree "
-                      f"(segment {a.forward_first_wagon_segment_index}, "
-                      f"frame {a.forward_start_frame})")
-            for d in a.rejected_extensions:
-                # "no candidates at all" and "candidates existed but validation
-                # hard-rejected them" are different findings and the log has to
-                # tell them apart -- the second one is the case worth looking at.
-                hard = d.get("hard_rejections_ignored") or 0
-                extra = (f"  ({hard} hard-rejected candidate(s) ignored: "
-                         f"validation measured them as not-a-gap)" if hard else "")
-                print(f"      NOT retained: segment {d.get('segment_index')} "
-                      f"({d.get('classification')}) -- {d.get('reason')}{extra}")
         print(f"  [WAGONWIN] segments={win.total_segments}  "
               f"wagon region = segment {fw}..{lw}  ->  "
               f"{win.master_wagon_count} wagon(s) GW_1..GW_{win.master_wagon_count}")

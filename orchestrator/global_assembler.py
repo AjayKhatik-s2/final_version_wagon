@@ -110,21 +110,6 @@ def _load_master_classifications(bundle: CameraEvidenceBundle) -> List[Any]:
     return out
 
 
-def _master_rejected_gap_spans(bundle: CameraEvidenceBundle) -> List[Any]:
-    """The master's rejected gap candidates, for the end-anchored boundary walk.
-
-    Read-only: nothing here re-admits a gap or renumbers anything. Returns []
-    when the file is absent, which makes the walk fall back to the forward
-    boundary -- absence of evidence must never become evidence of a boundary.
-    """
-    try:
-        from train_structure import rejected_gap_spans_from_json
-        return rejected_gap_spans_from_json(
-            bundle.read_json("gap_validation.json"))
-    except Exception:  # noqa: BLE001 - a missing diagnostic must not fail a train
-        return []
-
-
 def _load_classifications(bundle: CameraEvidenceBundle):
     """This camera's persisted segment classifications, as plain records.
 
@@ -384,12 +369,6 @@ def assemble(
         verbose=verbose,
         wagon_regions=support_regions,
         wagon_only=True,
-        # The master camera's own discarded gap candidates, read back from the
-        # `gap_validation.json` its camera pass already wrote. Batch mode holds
-        # the same list in memory, so the end-anchored boundary walk sees
-        # identical evidence in both modes.
-        master_rejected_gap_spans=_master_rejected_gap_spans(
-            bundles[master_camera]),
     )
     res.timings["fusion_alignment"] = round(time.perf_counter() - t0, 3)
 
@@ -686,6 +665,10 @@ def assemble(
             # ACTIVE-REGION marker follows that camera's footage instead of the
             # master window projected through an offset that may be unresolved.
             camera_regions=support_regions,
+            # The canonical gap sequence, so a marker can carry the CANONICAL
+            # boundary id (GAP_25) instead of the drawing camera's own local
+            # track number. Read-only: no gap is created, moved or renumbered.
+            global_gaps=list(getattr(engine_state, "global_gaps", None) or []),
             verbose=verbose,
         )
     except Exception as e:  # noqa: BLE001 - visualization must not fail a train

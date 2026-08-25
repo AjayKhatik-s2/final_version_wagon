@@ -455,9 +455,17 @@ def process_batch(
 
     # ---- Stage 4b: feature overlay video rendering (visualization only) ----
     print(f"\n--- STAGE 4b  Feature overlay rendering ---")
+    # Read here rather than reusing Stage 3c's import: that one lives inside a
+    # try/except, so depending on it would make a rendering failure possible for
+    # a reason that has nothing to do with rendering.
+    from orchestrator.damage_association import load_global_gaps
     try:
         with timer.stage("stage4b_overlay_render"):
             out.processed_video_paths = feature_overlay_renderer.render_all_cameras(
+                # Canonical boundary ids for the gap markers, from the same
+                # `global_train_state.json` Stage 3c reads. The v4 state object
+                # keeps only `global_gap_count`, so the list comes off disk.
+                global_gaps=load_global_gaps(recon.state_json_path),
                 state=recon.state,
                 unified=out.unified,
                 evidence_root=evidence_root,

@@ -962,10 +962,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             verbose=verbose,
             wagon_regions=support_regions,
             wagon_only=not args.no_wagon_only,
-            # The master's own discarded gap candidates, so the end-anchored
-            # boundary walk can recognise a missed ENGINE->first-WAGON coupling.
-            master_rejected_gap_spans=ts.rejected_gap_spans_from_validation(
-                gap_validation.get(CAMERA_RIGHT_UP)),
         )
     else:
         print("WARNING: --fusion legacy allows support-camera observations to "
