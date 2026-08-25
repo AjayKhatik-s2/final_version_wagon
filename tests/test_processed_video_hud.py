@@ -98,6 +98,21 @@ def _render(camera_id, tmp, *, tracking=None, state=None, unified=None):
     return out
 
 
+def _render_with_regions(camera_id, tmp, *, state=None, regions=None,
+                         tracking=None):
+    """Render one camera, supplying per-camera `LocalWagonRegion` objects."""
+    vid = _write_video(os.path.join(tmp, "raw.mp4"))
+    out = os.path.join(tmp, f"{camera_id}_processed.mp4")
+    tr = tracking if tracking is not None else _tracking(camera_id)
+    R._render_one_camera(
+        camera_id=camera_id, video_path=vid, output_path=out,
+        state=state or _state(), unified={},
+        evidence_root=os.path.join(tmp, "evidence"),
+        camera_meta=tr.get(camera_id, {}), verbose=False,
+        camera_tracking=tr, camera_regions=regions)
+    return out
+
+
 def _frames(path, idxs):
     import cv2
     cap = cv2.VideoCapture(path)
@@ -582,3 +597,179 @@ class TestGapsAreTheRealDetectedGaps(unittest.TestCase):
         self.assertTrue(_has_colour(fr[30], R._GAP_COLOR))
         prov = R.RENDER_AUDITS[C.CAMERA_RIGHT_UP]["gap_marker_provenance_sample"]
         self.assertTrue(all(p["frame"] in (29, 30, 31) for p in prov))
+
+
+class TestLeftUpTopKeepsTheEngineOutsideTheRegion(unittest.TestCase):
+    """The reported failure: LEFT_UP_TOP showed WAGON_REGION_ACTIVE while an
+    ENGINE filled the frame.
+
+    Root cause: the region was the MASTER's `wagon_window` projected by
+    `time_offset`, and `camera_time_offsets()` returns 0.0 for a camera whose
+    offset the counter could not resolve -- deliberately, since guessing a shift
+    is worse than assuming none. On a camera whose footage is genuinely
+    displaced, the master's region then projects as though the clocks agreed and
+    lands over the leading engine.
+
+    Fix: prefer that camera's OWN `LocalWagonRegion` -- built by
+    `build_local_wagon_region` from its own temporally-smoothed labels, in its
+    own clock. Display only: it selects which frames carry a marker and can
+    neither add, remove nor renumber a canonical wagon.
+    """
+
+    class _Region:
+        """A `LocalWagonRegion` as `wagon_region.json` round-trips it."""
+
+        def __init__(self, found=True, start_frame=None, end_frame=None,
+                     reason=""):
+            self.found = found
+            self.start_frame = start_frame
+            self.end_frame = end_frame
+            self.reason = reason
+
+    def test_the_engine_stays_outside_when_the_camera_supplies_its_region(self):
+        """LEFT_UP_TOP's own wagons run 40..59; frames 0..39 are its engine."""
+        st = _state()                       # master region is 20..49
+        regions = {C.CAMERA_LEFT_UP_TOP: self._Region(
+            start_frame=40, end_frame=59,
+            reason="first WAGON at segment 2 on this camera")}
+        with tempfile.TemporaryDirectory() as tmp:
+            _render_with_regions(C.CAMERA_LEFT_UP_TOP, tmp, state=st,
+                                 regions=regions)
+        a = R.RENDER_AUDITS[C.CAMERA_LEFT_UP_TOP]["active_region"]
+        self.assertEqual(a["start"], 40, "the region still used the master's")
+        self.assertEqual(a["end"], 59)
+        self.assertEqual(a["source"], f"{C.CAMERA_LEFT_UP_TOP}_local_wagon_region")
+        self.assertIn("first WAGON", a["reason"])
+
+    def test_the_start_banner_is_not_drawn_over_the_engine(self):
+        """Checked on the BOTTOM STRIP only, where the START/END banner is
+        drawn. The region colour also appears in the panel's state label on
+        every frame, so a whole-frame colour test cannot tell the two apart --
+        it would pass for the wrong reason."""
+        st = _state()
+        regions = {C.CAMERA_LEFT_UP_TOP: self._Region(start_frame=40,
+                                                      end_frame=59)}
+        with tempfile.TemporaryDirectory() as tmp:
+            out = _render_with_regions(C.CAMERA_LEFT_UP_TOP, tmp, state=st,
+                                       regions=regions)
+            fr = _frames(out, {10, 40})
+        strip = lambda f: f[-45:, :, :]
+        self.assertFalse(_has_colour(strip(fr[10]), R._REGION_COLOR),
+                         "a START banner was drawn over the engine at frame 10")
+        self.assertTrue(_has_colour(strip(fr[40]), R._REGION_COLOR),
+                        "no START banner at the camera's own region start")
+
+    def test_a_noisy_wagon_prediction_does_not_open_the_region(self):
+        """`found=False` means this camera's own smoothing accepted no wagon
+        run, so a single misclassified frame cannot open the region -- the
+        fallback is used and the camera's opinion is recorded as the reason."""
+        st = _state()
+        regions = {C.CAMERA_LEFT_UP_TOP: self._Region(
+            found=False, reason="no WAGON segment identified on this camera")}
+        with tempfile.TemporaryDirectory() as tmp:
+            _render_with_regions(C.CAMERA_LEFT_UP_TOP, tmp, state=st,
+                                 regions=regions)
+        a = R.RENDER_AUDITS[C.CAMERA_LEFT_UP_TOP]["active_region"]
+        self.assertEqual(a["source"], "master_window_projected")
+        self.assertIn("no local wagon region", a["reason"])
+
+    def test_the_other_three_cameras_are_unchanged(self):
+        """Only LEFT_UP_TOP supplies a region here; the rest must still use the
+        projected master window, exactly as before."""
+        st = _state()
+        regions = {C.CAMERA_LEFT_UP_TOP: self._Region(start_frame=40,
+                                                      end_frame=59)}
+        for cam in (C.CAMERA_RIGHT_UP, C.CAMERA_LEFT_UP,
+                    C.CAMERA_RIGHT_UP_TOP):
+            with tempfile.TemporaryDirectory() as tmp:
+                _render_with_regions(cam, tmp, state=st, regions=regions)
+            a = R.RENDER_AUDITS[cam]["active_region"]
+            self.assertEqual(a["source"], "master_window_projected", cam)
+            self.assertEqual(a["start"], 20, cam)
+            self.assertEqual(a["end"], 49, cam)
+
+    def test_the_canonical_roster_is_untouched(self):
+        """A display fix must not move a single canonical wagon."""
+        st = _state()
+        before = [(w.global_id, w.wagon_index, w.start_frame_master,
+                   w.end_frame_master) for w in st.wagons]
+        win_before = dict(st.wagon_window)
+        regions = {C.CAMERA_LEFT_UP_TOP: self._Region(start_frame=40,
+                                                      end_frame=59)}
+        with tempfile.TemporaryDirectory() as tmp:
+            _render_with_regions(C.CAMERA_LEFT_UP_TOP, tmp, state=st,
+                                 regions=regions)
+        after = [(w.global_id, w.wagon_index, w.start_frame_master,
+                  w.end_frame_master) for w in st.wagons]
+        self.assertEqual(before, after, "the canonical roster changed")
+        self.assertEqual(win_before, dict(st.wagon_window),
+                         "the canonical wagon_window changed")
+        self.assertEqual(len(st.wagons), 3)
+
+    def test_no_camera_region_at_all_behaves_as_before(self):
+        st = _state()
+        with tempfile.TemporaryDirectory() as tmp:
+            _render_with_regions(C.CAMERA_LEFT_UP_TOP, tmp, state=st,
+                                 regions=None)
+        a = R.RENDER_AUDITS[C.CAMERA_LEFT_UP_TOP]["active_region"]
+        self.assertEqual(a["source"], "master_window_projected")
+
+    def test_the_assembler_passes_each_cameras_own_region(self):
+        src = open(os.path.join(ROOT, "orchestrator", "global_assembler.py"),
+                   encoding="utf-8").read()
+        self.assertIn("camera_regions=support_regions", src)
+
+
+class TestRegionEdgesAreNotPhysicalGaps(unittest.TestCase):
+    """An active-region edge marks where the wagon SEQUENCE starts or ends. A
+    physical gap is the boundary between two adjacent wagons. Conflating them
+    would make the video claim a gap that the detector never found."""
+
+    def test_the_audit_marks_the_region_as_not_a_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _render(C.CAMERA_RIGHT_UP, tmp, state=_state_with_engine())
+        a = R.RENDER_AUDITS[C.CAMERA_RIGHT_UP]["active_region"]
+        self.assertFalse(a["is_physical_wagon_gap"])
+
+    def test_a_drawn_gap_marks_itself_as_a_physical_gap(self):
+        tracking = {C.CAMERA_RIGHT_UP: {
+            "fps": FPS, "total_frames": NF,
+            "gaps": [{"track_id": 9, "start_frame": 29, "end_frame": 31,
+                      "hit_frames": [29, 30, 31],
+                      "bbox_history": [[100.0, 80.0, 140.0, 200.0]] * 3}]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            _render(C.CAMERA_RIGHT_UP, tmp, state=_state_with_engine(),
+                    tracking=tracking)
+        prov = R.RENDER_AUDITS[C.CAMERA_RIGHT_UP]["gap_marker_provenance_sample"]
+        self.assertTrue(prov)
+        for p in prov:
+            self.assertTrue(p["is_physical_wagon_gap"])
+            self.assertFalse(p["is_active_region_boundary"])
+
+    def test_a_region_boundary_frame_produces_no_gap_marker(self):
+        """Frame 20 is the region START and has no gap live on it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _render(C.CAMERA_RIGHT_UP, tmp, state=_state_with_engine(),
+                    tracking={C.CAMERA_RIGHT_UP: {"fps": FPS,
+                                                  "total_frames": NF,
+                                                  "gaps": []}})
+        a = R.RENDER_AUDITS[C.CAMERA_RIGHT_UP]
+        self.assertEqual(a["gap_markers_drawn"], 0,
+                         "a region boundary was counted as a gap")
+        self.assertEqual(a["active_region"]["start"], 20)
+
+    def test_the_provenance_names_both_adjacent_wagons(self):
+        tracking = {C.CAMERA_RIGHT_UP: {
+            "fps": FPS, "total_frames": NF,
+            "gaps": [{"track_id": 25, "start_frame": 29, "end_frame": 31,
+                      "hit_frames": [29, 30, 31],
+                      "bbox_history": [[100.0, 80.0, 140.0, 200.0]] * 3}]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            _render(C.CAMERA_RIGHT_UP, tmp, state=_state_with_engine(),
+                    tracking=tracking)
+        prov = R.RENDER_AUDITS[C.CAMERA_RIGHT_UP]["gap_marker_provenance_sample"]
+        p = prov[0]
+        self.assertEqual(p["left_global_wagon"], "GW_1")
+        self.assertEqual(p["right_global_wagon"], "GW_2")
+        self.assertIn("GAP_25", p["label"])
+        self.assertIn(p["geometry_source"], ("recorded_hit", "interpolated"))

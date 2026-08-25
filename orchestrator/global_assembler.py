@@ -88,6 +88,9 @@ class AssemblyResult:
     source_video_urls: Dict[str, str] = field(default_factory=dict)
     per_camera_tracking_path: str = ""
     damage_boundary: Any = None      # damage_boundary.BoundaryResult
+    #: `damage_association.DamageAssociationResult` -- the canonical
+    #: time-based wagon assignment for every damage detection, with provenance.
+    damage_association: Any = None
 
 
 def _load_master_classifications(bundle: CameraEvidenceBundle) -> List[Any]:
@@ -105,6 +108,21 @@ def _load_master_classifications(bundle: CameraEvidenceBundle) -> List[Any]:
         except (KeyError, TypeError, ValueError):
             continue
     return out
+
+
+def _master_rejected_gap_spans(bundle: CameraEvidenceBundle) -> List[Any]:
+    """The master's rejected gap candidates, for the end-anchored boundary walk.
+
+    Read-only: nothing here re-admits a gap or renumbers anything. Returns []
+    when the file is absent, which makes the walk fall back to the forward
+    boundary -- absence of evidence must never become evidence of a boundary.
+    """
+    try:
+        from train_structure import rejected_gap_spans_from_json
+        return rejected_gap_spans_from_json(
+            bundle.read_json("gap_validation.json"))
+    except Exception:  # noqa: BLE001 - a missing diagnostic must not fail a train
+        return []
 
 
 def _load_classifications(bundle: CameraEvidenceBundle):
@@ -366,6 +384,12 @@ def assemble(
         verbose=verbose,
         wagon_regions=support_regions,
         wagon_only=True,
+        # The master camera's own discarded gap candidates, read back from the
+        # `gap_validation.json` its camera pass already wrote. Batch mode holds
+        # the same list in memory, so the end-anchored boundary walk sees
+        # identical evidence in both modes.
+        master_rejected_gap_spans=_master_rejected_gap_spans(
+            bundles[master_camera]),
     )
     res.timings["fusion_alignment"] = round(time.perf_counter() - t0, 3)
 
@@ -570,6 +594,34 @@ def assemble(
         traceback.print_exc(limit=3)
     res.timings["stage3b_damage_boundary"] = round(time.perf_counter() - t0, 3)
 
+    # ---- Stage 3c: canonical damage -> wagon association ----------------
+    # The authority on which GW_n owns a damage detection.  Stage 2 filed each
+    # detection under whichever wagon directory its frame landed in, which is a
+    # rounded frame window computed with a `delta` that is 0.0 whenever the
+    # counter could not resolve that camera's offset.  This normalizes each
+    # detection's own camera-local frame onto the master clock and looks up the
+    # canonical gap-delimited interval it falls in.
+    #
+    # Runs AFTER 3b deliberately: 3b decides ownership from same-frame gap
+    # geometry and can only act while the boundary gap is visible -- exactly the
+    # band where this returns BOUNDARY_AMBIGUOUS and leaves 3b's answer alone.
+    t0 = time.perf_counter()
+    try:
+        from orchestrator import damage_association as DASSOC
+        res.damage_association = DASSOC.run(
+            state=state,
+            global_gaps=list(getattr(engine_state, "global_gaps", None) or []),
+            per_camera_fps=per_camera_fps,
+            states_root=states_root,
+            evidence_root=global_evidence,
+            diagnostics_dir=gs_dir,
+            verbose=verbose)
+    except Exception as e:  # noqa: BLE001 - association must not fail a train
+        print(f"[DAMAGE-ASSOC] resolver FAILED (non-fatal): "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        traceback.print_exc(limit=3)
+    res.timings["stage3c_damage_association"] = round(time.perf_counter() - t0, 3)
+
     # ---- Stage 4: fuse (existing builder, unchanged) --------------------
     t0 = time.perf_counter()
     from fusion import wagon_state_builder
@@ -630,6 +682,10 @@ def assemble(
             per_camera_tracking_path=pct_path,
             output_dir=processed_root,
             camera_offsets=resolved,
+            # Each camera's OWN classified wagon region, so the video's
+            # ACTIVE-REGION marker follows that camera's footage instead of the
+            # master window projected through an offset that may be unresolved.
+            camera_regions=support_regions,
             verbose=verbose,
         )
     except Exception as e:  # noqa: BLE001 - visualization must not fail a train

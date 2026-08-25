@@ -285,6 +285,37 @@ REVIEWED_IN_WORKTREE = (
     # See tests/test_left_up_top_model.py.
     "wagon_count/train_structure.py",       # mapping: LEFT_UP_TOP -> ltop.pt
     "wagon_count/run_global_count.py",      # name-keyed classifier resolution
+
+    # END-ANCHORED wagon active region, reviewed 2026-08-25. Validated on real
+    # footage: the trailing WAGON->BRAKE_VAN transition is reliable, the leading
+    # ENGINE->first-WAGON coupling is the one that gets missed. When it is
+    # missed, `build_global_wagons` emits ENGINE + the first wagon as ONE
+    # segment, that segment inherits the ENGINE label, and the forward rule
+    # ("start at the first segment labelled WAGON") starts the region at the
+    # SECOND wagon -- losing a real wagon, silently.
+    #
+    # `get_master_wagon_window` now anchors on the trailing boundary and derives
+    # the leading edge by walking BACKWARDS. What the walk may do is deliberately
+    # narrow: it can only RETAIN a segment `build_global_wagons` already produced
+    # from the validated master gaps, only at the leading edge, only one, and
+    # only on two pieces of existing canonical evidence -- the segment being
+    # longer than `merge_duration_ratio` of THIS train's median wagon, and a
+    # SOFT-rejected gap candidate sitting inside it with a wagon-sized remainder
+    # after it. It never splits a segment, never invents or renumbers a gap,
+    # never reads a support camera, and with no rejected-candidate evidence it
+    # falls back to the forward boundary unchanged.
+    #
+    # Hard-rejected candidates are ignored on purpose: `gap_validation` calls
+    # those "the false-positive defences" and `recover_wagon_active_candidates`
+    # re-admits only soft failures inside the wagon region. Honouring the same
+    # split at the leading edge is what stops a long locomotive's own artefacts
+    # from manufacturing a wagon.
+    #
+    # No threshold, model, detector, gap decision or GW numbering scheme
+    # changed. Both boundaries are always reported and a disagreement is
+    # recorded, never resolved quietly.
+    # See tests/test_reverse_anchor_active_region.py.
+    "wagon_count/global_fusion.py",         # + master_rejected_gap_spans passthrough
     #
     # ALSO, 2026-08-25: vehicle-TYPE resolution. Type was already side-camera
     # only -- `initial_classifications` is built from the master alone, and the

@@ -452,6 +452,20 @@ def _gap_tracks_for(tracking: Dict[str, Any], camera_id: str) -> List[Dict[str, 
     return out
 
 
+def _gap_neighbour_pair(boundary_map: Dict[int, Tuple[str, str]],
+                        gap: Dict[str, Any]) -> Tuple[str, str]:
+    """`(left_global_wagon, right_global_wagon)` for a gap, or `("", "")`.
+
+    Taken from the canonical roster's own frame ranges -- the wagons the
+    reconstruction actually placed either side of this boundary -- never from
+    wagon numbering or an assumed spacing.
+    """
+    for f in (gap.get("start_frame"), gap.get("end_frame")):
+        if f is not None and int(f) in boundary_map:
+            return boundary_map[int(f)]
+    return ("", "")
+
+
 def _gap_neighbours(boundary_map: Dict[int, Tuple[str, str]],
                     gap: Dict[str, Any]) -> str:
     """`GW_n | GAP_id | GW_n+1` for a gap, or just the gap id.
@@ -461,14 +475,7 @@ def _gap_neighbours(boundary_map: Dict[int, Tuple[str, str]],
     boundary. It is NOT derived from wagon arithmetic or an assumed spacing.
     """
     gid = gap.get("track_id", "?")
-    key = None
-    for f in (gap.get("start_frame"), gap.get("end_frame")):
-        if f is not None and int(f) in boundary_map:
-            key = int(f)
-            break
-    if key is None:
-        return f"GAP_{gid}"
-    prev_gw, next_gw = boundary_map[key]
+    prev_gw, next_gw = _gap_neighbour_pair(boundary_map, gap)
     if prev_gw and next_gw:
         return f"{prev_gw} | GAP_{gid} | {next_gw}"
     return f"GAP_{gid}"
@@ -521,6 +528,7 @@ def _draw_gap_boxes(frame, gaps: List[Dict[str, Any]], frame_idx: int,
                     _FONT, 0.5, _GAP_COLOR, 1, cv2.LINE_AA)
         drawn += 1
         if drawn_provenance is not None:
+            _l, _r = _gap_neighbour_pair(boundary_map or {}, g)
             drawn_provenance.append({
                 "camera_id": camera_id,
                 "local_gap_track_id": g.get("track_id"),
@@ -530,9 +538,18 @@ def _draw_gap_boxes(frame, gaps: List[Dict[str, Any]], frame_idx: int,
                 "bbox": [round(float(v), 2) for v in bbox[:4]],
                 "center_x": round((float(bbox[0]) + float(bbox[2])) / 2.0, 2),
                 "label": label,
+                # recorded_hit = the gap's own bbox at this exact frame;
+                # interpolated = between recorded hits, via the counting
+                # engine's own `_interp_gap_bbox`. Never an assumed position.
+                "geometry_source": ("recorded_hit" if frame_idx in hits
+                                    else "interpolated"),
                 "geometry": ("recorded_hit" if frame_idx in hits
                              else "interpolated"),
+                "left_global_wagon": _l,
+                "right_global_wagon": _r,
                 "resolved": True,
+                "is_physical_wagon_gap": True,
+                "is_active_region_boundary": False,
             })
     return drawn
 
@@ -622,6 +639,7 @@ def _render_one_camera(
     verbose: bool = True,
     time_offset: float = 0.0,
     camera_tracking: Optional[Dict[str, Any]] = None,
+    camera_regions: Optional[Dict[str, Any]] = None,
 ) -> str:
     # `unified` IS drawn now: the per-wagon LOAD verdict comes from it. Load
     # never persisted per-frame detections -- only `load/best_frame.jpg` and a
@@ -687,25 +705,70 @@ def _render_one_camera(
         for _f in (_prev[1], _next[0]):
             _boundary_map[int(_f)] = (_prev[2], _next[2])
 
-    # Wagon-ACTIVE-REGION edges, projected into this camera's frames. Read from
-    # the master's `wagon_window` -- the canonical source -- so the video cannot
-    # disagree with the report about where the region is.
+    # ---- Wagon-ACTIVE-REGION edges, in THIS camera's frames ---------------
+    #
+    # Two sources, and the order matters.
+    #
+    # PREFERRED: this camera's OWN `LocalWagonRegion` -- built by
+    # `train_structure.build_local_wagon_region` from this camera's own
+    # temporally-smoothed labels, in its own clock, and persisted as
+    # `wagon_region.json`. It already knows where the wagons are on THIS
+    # footage, and a single noisy WAGON prediction cannot open it because
+    # `apply_temporal_classification` ran first.
+    #
+    # FALLBACK: the master's `wagon_window` projected by `time_offset`.
+    #
+    # The fallback alone was the bug. `camera_time_offsets()` returns 0.0 for a
+    # camera whose offset the counter could NOT resolve -- deliberately, since
+    # guessing a shift is worse than assuming none -- so on a camera whose
+    # footage is genuinely displaced the master's region projects as though the
+    # clocks agreed, and lands over the leading ENGINE. The video then showed
+    # WAGON_REGION_ACTIVE while an engine filled the frame.
+    #
+    # This is DISPLAY ONLY. It selects which frames a marker is drawn on; it
+    # cannot add, remove or renumber a canonical wagon, and it never touches
+    # `state.wagon_window`. The canonical timeline stays with RIGHT_UP.
     _win = dict(getattr(state, "wagon_window", None) or {})
     _region_frames: Dict[str, Optional[int]] = {"start": None, "end": None}
-    for _key, _t in (("start", _win.get("wagon_start_time")),
-                     ("end", _win.get("wagon_end_time"))):
-        if _t is None or src_fps <= 0:
-            continue
-        _f = int(round((float(_t) - time_offset) * src_fps))
-        if _key == "end":
-            # EXCLUSIVE, as above: the region's last frame is one before the
-            # time the window reports. Off by one here would put the END marker
-            # on the first frame AFTER the region.
-            _f -= 1
-        if 0 <= _f < max(1, total):
-            _region_frames[_key] = _f
-    _region_found = bool(_win.get("found"))
+    _region_source = "master_window_projected"
+    _region_reason = "master wagon_window projected by this camera's offset"
+
+    _local = (camera_regions or {}).get(camera_id)
+    _lf = getattr(_local, "start_frame", None) if _local is not None else None
+    _le = getattr(_local, "end_frame", None) if _local is not None else None
+    if (_local is not None and getattr(_local, "found", False)
+            and _lf is not None and _le is not None and int(_le) >= int(_lf)):
+        _region_frames["start"] = max(0, min(max(0, total - 1), int(_lf)))
+        _region_frames["end"] = max(0, min(max(0, total - 1), int(_le)))
+        _region_source = f"{camera_id}_local_wagon_region"
+        _region_reason = str(getattr(_local, "reason", "") or
+                             "this camera's own classified wagon region")
+        _region_found = True
+    else:
+        for _key, _t in (("start", _win.get("wagon_start_time")),
+                         ("end", _win.get("wagon_end_time"))):
+            if _t is None or src_fps <= 0:
+                continue
+            _f = int(round((float(_t) - time_offset) * src_fps))
+            if _key == "end":
+                # EXCLUSIVE: the window's end_time is (end_frame + 1) / fps, so
+                # the last frame is one before it. Off by one here would put the
+                # END marker on the first frame AFTER the region.
+                _f -= 1
+            if 0 <= _f < max(1, total):
+                _region_frames[_key] = _f
+        _region_found = bool(_win.get("found"))
+        if _local is not None and not getattr(_local, "found", False):
+            _region_reason = (
+                f"{camera_id} has no local wagon region "
+                f"({getattr(_local, 'reason', '') or 'unclassified'}); "
+                f"fell back to the projected master window")
     _total_wagons = len(state.wagons)
+
+    if verbose:
+        print(f"[ACTIVE-REGION] {camera_id}  START frame="
+              f"{_region_frames['start']}  END frame={_region_frames['end']}  "
+              f"source={_region_source}  reason={_region_reason}")
 
     overlay = _OverlayRegistry(
         camera_id=camera_id, evidence_root=evidence_root, wagons=state.wagons,
@@ -718,6 +781,10 @@ def _render_one_camera(
               f"({total} frames, {n_boxes} box-instances)")
 
     gap_tracks = _gap_tracks_for(camera_tracking or {}, camera_id)
+    # Non-wagon spans come from the master window projected by the offset. When
+    # this camera supplied its OWN region, anything outside that region is this
+    # camera's non-wagon footage, so the spans are clipped to it -- otherwise the
+    # ENGINE label and the region marker could disagree on the same frame.
     non_wagon_spans = _non_wagon_spans(state, src_fps, total, time_offset)
     _frame_to_nonwagon: Dict[int, Tuple[str, str]] = {}
     for _sf, _ef, _cls, _pos in non_wagon_spans:
@@ -749,6 +816,11 @@ def _render_one_camera(
         "active_region": {
             "start": _region_frames["start"],
             "end": _region_frames["end"],
+            "source": _region_source,
+            "reason": _region_reason,
+            # An active-region edge is NOT a wagon gap. Recorded separately so
+            # nothing downstream can count one as the other.
+            "is_physical_wagon_gap": False,
             "start_reason": ("first_canonical_wagon" if _region_found
                              else "no_wagon_evidence_anywhere"),
             "end_reason": ("last_canonical_wagon" if _region_found
@@ -913,6 +985,7 @@ def _render_one_camera(
 
 def render_all_cameras(
     *,
+    camera_regions: Optional[Dict[str, Any]] = None,
     state: GlobalTrainState,
     unified: Dict[str, UnifiedWagonState],
     evidence_root: str,
@@ -970,6 +1043,7 @@ def render_all_cameras(
                 verbose=verbose,
                 time_offset=float(offsets.get(cam, 0.0) or 0.0),
                 camera_tracking=tracking,
+                camera_regions=camera_regions,
             ): cam
             for cam, cfg in jobs.items()
         }

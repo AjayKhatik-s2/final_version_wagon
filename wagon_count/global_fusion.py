@@ -1312,6 +1312,7 @@ def assemble_global_train_state_master_fixed(
     verbose: bool = True,
     wagon_regions: Optional[Dict[str, Any]] = None,
     wagon_only: bool = True,
+    master_rejected_gap_spans: Optional[Sequence[Any]] = None,
 ) -> GlobalTrainState:
     """Build the GlobalTrainState under the fixed-master invariant.
 
@@ -1359,7 +1360,13 @@ def assemble_global_train_state_master_fixed(
     wagon_window = None
     if wagon_only:
         from train_structure import get_master_wagon_window
-        wagon_window = get_master_wagon_window(all_segments, verbose=verbose)
+        # `master_rejected_gap_spans` is the master's own discarded gap
+        # candidates, read-only. The END-ANCHORED boundary walk needs them to
+        # tell a long locomotive from a locomotive merged with the first wagon;
+        # without them it falls back to the forward boundary exactly as before.
+        wagon_window = get_master_wagon_window(
+            all_segments, rejected_gap_spans=master_rejected_gap_spans,
+            verbose=verbose)
         wagons = wagon_window.wagon_units
     else:
         wagons = all_segments

@@ -88,6 +88,9 @@ class BatchOutcome:
     unified: Dict[str, UnifiedWagonState] = field(default_factory=dict)
     feature_summary: Dict[str, Dict[str, str]] = field(default_factory=dict)
     cache_summary: Optional[Any] = None
+    #: `damage_association.DamageAssociationResult` -- the canonical time-based
+    #: wagon assignment for every damage detection, with provenance.
+    damage_association: Optional[Any] = None
     report_pdf_path: Optional[str] = None
     report_pdf_url: Optional[str] = None
     report_json_path: Optional[str] = None
@@ -389,6 +392,36 @@ def process_batch(
 
     assert_roster_unchanged(recon.state, roster_guard,
                             stage="Stage 3 (feature inference)")
+
+    # ---- Stage 3c: canonical damage -> wagon association ----
+    # The SAME resolver sequential mode runs, on the same canonical inputs: the
+    # engine's `global_gaps` (read from `global_train_state.json`, since the v4
+    # state object keeps only `global_gap_count`), this batch's per-camera fps,
+    # and the camera clock offsets already on the state.  A damage detection's
+    # wagon is decided by which canonical gap-delimited interval its NORMALIZED
+    # time falls in -- never by the frame-window bucket Stage 2 filed it under.
+    #
+    # Stage 3b (same-frame gap geometry) cannot run here: it needs the
+    # full-fidelity tracking batch mode does not retain.  This can, which is
+    # what makes damage ownership behave identically in both modes.
+    print(f"\n--- STAGE 3c  Canonical damage -> wagon association ---")
+    try:
+        from orchestrator import damage_association as DASSOC
+        with timer.stage("stage3c_damage_association"):
+            out.damage_association = DASSOC.run(
+                state=recon.state,
+                global_gaps=DASSOC.load_global_gaps(recon.state_json_path),
+                per_camera_fps=recon.per_camera_fps,
+                states_root=states_root,
+                evidence_root=evidence_root,
+                diagnostics_dir=stage0_root,
+                verbose=verbose)
+        assert_roster_unchanged(recon.state, roster_guard,
+                                stage="Stage 3c (damage association)")
+    except Exception as e:  # noqa: BLE001 - association must not fail a batch
+        print(f"[DAMAGE-ASSOC] resolver FAILED (non-fatal): "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        traceback.print_exc(limit=3)
 
     # ---- Stage 4: fusion ----
     print(f"\n--- STAGE 4  Wagon state fusion ---")
