@@ -67,6 +67,7 @@ class AssemblyResult:
     wagon_regions_applied: List[str] = field(default_factory=list)
     cache_summary: Any = None
     train_window: Any = None
+    wagon_active: Any = None
     train_window_filter: str = ""
     engine_frames: Any = None
     feature_summary: Dict[str, Any] = field(default_factory=dict)
@@ -242,6 +243,7 @@ def assemble(
 
     master_tracks = tracks[master_camera]
     tw_window = None
+    wagon_active_window = None
     if use_train_window:
         segs_by_cam = {c: bundles[c].read_segments() for c in res.sealed_cameras}
         master_cls = _load_master_classifications(bundles[master_camera])
@@ -266,6 +268,27 @@ def assemble(
         if verbose:
             for line in tw_window.summary_lines():
                 print(f"[TRAINWIN] {line}")
+        # WAGON-active corroboration across all four cameras. ENGINE /
+        # BRAKE_VAN / UNKNOWN are never regions here, so the interval cannot
+        # start on the locomotive even when one camera misreads it -- the
+        # median needs a majority to be wrong.
+        from core import wagon_active as WA
+
+        acts = {}
+        for cam in res.sealed_cameras:
+            spans = (TW.spans_from_master_classifications(
+                        master_cls, float(master_tracks.fps or 0.0), cam)
+                     if cam == master_camera else
+                     TW.spans_from_local_segments(segs_by_cam.get(cam) or [],
+                                                  cam, 0.0))
+            acts[cam] = WA.camera_wagon_activity(spans, cam)
+        wagon_active_window = WA.common_wagon_window(
+            acts, master_camera=master_camera)
+        res.wagon_active = wagon_active_window
+        if verbose:
+            for line in wagon_active_window.summary_lines():
+                print(f"[WAGONACT] {line}")
+
         filt = TW.filter_gaps_to_window(master_tracks.gaps, tw_window,
                                         fps=float(master_tracks.fps or 0.0))
         res.train_window_filter = filt.summary()
@@ -300,6 +323,18 @@ def assemble(
         os.makedirs(d, exist_ok=True)
     if tw_window is not None:
         TW.write_artifact(tw_window, gs_dir)
+    # WAGON-active audit: where each camera saw sustained wagons, what it
+    # rejected, how the four were combined, and which canonical gaps landed
+    # inside the result. Persisted so the boundary can be explained after the
+    # fact rather than re-derived.
+    if wagon_active_window is not None:
+        from core import wagon_active as WA
+        with open(os.path.join(gs_dir, "wagon_active.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(WA.audit_payload(
+                wagon_active_window,
+                [g.center_time for g in master_tracks.gaps]),
+                f, indent=2, default=str)
     res.state_json_path = os.path.join(gs_dir, "global_train_state.json")
     with open(res.state_json_path, "w", encoding="utf-8") as f:
         f.write(engine_state.to_json())

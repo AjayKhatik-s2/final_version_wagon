@@ -299,17 +299,68 @@ def _map_wagon_to_local_frames(
     A wagon outside this camera's footage yields an empty range instead of
     being clamped onto an unrelated frame.
     """
-    if local_fps <= 0 or local_total_frames <= 0:
-        return (0, -1)
-    sf = int(round((wagon.start_time - time_offset) * local_fps))
-    ef = int(round((wagon.end_time - time_offset) * local_fps)) - 1
-    if ef < 0 or sf > local_total_frames - 1:
-        return (0, -1)
-    sf = max(0, min(local_total_frames - 1, sf))
-    ef = max(0, min(local_total_frames - 1, ef))
-    if ef < sf:
-        ef = sf
-    return (sf, ef)
+    # Delegates to core.master_timeline, the single implementation of this
+    # arithmetic. Behaviour is unchanged: a wagon outside this camera's footage
+    # yields the empty (0, -1) rather than being clamped onto an unrelated
+    # frame; partial overlap keeps the frames that exist.
+    from core.master_timeline import CameraClock, master_interval_to_local
+
+    clock = CameraClock(camera_id="", fps=float(local_fps or 0.0),
+                        total_frames=int(local_total_frames or 0),
+                        offset=float(time_offset or 0.0))
+    return master_interval_to_local(
+        clock, wagon.start_time, wagon.end_time).as_range()
+
+
+def _build_timeline_plan(*, camera_id: str, state: GlobalTrainState,
+                         camera_meta: Dict[str, Any], time_offset: float):
+    """Assemble the overlay plan from the canonical structures already on hand.
+
+    Regions and GW ids come from the persisted train window; boundaries come
+    from the canonical gap sequence RIGHT_UP minted. Both are read, never
+    recomputed -- if either is absent the overlay is simply skipped rather than
+    reconstructed from something weaker.
+    """
+    from core.master_timeline import CameraClock
+    from core.train_window import (
+        LabelledSpan, TrainWindow, build_train_timeline,
+    )
+    from rendering import timeline_overlay as TO
+
+    gaps = [float((g.get("master_observation") or {}).get("center_time", 0.0))
+            for g in (getattr(state, "global_gaps", None) or [])
+            if isinstance(g, dict)]
+    if not gaps:
+        return None
+
+    # The complete-train timeline, rebuilt from the canonical roster: every
+    # counted wagon keeps the id fusion gave it, so nothing is renumbered here.
+    spans, win = [], TrainWindow()
+    for w in getattr(state, "wagons", ()) or ():
+        spans.append(LabelledSpan(
+            camera_id=getattr(state, "master_camera", C.CAMERA_RIGHT_UP),
+            start_time=float(w.start_time), end_time=float(w.end_time),
+            label=str(w.classification),
+            confidence=float(w.classification_confidence or 0.0)))
+    if not spans:
+        return None
+    win.found = True
+    win.start_time = min(s.start_time for s in spans)
+    win.end_time = max(s.end_time for s in spans)
+    timeline = build_train_timeline(win, spans)
+
+    clock = CameraClock(
+        camera_id=camera_id,
+        fps=float((camera_meta or {}).get("fps") or 0.0),
+        total_frames=int((camera_meta or {}).get("total_frames") or 0),
+        offset=float(time_offset or 0.0), offset_status="RESOLVED")
+
+    detected = [float(g.get("center_time", 0.0)) + float(time_offset or 0.0)
+                for g in ((camera_meta or {}).get("gaps") or [])
+                if isinstance(g, dict) and g.get("center_time") is not None]
+    return TO.build_overlay_plan(
+        timeline=timeline, canonical_gap_times=gaps, clock=clock,
+        detected_gap_times=detected)
 
 
 def _load_camera_tracking(per_camera_tracking_path: str) -> Dict[str, Any]:
@@ -388,6 +439,23 @@ def _render_one_camera(
         print(f"[RENDER/{camera_id}] writing -> {output_path}  "
               f"({total} frames, {n_boxes} box-instances)")
 
+    # ---- canonical-timeline audit overlay --------------------------------
+    # Read-only view of the canonical structures. It creates no gap and no
+    # wagon; a boundary this camera did not itself detect is drawn as
+    # PROJECTED so the picture cannot imply agreement it does not have.
+    timeline_plan = None
+    try:
+        from rendering import timeline_overlay as TO
+        timeline_plan = _build_timeline_plan(
+            camera_id=camera_id, state=state, camera_meta=camera_meta,
+            time_offset=time_offset)
+        if timeline_plan is not None and verbose:
+            for line in timeline_plan.summary_lines():
+                print(line)
+    except Exception as e:
+        print(f"[RENDER/{camera_id}] timeline overlay unavailable "
+              f"({type(e).__name__}: {e}); drawing feature boxes only")
+
     frame_idx = 0
     written = 0
     while True:
@@ -411,6 +479,10 @@ def _render_one_camera(
             w = frame_to_wagon.get(frame_idx)
             frame_class = str(w.classification).upper() if w else "WAGON"
             _draw_damage_info(frame, frame_idx, n_damages, frame_class)
+
+        if timeline_plan is not None:
+            from rendering import timeline_overlay as TO
+            TO.draw_overlay(frame, TO.overlay_at(timeline_plan, frame_idx))
 
         writer.write(frame)
         written += 1
