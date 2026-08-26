@@ -38,20 +38,47 @@ from core.evidence_identity import (
 def wagon_local_frames(
     wagon_start_time: float, wagon_end_time: float,
     local_fps: float, local_total_frames: int,
+    time_offset: float = 0.0, camera_id: str = "",
 ) -> Tuple[int, int]:
-    """Same arithmetic as wagon_count/video_segmenter.py:70.
+    """A wagon's master window as this camera's inclusive frame range.
 
-    Returns (start_frame, end_frame) inclusive, clipped into the camera.
+    Delegates to `core.master_timeline`, the single implementation. Returns the
+    empty `(0, -1)` when the wagon lies outside this camera's footage.
+
+    It used to clamp unconditionally, so a camera that stopped recording before
+    the wagon existed returned its LAST frame -- `(1349, 1349)` for a
+    100-104s wagon against 90s of footage -- and the report showed that one
+    still as evidence for every wagon after the footage ended, each under a
+    different wagon id. Partial overlap is still clamped, because those frames
+    do show the wagon; no overlap is now refused.
     """
-    if local_fps <= 0 or local_total_frames <= 0:
-        return (0, -1)
-    sf = int(round(wagon_start_time * local_fps))
-    ef = int(round(wagon_end_time * local_fps)) - 1
-    sf = max(0, min(local_total_frames - 1, sf))
-    ef = max(0, min(local_total_frames - 1, ef))
-    if ef < sf:
-        ef = sf
-    return (sf, ef)
+    from core.master_timeline import CameraClock, master_interval_to_local
+
+    clock = CameraClock(camera_id=camera_id or "unknown",
+                        fps=float(local_fps or 0.0),
+                        total_frames=int(local_total_frames or 0),
+                        offset=float(time_offset or 0.0))
+    return master_interval_to_local(
+        clock, wagon_start_time, wagon_end_time).as_range()
+
+
+def wagon_local_window(
+    wagon_start_time: float, wagon_end_time: float,
+    local_fps: float, local_total_frames: int,
+    time_offset: float = 0.0, camera_id: str = "",
+):
+    """`wagon_local_frames` with the REASON attached.
+
+    Use this where a report needs to say why a slot is empty -- "camera ended
+    early" reads very differently from "no detection".
+    """
+    from core.master_timeline import CameraClock, master_interval_to_local
+
+    clock = CameraClock(camera_id=camera_id or "unknown",
+                        fps=float(local_fps or 0.0),
+                        total_frames=int(local_total_frames or 0),
+                        offset=float(time_offset or 0.0))
+    return master_interval_to_local(clock, wagon_start_time, wagon_end_time)
 
 
 # -----------------------------------------------------------------------------

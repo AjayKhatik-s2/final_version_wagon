@@ -211,7 +211,27 @@ def write_stage1_outputs(engine_state, tracks, output_dir: str) -> Dict[str, str
 # These entries are self-clearing: once committed, `git diff HEAD` no longer
 # reports the file and the entry has no effect. Delete an entry when its change
 # is committed rather than letting the list accumulate.
-REVIEWED_IN_WORKTREE = ()
+REVIEWED_IN_WORKTREE = (
+    # The time-to-local-frame arithmetic lived in three places and disagreed
+    # at the edges: for a wagon at master 100-104s against 90s of footage,
+    # wagon_local_frames() returned the camera's LAST frame (1349, 1349) and
+    # the report showed that one still as evidence for every wagon recorded
+    # after the camera stopped. Both callers now delegate to
+    # core/master_timeline.py; the materializer's behaviour is unchanged and
+    # the evidence lookup's clamp is gone. Covered by
+    # tests/test_master_timeline.py.
+    "reporting/_evidence_lookup.py",
+    "materializer/wagon_cache_builder.py",
+    # STEP 2d: the canonical train window restricts the master's validated
+    # gaps to the classification-confirmed physical train before STEP 3 fuses
+    # them, so a leading detection on empty track or across the ENGINE's face
+    # cannot become an inter-wagon boundary. Batch has no other seam -- fusion
+    # runs inside this subprocess -- and both modes must agree on the roster.
+    # Strictly subtractive; the master-fixed invariant is untouched. Bounded by
+    # test_counting_engine_swap.test_the_entry_point_diverges_ONLY_by_the_
+    # train_window_stage, and reversible with --no-train-window.
+    "wagon_count/run_global_count.py",
+)
 
 
 

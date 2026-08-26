@@ -87,18 +87,17 @@ def _wagon_local_range(
     camera's footage at all, so the caller writes no frames for it instead of
     clamping onto a frame that shows a different wagon.
     """
-    if local_fps <= 0 or local_total_frames <= 0:
-        return (0, -1)
-    sf = int(round((wagon.start_time - time_offset) * local_fps))
-    ef = int(round((wagon.end_time   - time_offset) * local_fps)) - 1
-    # Out of this camera's footage entirely -> contribute nothing.
-    if ef < 0 or sf > local_total_frames - 1:
-        return (0, -1)
-    sf = max(0, min(local_total_frames - 1, sf))
-    ef = max(0, min(local_total_frames - 1, ef))
-    if ef < sf:
-        ef = sf
-    return (sf, ef)
+    # Delegates to core.master_timeline -- the single implementation of this
+    # arithmetic. Behaviour here is unchanged: fully outside the footage yields
+    # the empty (0, -1), partial overlap is clamped to the frames that exist.
+    from core.master_timeline import CameraClock, master_interval_to_local
+
+    clock = CameraClock(camera_id=getattr(wagon, "camera_id", "") or "",
+                        fps=float(local_fps or 0.0),
+                        total_frames=int(local_total_frames or 0),
+                        offset=float(time_offset or 0.0))
+    return master_interval_to_local(
+        clock, wagon.start_time, wagon.end_time).as_range()
 
 
 # -----------------------------------------------------------------------------

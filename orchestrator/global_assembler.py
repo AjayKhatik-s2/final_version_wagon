@@ -66,6 +66,8 @@ class AssemblyResult:
     mapping_by_camera: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     wagon_regions_applied: List[str] = field(default_factory=list)
     cache_summary: Any = None
+    train_window: Any = None
+    train_window_filter: str = ""
     engine_frames: Any = None
     feature_summary: Dict[str, Any] = field(default_factory=dict)
     missing_cameras: List[str] = field(default_factory=list)
@@ -164,6 +166,7 @@ def assemble(
     output_root: str,
     batch_key: str,
     feat_models_dir: str = "",
+    use_train_window: bool = True,
     master_camera: str = C.MASTER_CAMERA,
     all_cameras: Tuple[str, ...] = C.ALL_CAMERAS,
     verbose: bool = True,
@@ -226,9 +229,54 @@ def assemble(
     support = [tracks[c] for c in all_cameras
                if c != master_camera and c in tracks]
 
+    # ---- canonical TRAIN WINDOW, before the master gaps are frozen --------
+    # Classification decides where the physical train begins and ends; gaps
+    # never do. The window then removes any RIGHT_UP gap lying outside it --
+    # a detection on empty track ahead of the rake, or across the ENGINE's
+    # leading face, which would otherwise become an inter-wagon boundary and
+    # add a phantom wagon at the head of the train.
+    #
+    # Subtractive only. Fusion still receives RIGHT_UP's gaps and is still the
+    # sole minter of the global sequence; nothing here touches that invariant.
+    from core import train_window as TW
+
+    master_tracks = tracks[master_camera]
+    tw_window = None
+    if use_train_window:
+        segs_by_cam = {c: bundles[c].read_segments() for c in res.sealed_cameras}
+        master_cls = _load_master_classifications(bundles[master_camera])
+        tw_window = TW.detect_train_window(
+            master_spans=TW.spans_from_master_classifications(
+                master_cls, float(master_tracks.fps or 0.0), master_camera),
+            # Support spans are projected at offset 0. Clock offsets are an
+            # OUTPUT of fusion, which has not run yet, so they are not
+            # available at this point -- and waiting for them would invert the
+            # dependency, since the window is meant to constrain the gaps that
+            # fusion consumes. The master's own classification sets the
+            # boundary whenever it exists (the normal case) and needs no
+            # offset, being the reference clock; support cameras only
+            # corroborate, so a sub-second misalignment cannot move the edge.
+            support_spans={
+                c: TW.spans_from_local_segments(segs_by_cam.get(c) or [], c,
+                                                0.0)
+                for c in res.sealed_cameras if c != master_camera},
+            master_gap_times=[g.center_time for g in master_tracks.gaps],
+            master_camera=master_camera)
+        res.train_window = tw_window
+        if verbose:
+            for line in tw_window.summary_lines():
+                print(f"[TRAINWIN] {line}")
+        filt = TW.filter_gaps_to_window(master_tracks.gaps, tw_window,
+                                        fps=float(master_tracks.fps or 0.0))
+        res.train_window_filter = filt.summary()
+        if verbose:
+            print(f"[TRAINWIN] {filt.summary()}")
+        if filt.applied and filt.dropped:
+            master_tracks.gaps = list(filt.kept)
+
     t0 = time.perf_counter()
     engine_state = gf.assemble_global_train_state_master_fixed(
-        master_tracks=tracks[master_camera],
+        master_tracks=master_tracks,
         support_tracks=support,
         initial_classifications=_load_master_classifications(
             bundles[master_camera]),
@@ -250,6 +298,8 @@ def assemble(
     global_cache = os.path.join(batch_root, "wagon_cache")
     for d in (gs_dir, states_root, reports_root):
         os.makedirs(d, exist_ok=True)
+    if tw_window is not None:
+        TW.write_artifact(tw_window, gs_dir)
     res.state_json_path = os.path.join(gs_dir, "global_train_state.json")
     with open(res.state_json_path, "w", encoding="utf-8") as f:
         f.write(engine_state.to_json())

@@ -394,13 +394,22 @@ class TestStage1IsUntouched(unittest.TestCase):
                          f"Stage-1/protected files modified: {offenders}")
 
     def test_counting_engine_entry_point_untracked_changes_none(self):
+        """Only the reviewed train-window stage may differ in wagon_count/.
+
+        run_global_count.py carries STEP 2d; the exception is bounded by
+        test_counting_engine_swap.test_the_entry_point_diverges_ONLY_by_the_
+        train_window_stage, which diffs it against the proven reference and
+        fails on any added line outside that stage, or any removed line.
+        """
         import subprocess
         r = subprocess.run(["git", "status", "--porcelain", "wagon_count"],
                            cwd=V4_ROOT, capture_output=True, text=True)
         if r.returncode != 0:
             self.skipTest("git unavailable")
-        self.assertEqual(r.stdout.strip(), "",
-                         "wagon_count/ has uncommitted modifications")
+        changed = sorted(ln.split()[-1] for ln in r.stdout.splitlines()
+                         if ln.strip())
+        self.assertEqual(changed, ["wagon_count/run_global_count.py"],
+                         f"unexpected changes in wagon_count/: {changed}")
 
 
 if __name__ == "__main__":

@@ -367,6 +367,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         f"{_tc.min_confidence_to_challenge})")
 
     # ---- train structure ----------------------------------------------------
+    p.add_argument("--no-train-window", action="store_true",
+                   help="Skip STEP 2d. The master's validated gaps are then "
+                        "used exactly as before, INCLUDING any leading gap on "
+                        "empty track or across the engine's face. Provided to "
+                        "reproduce pre-train-window results.")
     p.add_argument("--no-wagon-recovery", action="store_true",
                    help="Disable the WAGON_ACTIVE second validation pass. By "
                         "default a master candidate inside the confirmed wagon "
@@ -899,6 +904,67 @@ def main(argv: Optional[List[str]] = None) -> int:
                       "passed already or failed a hard gate")
         else:
             print("  no wagon window derived -- recovery skipped")
+
+    # ------------------------------------------------------------------
+    # STEP 2d -- canonical TRAIN WINDOW, then restrict the master's gaps to it
+    # ------------------------------------------------------------------
+    # Classification decides where the physical train begins and ends; a gap
+    # never does. The first detection at the head of a run is often not an
+    # inter-wagon gap at all -- it is empty track before the rake arrives, or
+    # the ENGINE's leading face crossing the frame -- and taking it as a
+    # boundary adds a phantom wagon at one end.
+    #
+    # Strictly subtractive: this can drop a validated gap that lies outside the
+    # classified train, and can never add, move, split or renumber one. STEP 3
+    # still receives RIGHT_UP's gaps and `build_global_gap_sequence` is still
+    # the sole minter of the global sequence, consulting no support camera.
+    # The master-fixed invariant is untouched.
+    train_window = None
+    if not args.no_train_window:
+        print()
+        print("-" * 70)
+        print("  STEP 2d  Canonical train window (classification + continuity)")
+        print("-" * 70)
+        try:
+            sys.path.insert(0, os.path.dirname(_here()))
+            from core import train_window as TW
+
+            support_spans = {}
+            for cam in ALL_CAMERAS:
+                if cam == CAMERA_RIGHT_UP or cam not in tracks:
+                    continue
+                t = tracks[cam]
+                segs = segments_from_gaps(t.gaps, t.total_frames)
+                labels = ((support_regions.get(cam).segment_labels
+                           if support_regions.get(cam) else None) or [])
+                spans = []
+                for i, (sf, ef) in enumerate(segs):
+                    if i >= len(labels) or t.fps <= 0:
+                        continue
+                    spans.append(TW.LabelledSpan(
+                        camera_id=cam, start_time=sf / t.fps,
+                        end_time=(ef + 1) / t.fps, label=str(labels[i])))
+                support_spans[cam] = spans
+
+            train_window = TW.detect_train_window(
+                master_spans=TW.spans_from_master_classifications(
+                    initial_classifications, master.fps, CAMERA_RIGHT_UP),
+                support_spans=support_spans,
+                master_gap_times=[g.center_time for g in master.gaps],
+                master_camera=CAMERA_RIGHT_UP)
+            for line in train_window.summary_lines():
+                print(f"  {line}")
+            filt = TW.filter_gaps_to_window(master.gaps, train_window,
+                                            fps=master.fps)
+            print(f"  {filt.summary()}")
+            if filt.applied and filt.dropped:
+                master.gaps = gval.renumber_gap_events(list(filt.kept))
+                print(f"  master gap sequence restricted to the physical "
+                      f"train: {len(master.gaps)} gap(s)")
+        except Exception as e:
+            print(f"WARNING: train-window stage failed, master gaps left "
+                  f"unchanged: {type(e).__name__}: {e}", file=sys.stderr)
+            _pending_notes.append(f"train_window_failed:{e}")
 
     # ------------------------------------------------------------------
     # STEP 3 -- cross-camera fusion
