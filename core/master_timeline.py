@@ -360,3 +360,51 @@ def project_roster(clocks: Dict[str, CameraClock], wagons: Sequence[Any],
             for cam, clock in clocks.items()
         }
     return out
+
+
+# --- canonical gap anchors --------------------------------------------------
+
+def gap_anchored_window(wagon: Any) -> Tuple[float, float]:
+    """A wagon's window bounded by the canonical GAPS either side of it.
+
+    `build_global_wagons` records, on every wagon, the master gap that leads it
+    and the one that trails it. Those two instants are the hardest temporal
+    evidence the pipeline has: they came from RIGHT_UP's validated gap
+    sequence, which is the same thing that defined the wagon's identity.
+
+    Preferred over `(start_time, end_time)` for MATCHING because the two can
+    differ. A wagon's own window is cut at `round(center_frame)`, while the gap
+    carries the un-rounded centre; and where a boundary gap is missing -- the
+    first and last wagon -- the window ends at the video edge rather than at a
+    gap. Anchoring on the gaps therefore places a segment against the same
+    landmarks the roster was built from, instead of against a derived interval.
+
+    Falls back to the wagon's own bounds for whichever side has no gap, so the
+    first and last wagon still get a usable window.
+    """
+    lead = getattr(wagon, "leading_gap", None) or {}
+    trail = getattr(wagon, "trailing_gap", None) or {}
+    t0 = lead.get("center_time") if isinstance(lead, dict) else None
+    t1 = trail.get("center_time") if isinstance(trail, dict) else None
+    if t0 is None:
+        t0 = wagon.start_time
+    if t1 is None:
+        t1 = wagon.end_time
+    return (float(t0), float(t1))
+
+
+def wagon_containing(t_master: float, wagons: Sequence[Any]) -> Optional[Any]:
+    """The wagon whose GAP-ANCHORED window contains this instant, if exactly one.
+
+    Returns None when the instant falls in no wagon, or -- because adjacent
+    anchored windows share an endpoint -- in more than one. An ambiguous hit is
+    left for the caller's own tie-break rather than being resolved silently
+    here.
+    """
+    hits = [w for w in wagons
+            if _within(t_master, *gap_anchored_window(w))]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _within(t: float, lo: float, hi: float) -> bool:
+    return lo <= t <= hi

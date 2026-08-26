@@ -551,3 +551,165 @@ def _gap_time(gap: Any, fps: float) -> Optional[float]:
             if gap.get(key) is not None:
                 return float(gap[key])
     return None
+
+
+# ===========================================================================
+# The complete-train timeline -- the master temporal coordinate system
+# ===========================================================================
+#
+# Order matters, and it is the reverse of how the pipeline grew:
+#
+#   1. the COMPLETE PHYSICAL TRAIN   TRAIN_START -> TRAIN_END, from
+#      classification + continuity. Includes ENGINE and BRAKE_VAN, because
+#      they are part of the train even though they are never counted.
+#   2. canonical GAPS                RIGHT_UP's validated gaps, restricted to
+#      that interval. RIGHT_UP alone; no support camera may mint one.
+#   3. counted ROSTER                GW_1..GW_N, derived from those gaps and
+#      numbered from the FIRST WAGON. Engine and brake van get no id.
+#   4. projection                    every camera reads the same coordinates.
+#
+# Deriving the train from the wagons has the boundary problem backwards: the
+# first counted wagon is not the front of the train, so anchoring on it starts
+# the coordinate system behind the locomotive and puts the ENGINE at a negative
+# offset from a timeline that claims to describe the whole train.
+
+COUNTED_CLASS = C.CLASS_WAGON
+
+
+@dataclass
+class TrainRegion:
+    """One classified stretch of the physical train, counted or not."""
+    index: int                       # position in the complete train, 0-based
+    kind: str                        # ENGINE | WAGON | BRAKE_VAN | UNKNOWN
+    start_time: float
+    end_time: float
+    confidence: float = 0.0
+    source_camera: str = ""
+    global_id: Optional[str] = None  # GW_n, only ever on a counted WAGON
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end_time - self.start_time)
+
+    @property
+    def counted(self) -> bool:
+        return self.global_id is not None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "index": self.index, "kind": self.kind,
+            "start_time": round(self.start_time, 4),
+            "end_time": round(self.end_time, 4),
+            "duration": round(self.duration, 4),
+            "confidence": round(self.confidence, 4),
+            "source_camera": self.source_camera,
+            "global_id": self.global_id, "counted": self.counted,
+        }
+
+
+@dataclass
+class TrainTimeline:
+    """The complete physical train, as one ordered coordinate system."""
+    window: TrainWindow
+    regions: List[TrainRegion] = field(default_factory=list)
+
+    @property
+    def found(self) -> bool:
+        return self.window.found
+
+    @property
+    def start_time(self) -> float:
+        return self.window.start_time
+
+    @property
+    def end_time(self) -> float:
+        return self.window.end_time
+
+    @property
+    def duration(self) -> float:
+        return self.window.duration
+
+    @property
+    def counted_regions(self) -> List[TrainRegion]:
+        return [r for r in self.regions if r.counted]
+
+    @property
+    def non_counted_regions(self) -> List[TrainRegion]:
+        """ENGINE / BRAKE_VAN / UNKNOWN -- on the timeline, off the roster."""
+        return [r for r in self.regions if not r.counted]
+
+    @property
+    def counted_wagon_count(self) -> int:
+        return len(self.counted_regions)
+
+    def region_at(self, t: float) -> Optional[TrainRegion]:
+        for r in self.regions:
+            if r.start_time <= t <= r.end_time:
+                return r
+        return None
+
+    def global_id_at(self, t: float) -> Optional[str]:
+        r = self.region_at(t)
+        return r.global_id if r is not None else None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "train_start_global_time": (round(self.start_time, 4)
+                                        if self.found else None),
+            "train_end_global_time": (round(self.end_time, 4)
+                                      if self.found else None),
+            "duration_seconds": round(self.duration, 4),
+            "region_count": len(self.regions),
+            "counted_wagon_count": self.counted_wagon_count,
+            "regions": [r.to_dict() for r in self.regions],
+            "window": self.window.to_dict(),
+        }
+
+    def summary_lines(self) -> List[str]:
+        if not self.found:
+            return self.window.summary_lines()
+        out = [f"complete train : {self.start_time:.2f}s -> "
+               f"{self.end_time:.2f}s ({self.duration:.2f}s), "
+               f"{len(self.regions)} region(s), "
+               f"{self.counted_wagon_count} counted wagon(s)"]
+        for r in self.regions:
+            tag = r.global_id or "--"
+            out.append(f"  [{r.index:>2}] {r.kind:<10} {r.start_time:7.2f} -> "
+                       f"{r.end_time:7.2f}  {tag}")
+        return out
+
+
+def build_train_timeline(window: TrainWindow,
+                         master_spans: Sequence[LabelledSpan],
+                         *, number_from: int = 1) -> TrainTimeline:
+    """The complete train as ordered regions, with GW ids on the WAGONs only.
+
+    Regions are the master's classified spans clipped to the train window, so
+    the coordinate system covers the whole physical train -- ENGINE and BRAKE
+    VAN included. Only `WAGON` regions receive a `GW_n`, numbered from the
+    FIRST WAGON, which keeps the counted roster identical to what
+    `train_structure.get_master_wagon_window()` produces from the same
+    classification. This does not replace that function; it is the timeline
+    view that surrounds it.
+    """
+    tl = TrainTimeline(window=window)
+    if not window.found:
+        return tl
+
+    lo, hi = window.start_time, window.end_time
+    idx = 0
+    for span in sorted(master_spans, key=lambda s: s.start_time):
+        s, e = max(span.start_time, lo), min(span.end_time, hi)
+        if e <= s:
+            continue                    # entirely outside the physical train
+        tl.regions.append(TrainRegion(
+            index=idx, kind=span.label, start_time=s, end_time=e,
+            confidence=span.confidence, source_camera=span.camera_id))
+        idx += 1
+
+    n = number_from
+    for r in tl.regions:
+        if r.kind == COUNTED_CLASS:
+            r.global_id = f"GW_{n}"
+            n += 1
+    return tl

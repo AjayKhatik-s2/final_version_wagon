@@ -151,6 +151,10 @@ def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
     return max(0.0, min(a1, b1) - max(a0, b0))
 
 
+def _between(t: float, lo: float, hi: float) -> bool:
+    return lo <= t <= hi
+
+
 def map_segments_to_global(
     segments: Sequence[LocalSegment],
     global_wagons: Sequence[Any],
@@ -159,6 +163,7 @@ def map_segments_to_global(
     offset: float = 0.0,
     offset_resolved: bool = True,
     min_overlap_fraction: float = 0.10,
+    use_gap_anchors: bool = True,
 ) -> List[SegmentMapping]:
     """Map camera-local segments onto global wagons by temporal overlap.
 
@@ -179,6 +184,8 @@ def map_segments_to_global(
     The winner is always the maximum-overlap GW so downstream has a usable
     assignment, but `kind` and `candidates` preserve the full picture.
     """
+    from core.master_timeline import gap_anchored_window
+
     out: List[SegmentMapping] = []
     eff_offset = float(offset) if offset_resolved else 0.0
 
@@ -186,6 +193,22 @@ def map_segments_to_global(
         g0 = seg.start_time + eff_offset
         g1 = seg.end_time + eff_offset
         duration = max(1e-9, g1 - g0)
+        midpoint = (g0 + g1) / 2.0
+
+        # HARD ANCHOR: the canonical gaps either side of a wagon are the same
+        # landmarks that defined its identity, so a segment whose centre sits
+        # between them belongs to that wagon -- whatever the overlap fraction
+        # says. Overlap alone mis-assigns a segment whose boundaries the local
+        # detector placed badly: it can sit squarely inside GW_n and still lose
+        # to GW_n+1 on area because the local segment ran long. Classification
+        # cannot break that tie either, since neighbouring wagons carry the
+        # same label.
+        anchor_hit = None
+        if use_gap_anchors:
+            inside = [w for w in global_wagons
+                      if _between(midpoint, *gap_anchored_window(w))]
+            if len(inside) == 1:
+                anchor_hit = inside[0]
 
         cands: List[Dict[str, Any]] = []
         for w in global_wagons:
@@ -206,8 +229,24 @@ def map_segments_to_global(
             continue
 
         best = cands[0]
+        if anchor_hit is not None and best["global_id"] != anchor_hit.global_id:
+            # The anchor wins, and the overlap view is kept alongside it so the
+            # disagreement stays visible rather than being silently overridden.
+            anchored = next((c for c in cands
+                             if c["global_id"] == anchor_hit.global_id), None)
+            if anchored is None:
+                anchored = {"global_id": anchor_hit.global_id,
+                            "overlap_seconds": 0.0, "overlap_fraction": 0.0}
+                cands.append(anchored)
+            anchored = dict(anchored)
+            anchored["anchor"] = "gap"
+            anchored["overlap_winner"] = best["global_id"]
+            cands = [anchored] + [c for c in cands
+                                  if c["global_id"] != anchor_hit.global_id]
+            best = anchored
         significant = [c for c in cands
-                       if c["overlap_fraction"] >= min_overlap_fraction]
+                       if c["overlap_fraction"] >= min_overlap_fraction
+                       or c.get("anchor") == "gap"]
         kind = MAP_EXACT
         note = ""
         if not offset_resolved:

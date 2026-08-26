@@ -267,3 +267,117 @@ class TestOutputContract(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCompleteTrainTimeline(unittest.TestCase):
+    """The timeline is the whole train; the roster is only its wagons.
+
+    Order: complete physical train first, canonical gaps second, counted
+    GW_n third. Deriving the train from the wagons instead would start the
+    coordinate system behind the locomotive.
+    """
+
+    def _timeline(self, spans=None):
+        from core.train_window import build_train_timeline
+        spans = spans if spans is not None else _typical()
+        w = detect_train_window(master_spans=spans)
+        return build_train_timeline(w, spans)
+
+    def test_engine_and_brake_van_are_on_the_timeline(self):
+        tl = self._timeline()
+        kinds = [r.kind for r in tl.regions]
+        self.assertEqual(kinds, [ENGINE, WAGON, WAGON, WAGON, BRAKE])
+        self.assertAlmostEqual(tl.start_time, 10.0)
+        self.assertAlmostEqual(tl.end_time, 40.0)
+
+    def test_gw_numbering_starts_at_the_first_wagon(self):
+        tl = self._timeline()
+        self.assertEqual([r.global_id for r in tl.regions],
+                         [None, "GW_1", "GW_2", "GW_3", None])
+        self.assertEqual(tl.counted_wagon_count, 3)
+
+    def test_engine_and_brake_van_receive_no_global_id(self):
+        tl = self._timeline()
+        for r in tl.non_counted_regions:
+            self.assertIn(r.kind, (ENGINE, BRAKE, UNKNOWN))
+            self.assertIsNone(r.global_id)
+            self.assertFalse(r.counted)
+
+    def test_the_timeline_is_longer_than_the_counted_region(self):
+        """The train starts before GW_1 and ends after the last wagon."""
+        tl = self._timeline()
+        first, last = tl.counted_regions[0], tl.counted_regions[-1]
+        self.assertLess(tl.start_time, first.start_time,
+                        "the ENGINE must precede GW_1")
+        self.assertGreater(tl.end_time, last.end_time,
+                           "the BRAKE_VAN must follow the last wagon")
+
+    def test_a_time_inside_the_engine_maps_to_no_wagon(self):
+        tl = self._timeline()
+        self.assertEqual(tl.region_at(12.0).kind, ENGINE)
+        self.assertIsNone(tl.global_id_at(12.0))
+        self.assertEqual(tl.global_id_at(20.0), "GW_1")
+        self.assertIsNone(tl.global_id_at(38.0), "brake van is not a wagon")
+
+    def test_numbering_matches_the_counted_wagon_window(self):
+        """Same classification in, same roster out as the counting engine."""
+        from global_train_state import GlobalWagon as EngineWagon
+        from train_structure import get_master_wagon_window
+        fps = 15.0
+
+        def seg(i, cls, a, b):
+            return EngineWagon(global_id=f"GW_{i}", wagon_index=i,
+                               start_frame_master=a, end_frame_master=b,
+                               start_time=a / fps, end_time=(b + 1) / fps,
+                               classification=cls,
+                               classification_confidence=0.9)
+        segments = [seg(1, ENGINE, 150, 239), seg(2, WAGON, 240, 359),
+                    seg(3, WAGON, 360, 479), seg(4, WAGON, 480, 539),
+                    seg(5, BRAKE, 540, 599)]
+        win = get_master_wagon_window(segments, verbose=False)
+        tl = self._timeline()
+        self.assertEqual(len(win.wagon_units), tl.counted_wagon_count)
+        self.assertEqual([w.global_id for w in win.wagon_units],
+                         [r.global_id for r in tl.counted_regions])
+
+    def test_an_unknown_region_stays_on_the_timeline_uncounted(self):
+        spans = _spans(RU, [(10.0, 14.0, ENGINE), (14.0, 20.0, WAGON),
+                            (20.0, 24.0, UNKNOWN), (24.0, 30.0, WAGON)])
+        tl = self._timeline(spans)
+        kinds = [r.kind for r in tl.regions]
+        self.assertIn(UNKNOWN, kinds)
+        self.assertEqual([r.global_id for r in tl.regions],
+                         [None, "GW_1", None, "GW_2"])
+
+    def test_regions_are_clipped_to_the_physical_train(self):
+        """Nothing outside TRAIN_START..TRAIN_END enters the coordinate system."""
+        spans = _spans(RU, [(0.0, 2.0, UNKNOWN)]) + _typical() + \
+            _spans(RU, [(50.0, 55.0, UNKNOWN)])
+        tl = self._timeline(spans)
+        for r in tl.regions:
+            self.assertGreaterEqual(r.start_time, tl.start_time - 1e-9)
+            self.assertLessEqual(r.end_time, tl.end_time + 1e-9)
+
+    def test_regions_are_ordered_and_contiguous_in_index(self):
+        tl = self._timeline()
+        self.assertEqual([r.index for r in tl.regions],
+                         list(range(len(tl.regions))))
+        times = [r.start_time for r in tl.regions]
+        self.assertEqual(times, sorted(times))
+
+    def test_no_timeline_when_no_train_was_found(self):
+        from core.train_window import build_train_timeline
+        spans = _spans(RU, [(0.0, 50.0, UNKNOWN)])
+        w = detect_train_window(master_spans=spans)
+        tl = build_train_timeline(w, spans)
+        self.assertFalse(tl.found)
+        self.assertEqual(tl.regions, [])
+
+    def test_the_timeline_serialises_with_both_views(self):
+        d = self._timeline().to_dict()
+        self.assertEqual(d["counted_wagon_count"], 3)
+        self.assertEqual(d["region_count"], 5)
+        self.assertEqual(d["train_start_global_time"], 10.0)
+        kinds = [r["kind"] for r in d["regions"]]
+        self.assertIn(ENGINE, kinds)
+        self.assertIn(BRAKE, kinds)
