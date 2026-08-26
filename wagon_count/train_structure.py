@@ -298,6 +298,8 @@ def _as_non_wagon(w: GlobalWagon, idx: int, position: str) -> NonWagonObject:
 def get_master_wagon_window(
     segments: Sequence[GlobalWagon],
     *,
+    first_wagon_index: Optional[int] = None,
+    last_wagon_index: Optional[int] = None,
     verbose: bool = True,
 ) -> WagonWindow:
     """Select the counted wagon region from the master's full segment list.
@@ -354,6 +356,23 @@ def get_master_wagon_window(
         return win
 
     fw, lw = wagon_idx[0], wagon_idx[-1]
+
+    # Optional boundary override from `core.region_consensus`: multi-camera
+    # evidence, already normalized onto the global timeline, may WIDEN the
+    # window to another of the master's own segments. It can only ever select a
+    # different existing segment -- the units stay the master's gap-delimited
+    # segments, so no wagon is invented and the count stays master-controlled.
+    # Never narrows: shrinking would drop a wagon the master already counted,
+    # which classification evidence alone must not do.
+    if first_wagon_index is not None:
+        _f = int(first_wagon_index)
+        if 0 <= _f < len(segments) and _f < fw:
+            fw = _f
+    if last_wagon_index is not None:
+        _l = int(last_wagon_index)
+        if 0 <= _l < len(segments) and _l > lw:
+            lw = _l
+
     win.found = True
     win.first_wagon_segment_index = fw
     win.last_wagon_segment_index = lw

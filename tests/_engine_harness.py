@@ -297,7 +297,40 @@ REVIEWED_IN_WORKTREE = (
     #   git diff 5e4bcf1 -- wagon_count/      -> empty
     # The reverse walk, its rejected-gap evidence adapters, its diagnostics and
     # its tests are all gone; nothing reads a ReverseAnchor any more.
-    "wagon_count/global_fusion.py",         # reverted: no evidence passthrough
+    "wagon_count/global_fusion.py",         # reverted; + consensus pass (below)
+
+    # MULTI-CAMERA active-region consensus, reviewed 2026-08-26. The four
+    # cameras do not observe the wagon region at the same LOCAL time -- they sit
+    # at different points on the track and their clocks differ -- so their
+    # boundaries were being read as contradictions when they are one boundary
+    # seen through four clocks.
+    #
+    # What was wrong, specifically:
+    #   * only the two TOP cameras were consulted for boundary evidence;
+    #     LEFT_UP, a SIDE camera and the strongest corroboration available, was
+    #     not consulted at all;
+    #   * a camera whose offset is UNRESOLVED was normalized with delta = 0.0 --
+    #     compared as though its clock agreed with the master's, manufacturing
+    #     both false agreement and false dissent out of a missing measurement;
+    #   * top cameras could corroborate or dissent but never help recover a
+    #     boundary the master's own classifier missed.
+    #
+    # `core.region_consensus` now normalizes every camera with the EXISTING
+    # `global_fusion` offsets (t_global = t_local + delta; an unresolved camera
+    # is recorded but excluded from the vote) and decides by weighted consensus
+    # -- side 2, top 1. A boundary moves only when the weighted support reaches
+    # 3, which the two top cameras alone cannot reach, AND the proposed boundary
+    # sits on a VALIDATED MASTER GAP. Those two conditions together are what stop
+    # classification alone from manufacturing a wagon. It can only WIDEN the
+    # window; narrowing would drop a wagon the master already counted.
+    #
+    # `get_master_wagon_window` gained `first_wagon_index` / `last_wagon_index`:
+    # indices into the master's OWN segment list, so the units stay the master's
+    # gap-delimited segments and the count stays master-controlled. No second
+    # clock, no second gap detector, no second counter. One call, made by both
+    # pipelines, so the two modes cannot diverge.
+    # See tests/test_multicamera_active_region.py.
+    "wagon_count/global_train_state.py",    # + region_consensus diagnostics
     #
     # ALSO, 2026-08-25: vehicle-TYPE resolution. Type was already side-camera
     # only -- `initial_classifications` is built from the master alone, and the

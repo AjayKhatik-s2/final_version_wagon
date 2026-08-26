@@ -363,6 +363,12 @@ class GlobalTrainState:
     with counts per rejection reason."""
 
     gap_rejection_details: Dict[str, Any] = field(default_factory=dict)
+
+    region_consensus: Dict[str, Any] = field(default_factory=dict)
+    """`core.region_consensus` -- every camera's wagon-region boundary in its own
+    clock AND normalized onto the global timeline, plus which cameras supported
+    the canonical START/END, which disagreed, which could not be compared, and
+    why the boundary was held or moved."""
     """Per camera: every rejected candidate with its reason and measured motion
     features. Nothing is discarded silently."""
 
@@ -457,6 +463,7 @@ class GlobalTrainState:
             "fragment_stitching": dict(self.fragment_stitching),
             "wagon_active_recovery": dict(self.wagon_active_recovery),
             "gap_rejection_details": dict(self.gap_rejection_details),
+            "region_consensus": dict(self.region_consensus),
         }
 
     def to_json(self, indent: int = 2) -> str:

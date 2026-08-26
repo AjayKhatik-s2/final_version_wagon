@@ -130,11 +130,34 @@ def resolve(state, tops=None, fps=None):
 
 class TestTopCameraCannotCreateAWagon(unittest.TestCase):
 
-    def test_the_window_selector_sees_only_master_segments(self):
-        """Its entire input is the master's classified segments. There is no
-        parameter through which a top camera's opinion could arrive."""
-        params = list(inspect.signature(ts.get_master_wagon_window).parameters)
-        self.assertEqual(params, ["segments", "verbose"])
+    def test_the_window_selector_only_ever_selects_master_segments(self):
+        """Its units are the master's classified segments, always.
+
+        `first_wagon_index` / `last_wagon_index` come from
+        `core.region_consensus` and are INDICES INTO `segments` -- so the most
+        multi-camera evidence can do is pick a different one of the master's own
+        gap-delimited units. There is no parameter through which a camera could
+        supply a wagon, a frame range or a time.
+        """
+        params = set(inspect.signature(ts.get_master_wagon_window).parameters)
+        self.assertEqual(params, {"segments", "verbose",
+                                  "first_wagon_index", "last_wagon_index"})
+
+    def test_an_out_of_range_override_is_ignored(self):
+        """A boundary index outside the master's own segment list cannot select
+        anything -- the window falls back to the master's own answer."""
+        win = ts.get_master_wagon_window(
+            segments(SPEC), first_wagon_index=-5, last_wagon_index=999,
+            verbose=False)
+        self.assertEqual(win.master_wagon_count, 5)
+
+    def test_an_override_can_only_widen_never_narrow(self):
+        """Narrowing would drop a wagon the master already counted, which
+        classification evidence alone must never do."""
+        win = ts.get_master_wagon_window(
+            segments(SPEC), first_wagon_index=3, last_wagon_index=4,
+            verbose=False)
+        self.assertEqual(win.master_wagon_count, 5)
 
     def test_the_roster_is_the_same_however_loudly_a_top_camera_disagrees(self):
         win = canonical_window()

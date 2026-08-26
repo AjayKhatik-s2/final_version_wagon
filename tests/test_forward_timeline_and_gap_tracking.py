@@ -145,12 +145,23 @@ class TestReverseAnchorIsRemoved(unittest.TestCase):
         self.assertFalse(os.path.exists(
             os.path.join(V4_ROOT, "tests/test_reverse_anchor_active_region.py")))
 
-    def test_the_window_selector_takes_no_evidence_parameter(self):
-        """Its whole input is the master's classified segments."""
+    def test_the_window_selector_takes_no_rejected_gap_evidence(self):
+        """The withdrawn mechanism fed it the master's DISCARDED gap candidates
+        so it could walk backwards. That is gone.
+
+        It does take `first_wagon_index` / `last_wagon_index` from
+        `core.region_consensus` -- multi-camera boundaries already normalized
+        onto the global timeline. Those select a different one of the master's
+        OWN segments; they carry no evidence of their own and cannot widen the
+        window to anything the master did not already produce.
+        """
         import inspect
         import train_structure as ts
-        params = list(inspect.signature(ts.get_master_wagon_window).parameters)
-        self.assertEqual(params, ["segments", "verbose"])
+        params = set(inspect.signature(ts.get_master_wagon_window).parameters)
+        self.assertEqual(params, {"segments", "verbose",
+                                  "first_wagon_index", "last_wagon_index"})
+        for banned in ("rejected_gap_spans", "reverse_cfg"):
+            self.assertNotIn(banned, params)
 
     def test_the_wagon_window_carries_no_reverse_fields(self):
         import train_structure as ts

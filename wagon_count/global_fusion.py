@@ -1357,9 +1357,42 @@ def assemble_global_train_state_master_fixed(
 
     # ---- 3b. WAGON-ONLY selection: engines and brake vans get no GW id ----
     wagon_window = None
+    region_consensus = None
     if wagon_only:
         from train_structure import get_master_wagon_window
+        # PASS 1: the master's own boundary. RIGHT_UP defines the timeline, so
+        # this is the incumbent and the default answer.
         wagon_window = get_master_wagon_window(all_segments, verbose=verbose)
+
+        # PASS 2: normalize all four cameras onto that timeline and see whether
+        # the combined evidence puts a boundary on a DIFFERENT master segment.
+        # Runs here because this is the only point where the master window, the
+        # per-camera regions and the resolved offsets are all in hand -- and
+        # because it is the one call both pipelines make, so neither mode can
+        # get a different active-region algorithm.
+        try:
+            from core import region_consensus as RC
+            _offsets_meta = {
+                cam: {"delta": al.offset.delta, "status": al.offset.status}
+                for cam, al in alignments.items()}
+            _offsets_meta[master_tracks.camera_id] = {
+                "delta": 0.0, "status": OFFSET_REFERENCE}
+            region_consensus = RC.resolve(
+                master_camera=master_tracks.camera_id,
+                master_window=wagon_window.summary(),
+                support_regions=(wagon_regions or {}),
+                camera_offsets=_offsets_meta,
+                master_gap_times=[g.master_time for g in global_gaps],
+                verbose=verbose)
+            _f, _l = _consensus_segment_bounds(
+                all_segments, region_consensus, master_tracks.fps)
+            if _f is not None or _l is not None:
+                wagon_window = get_master_wagon_window(
+                    all_segments, first_wagon_index=_f, last_wagon_index=_l,
+                    verbose=verbose)
+        except Exception as e:  # noqa: BLE001 - consensus must not fail a train
+            print(f"[ACTIVE-REGION] consensus unavailable, master boundary "
+                  f"stands: {type(e).__name__}: {e}")
         wagons = wagon_window.wagon_units
     else:
         wagons = all_segments
@@ -1436,6 +1469,8 @@ def assemble_global_train_state_master_fixed(
         state.master_wagon_count = wagon_window.master_wagon_count
     else:
         state.master_wagon_count = len(wagons)
+    if region_consensus is not None:
+        state.region_consensus = region_consensus.to_dict()
     if wagon_regions:
         state.support_wagon_regions = {
             cam: (reg.to_dict() if hasattr(reg, "to_dict") else {})
@@ -1454,6 +1489,37 @@ def assemble_global_train_state_master_fixed(
                   f"total_wagons={checks['total_wagons']}")
 
     return state
+
+
+def _consensus_segment_bounds(
+    segments: Sequence[GlobalWagon],
+    consensus: Any,
+    fps: float,
+) -> Tuple[Optional[int], Optional[int]]:
+    """Map a moved consensus boundary onto one of the master's OWN segments.
+
+    Returns `(first_index, last_index)`, either of which may be None for "leave
+    the master's boundary alone". A time is only ever translated into an index
+    into `segments`, so the wagon that results is a master segment bounded by
+    validated master gaps -- never a span invented from a classification.
+    """
+    first = last = None
+    if consensus is None or fps <= 0:
+        return (None, None)
+    if getattr(consensus.start, "moved", False):
+        t = consensus.start.canonical_time
+        if t is not None:
+            for i, sg in enumerate(segments):
+                if sg.start_time <= t < sg.end_time:
+                    first = i
+                    break
+    if getattr(consensus.end, "moved", False):
+        t = consensus.end.canonical_time
+        if t is not None:
+            for i, sg in enumerate(segments):
+                if sg.start_time < t <= sg.end_time:
+                    last = i
+    return (first, last)
 
 
 def _assign_real_supporting_cameras(
