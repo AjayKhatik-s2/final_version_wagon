@@ -56,6 +56,23 @@ from features._evidence import (
 FEATURE_NAME = "load"
 
 
+class _NoInferenceSentinel:
+    """Stands in for the model during Phase 2. Calling it is a bug."""
+
+    names: dict = {}
+
+    def __call__(self, *a, **k):
+        raise RuntimeError(
+            "model inference attempted during Phase 2 aggregation -- "
+            "evidence was already collected in the single decode pass")
+
+    def __bool__(self):
+        return True
+
+
+_SENTINEL_NO_INFERENCE = _NoInferenceSentinel()
+
+
 # Legacy threshold from RIGHT_UP_TOP/damage_processor.py:1047
 _LOADED_RATIO_THRESHOLD = 0.35
 
@@ -144,6 +161,13 @@ def run(
     # When supplied, these are CAMERA-LOCAL segments (L_<CAM>_<n>) presented
     # through the same attribute shape, so the loop body below is unchanged.
     segments: Optional[Sequence[Any]] = None,
+    # Phase 2 of the unified architecture. When supplied, Door/Damage/Load
+    # evidence was ALREADY collected from the original video in the single
+    # decode pass and assigned to this wagon by TimelineEvidence.fuse(), so
+    # this processor performs NO inference: it reads the aggregated result and
+    # runs the unchanged persistence / fusion code below it. When None the
+    # legacy path runs exactly as before.
+    collected: Any = None,
     inference_mode: str = "legacy",
     sample_stride: int = 2,
     verbose: bool = True,
@@ -159,7 +183,15 @@ def run(
     effective_every_nth = max(1, int(sample_stride)) if mode == "sampled" else every_nth
 
     model_path = os.path.join(feature_models_dir, C.MODEL_LOADED)
-    model = load_yolo(model_path)
+    # Phase 2 loads NO weights. With `collected` supplied every detection was
+    # already made during the single decode pass, so opening the model here
+    # would be dead weight AND would let a missing .pt file fail a run that
+    # needs no inference. The sentinel keeps the "model present" branches below
+    # truthy without being callable -- if anything downstream ever tries to
+    # score with it, that is a bug and it raises loudly rather than silently
+    # re-inferring.
+    model = (_SENTINEL_NO_INFERENCE if collected is not None
+             else load_yolo(model_path))
 
     feature_out = os.path.join(output_dir, FEATURE_NAME)
     os.makedirs(feature_out, exist_ok=True)
@@ -206,10 +238,15 @@ def run(
             per_camera: Dict[str, Dict[str, Any]] = {}
             best_by_cam: Dict[str, Dict[str, BestFrameTracker]] = {}
             for cam in C.TOP_CAMERAS:
-                cls, conf, used, n_l, n_e, b_l, b_e = _aggregate_camera(
-                    model, cache_root, gw_id, cam,
-                    every_nth=effective_every_nth, max_frames=max_frames,
-                )
+                if collected is not None:
+                    # Pure aggregation over evidence already collected.
+                    (cls, conf, used, n_l, n_e, b_l,
+                     b_e) = collected.load_for(gw_id, cam)
+                else:
+                    cls, conf, used, n_l, n_e, b_l, b_e = _aggregate_camera(
+                        model, cache_root, gw_id, cam,
+                        every_nth=effective_every_nth, max_frames=max_frames,
+                    )
                 per_camera[cam] = {
                     "load_status":  cls,
                     "confidence":   round(float(conf), 4),

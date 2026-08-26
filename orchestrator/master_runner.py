@@ -308,12 +308,45 @@ def process_batch(
     # all wagons within its processor).
     print(f"\n--- STAGE 3  Feature inference ---")
     _print_feature_config(feature_config, header="  feature config:")
+    # PHASE 2 of the unified architecture. Door / Damage / Load evidence was
+    # already collected in Stage 1's SINGLE decode of each original video and
+    # persisted; here it is assigned to the canonical wagons by
+    # `TimelineEvidence.fuse()` and aggregated by the three extracted pure
+    # functions. The processors below then run their unchanged persistence /
+    # fusion code over that result WITHOUT loading a model or opening a video.
+    #
+    # One call, into the module Sequential also calls -- Batch contains no raw
+    # collection, no aggregation and no timestamp-to-wagon logic of its own.
+    # A None result means no evidence was collected, in which case the
+    # processors fall back to their proven per-wagon path rather than silently
+    # producing empty features.
+    from core.production_pipeline import (
+        RAW_EVIDENCE_DIRNAME, phase2_from_disk,
+    )
+
+    collected = None
+    with timer.stage("phase2_aggregate"):
+        try:
+            collected = phase2_from_disk(
+                evidence_dir=os.path.join(recon.output_dir,
+                                          RAW_EVIDENCE_DIRNAME),
+                wagons=list(recon.state.wagons), mode="batch",
+                camera_offsets={c: {"offset": o} for c, o in
+                                (recon.camera_offsets or {}).items()},
+                verbose=verbose)
+        except Exception as e:
+            print(f"[EVIDENCE-AGGREGATE] Phase 2 unavailable ({e}); "
+                  f"features fall back to the per-wagon path",
+                  file=sys.stderr)
+            traceback.print_exc(limit=3)
+
     feature_kwargs = dict(
         state=recon.state,
         cache_root=cache_root,
         feature_models_dir=feat_models_dir,
         output_dir=states_root,
         evidence_root=evidence_root,
+        collected=collected,
         verbose=verbose,
     )
 
@@ -332,10 +365,19 @@ def process_batch(
           f"damage={damage_inference_mode}/stride={damage_sample_stride}  "
           f"load={load_inference_mode}/stride={load_sample_stride}")
 
+    #: OCR is deliberately NOT part of Phase 2: it bands its detections and
+    #: picks frames by the wagon's LOAD state, so it cannot collect before a
+    #: roster exists. It keeps its own per-wagon path and never sees
+    #: `collected`.
+    _NO_PHASE2 = ("ocr",)
+
     def _run_feature(name, fn):
+        kw = dict(feature_kwargs)
+        if name in _NO_PHASE2:
+            kw.pop("collected", None)
         with timer.stage(f"stage3_{name}"):
             try:
-                return fn(**feature_kwargs, **_feature_extra.get(name, {}))
+                return fn(**kw, **_feature_extra.get(name, {}))
             except Exception as e:
                 print(f"[STAGE3/{name}] CRASHED: {e}", file=sys.stderr)
                 traceback.print_exc(limit=3)

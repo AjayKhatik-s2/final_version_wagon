@@ -118,13 +118,35 @@ class TestStepOrdering(unittest.TestCase):
         return [src.index(t) for t in tokens]
 
     def test_shared_prefix_is_track_stitch_validate(self):
+        """STEP 1 -> 1a -> 1b, with STEP 1 now the shared single decode.
+
+        The tokens changed because the architecture did: STEP 1 used to be
+        `GapTracker(...)` + `tracker.process_video(...)` inside this function,
+        and is now one call into `core.production_pipeline.collect_production`,
+        which both Batch and Sequential share. The ORDER assertion is
+        unchanged, and the next test makes this strictly stronger than before
+        by requiring `process_video` to be absent rather than merely present in
+        the right position.
+        """
         pos = self._positions(cp._track_stitch_validate, [
-            "GapTracker(", "tracker.process_video(",
+            "collect_production(", "stage1.tracks",
             "fstitch.reassemble_fragments(", "gval.validate_gap_events(",
             "gval.renumber_gap_events(",
         ])
         self.assertEqual(pos, sorted(pos),
                          "STEP 1 -> 1a -> 1b order violated")
+
+    def test_step_one_does_not_open_a_second_decode(self):
+        """`process_video()` would decode the camera a second time.
+
+        Comments are stripped first: the function's own comment explains why it
+        does not call `process_video`, and a naive substring search would match
+        that explanation and pass for the wrong reason.
+        """
+        src = inspect.getsource(cp._track_stitch_validate)
+        code = "\n".join(ln.split("#", 1)[0] for ln in src.splitlines())
+        self.assertNotIn("process_video", code)
+        self.assertIn("assert_no_second_decode", code)
 
     def test_stitching_precedes_validation(self):
         """run_global_count is explicit: reassembly runs BEFORE validation."""

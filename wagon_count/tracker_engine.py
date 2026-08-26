@@ -214,12 +214,193 @@ class GapTracker:
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Frame-by-frame stepping
+    # ------------------------------------------------------------------
+    #
+    # `process_video` used to own the decode loop AND all tracker state as
+    # method locals, so nothing else could feed it frames. The unified
+    # collector needs to decode each camera ONCE and hand the same frame to the
+    # gap tracker and to Door / Damage / Load, which is impossible while the
+    # loop is sealed inside this method.
+    #
+    # The loop body is therefore extracted VERBATIM into `step()`, with the
+    # loop-local state moved onto `self`. Detection, association, confirmation,
+    # miss handling, track closure, gap construction, ordering, diagnostics and
+    # the returned structure are unchanged; `process_video` keeps its signature
+    # and is now a thin decode loop over `step()`, so every existing caller
+    # behaves exactly as before. `tests/test_gap_stepper_equivalence.py` runs
+    # the pre-refactor implementation and this one over the same video and
+    # requires identical events.
+
+    def begin(self, *, keep_raw_detections: bool = True) -> None:
+        """Reset per-run tracker state. Called once before the first `step`."""
+        self._active_tracks: List[_Track] = []
+        self._completed_tracks: List[_Track] = []
+        self._next_track_id = 1
+        self._raw_detections: Dict[int, List[Dict[str, Any]]] = {}
+        self._keep_raw_detections = bool(keep_raw_detections)
+        self._frames_seen = 0
+
+        # Reset diagnostic counters for this video
+        self._diag_total_yolo_boxes = 0
+        self._diag_after_class = 0
+        self._diag_after_conf = 0
+        self._diag_kept = 0
+
+    def step(self, frame_idx: int, frame: np.ndarray,
+             frame_h: Optional[int] = None) -> None:
+        """Advance the tracker by ONE frame. The body of the old loop, verbatim.
+
+        `frame_idx` is supplied by the caller so the gap tracker and the feature
+        collectors stamp the same index on evidence from the same frame.
+        """
+        if getattr(self, "_active_tracks", None) is None:
+            self.begin()
+        height = int(frame_h if frame_h is not None else frame.shape[0])
+
+        detections = self._detect_gaps(frame, height)
+
+        if self._keep_raw_detections and detections:
+            # Lightweight payload for the overlay renderer (bbox + conf)
+            self._raw_detections[frame_idx] = [
+                {
+                    "bbox": [float(x) for x in d["bbox"]],
+                    "confidence": d["confidence"],
+                    "center_x": d["center_x"],
+                }
+                for d in detections
+            ]
+
+        # Predict step for all active tracks
+        for tr in self._active_tracks:
+            tr.predicted_center()
+
+        # Greedy nearest-neighbor association on x distance.
+        # Sort detections by center_x so association is deterministic.
+        detections_sorted = sorted(detections, key=lambda d: d["center_x"])
+        used_track_idx: set = set()
+
+        for det in detections_sorted:
+            best_i, best_d = -1, float("inf")
+            cx = det["center_x"]
+            for i, tr in enumerate(self._active_tracks):
+                if i in used_track_idx:
+                    continue
+                d = abs(cx - tr.kf.cx) if tr.kf is not None else abs(cx - tr.centers[-1])
+                if d < best_d and d <= self.match_distance_px:
+                    best_d = d
+                    best_i = i
+            if best_i >= 0:
+                used_track_idx.add(best_i)
+                self._active_tracks[best_i].update(frame_idx, cx, det["confidence"], det["bbox"])
+                if self._active_tracks[best_i].hit_count >= self.min_hits:
+                    self._active_tracks[best_i].confirmed = True
+            else:
+                tr = _Track(
+                    track_id=self._next_track_id,
+                    first_frame=frame_idx,
+                    last_seen_frame=frame_idx,
+                )
+                tr.update(frame_idx, cx, det["confidence"], det["bbox"])
+                self._active_tracks.append(tr)
+                self._next_track_id += 1
+
+        # Increment miss for tracks not matched this frame
+        for i, tr in enumerate(self._active_tracks):
+            if i not in used_track_idx:
+                tr.mark_miss()
+
+        # Close tracks that exceeded max_miss
+        still_active: List[_Track] = []
+        for tr in self._active_tracks:
+            if tr.miss_count >= self.max_miss:
+                if tr.confirmed:
+                    self._completed_tracks.append(tr)
+            else:
+                still_active.append(tr)
+        self._active_tracks = still_active
+
+        self._frames_seen = frame_idx + 1
+        if self.verbose and self._frames_seen % 200 == 0:
+            print(f"  ... frame {self._frames_seen}  "
+                  f"active_tracks={len(self._active_tracks)}  "
+                  f"completed={len(self._completed_tracks)}")
+
+    def finish(self, *, video_path: str, fps: float, width: int, height: int,
+               total_frames_meta: int = 0,
+               t0: Optional[float] = None) -> LocalCameraTracks:
+        """Flush surviving tracks and build the result. The old tail, verbatim."""
+        # Flush surviving confirmed tracks
+        for tr in self._active_tracks:
+            if tr.confirmed:
+                self._completed_tracks.append(tr)
+
+        # Sort by first_frame so GapEvents are temporally ordered, then
+        # rewrite track_ids 1..N for determinism
+        self._completed_tracks.sort(key=lambda t: (t.first_frame, t.last_seen_frame))
+
+        events: List[GapEvent] = []
+        for new_id, tr in enumerate(self._completed_tracks, start=1):
+            mean_conf = float(np.mean(tr.confidences)) if tr.confidences else 0.0
+            span = max(1, tr.last_seen_frame - tr.first_frame + 1)
+            tcs = float(min(1.0, tr.hit_count / span))
+            events.append(GapEvent(
+                track_id=new_id,
+                camera_id=self.camera_id,
+                start_frame=tr.first_frame,
+                end_frame=tr.last_seen_frame,
+                confidence=mean_conf,
+                hit_count=tr.hit_count,
+                center_x_trajectory=list(tr.centers),
+                fps=fps,
+                temporal_consistency_score=tcs,
+                hit_frames=list(tr.hit_frames),
+                bbox_history=[list(b) for b in tr.bboxes],
+            ))
+
+        # Effective frame count = whatever we actually iterated through
+        effective_frames = self._frames_seen
+        # Some containers misreport CAP_PROP_FRAME_COUNT; trust what we read.
+        total_frames = max(effective_frames, total_frames_meta if total_frames_meta > 0 else 0)
+
+        if self.verbose:
+            elapsed = (time.time() - t0) if t0 is not None else 0.0
+            print(f"[GapTracker/{self.camera_id}] done in {elapsed:.1f}s  "
+                  f"emitted {len(events)} confirmed gaps  "
+                  f"({self._frames_seen} frames processed)")
+            # Filter-stage diagnostics -- helps spot "no bbox shown" cases.
+            print(f"  YOLO boxes: total={self._diag_total_yolo_boxes}  "
+                  f"after_class={self._diag_after_class}  "
+                  f"after_conf={self._diag_after_conf}  "
+                  f"kept={self._diag_kept}")
+            if self._diag_total_yolo_boxes > 0 and self._diag_kept == 0:
+                print(f"  \u26a0 All {self._diag_total_yolo_boxes} YOLO boxes were "
+                      f"rejected by filters.  Lower --side/top-confidence or "
+                      f"--side/top-min-height-ratio for this camera.")
+
+        return LocalCameraTracks(
+            camera_id=self.camera_id,
+            video_path=video_path,
+            fps=fps,
+            total_frames=total_frames,
+            width=width,
+            height=height,
+            gaps=events,
+            raw_frame_detections=self._raw_detections if self._keep_raw_detections else {},
+        )
+
     def process_video(
         self,
         video_path: str,
         frame_limit: int = 0,
         keep_raw_detections: bool = True,
     ) -> LocalCameraTracks:
+        """Unchanged public API: decode this video and return its gap tracks.
+
+        Now a thin loop over `step()`. Behaviour is identical -- see the note
+        above the stepper.
+        """
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video not found: {video_path}")
 
@@ -240,17 +421,7 @@ class GapTracker:
             print(f"\n[GapTracker/{self.camera_id}] {os.path.basename(video_path)}")
             print(f"  fps={fps:.3f}  frames={total_frames_meta}  size={width}x{height}")
 
-        active_tracks: List[_Track] = []
-        completed_tracks: List[_Track] = []
-        next_track_id = 1
-        raw_detections: Dict[int, List[Dict[str, Any]]] = {}
-
-        # Reset diagnostic counters for this video
-        self._diag_total_yolo_boxes = 0
-        self._diag_after_class = 0
-        self._diag_after_conf = 0
-        self._diag_kept = 0
-
+        self.begin(keep_raw_detections=keep_raw_detections)
         frame_idx = 0
         t0 = time.time()
 
@@ -260,137 +431,14 @@ class GapTracker:
             ret, frame = cap.read()
             if not ret:
                 break
-
-            detections = self._detect_gaps(frame, height)
-
-            if keep_raw_detections and detections:
-                # Lightweight payload for the overlay renderer (bbox + conf)
-                raw_detections[frame_idx] = [
-                    {
-                        "bbox": [float(x) for x in d["bbox"]],
-                        "confidence": d["confidence"],
-                        "center_x": d["center_x"],
-                    }
-                    for d in detections
-                ]
-
-            # Predict step for all active tracks
-            for tr in active_tracks:
-                tr.predicted_center()
-
-            # Greedy nearest-neighbor association on x distance.
-            # Sort detections by center_x so association is deterministic.
-            detections_sorted = sorted(detections, key=lambda d: d["center_x"])
-            used_track_idx: set = set()
-
-            for det in detections_sorted:
-                best_i, best_d = -1, float("inf")
-                cx = det["center_x"]
-                for i, tr in enumerate(active_tracks):
-                    if i in used_track_idx:
-                        continue
-                    d = abs(cx - tr.kf.cx) if tr.kf is not None else abs(cx - tr.centers[-1])
-                    if d < best_d and d <= self.match_distance_px:
-                        best_d = d
-                        best_i = i
-                if best_i >= 0:
-                    used_track_idx.add(best_i)
-                    active_tracks[best_i].update(frame_idx, cx, det["confidence"], det["bbox"])
-                    if active_tracks[best_i].hit_count >= self.min_hits:
-                        active_tracks[best_i].confirmed = True
-                else:
-                    tr = _Track(
-                        track_id=next_track_id,
-                        first_frame=frame_idx,
-                        last_seen_frame=frame_idx,
-                    )
-                    tr.update(frame_idx, cx, det["confidence"], det["bbox"])
-                    active_tracks.append(tr)
-                    next_track_id += 1
-
-            # Increment miss for tracks not matched this frame
-            for i, tr in enumerate(active_tracks):
-                if i not in used_track_idx:
-                    tr.mark_miss()
-
-            # Close tracks that exceeded max_miss
-            still_active: List[_Track] = []
-            for tr in active_tracks:
-                if tr.miss_count >= self.max_miss:
-                    if tr.confirmed:
-                        completed_tracks.append(tr)
-                else:
-                    still_active.append(tr)
-            active_tracks = still_active
-
+            self.step(frame_idx, frame, frame_h=height)
             frame_idx += 1
-            if self.verbose and frame_idx % 200 == 0:
-                print(f"  ... frame {frame_idx}  active_tracks={len(active_tracks)}  "
-                      f"completed={len(completed_tracks)}")
 
         cap.release()
-        # Flush surviving confirmed tracks
-        for tr in active_tracks:
-            if tr.confirmed:
-                completed_tracks.append(tr)
+        return self.finish(video_path=video_path, fps=fps, width=width,
+                           height=height,
+                           total_frames_meta=total_frames_meta, t0=t0)
 
-        # Sort by first_frame so GapEvents are temporally ordered, then
-        # rewrite track_ids 1..N for determinism
-        completed_tracks.sort(key=lambda t: (t.first_frame, t.last_seen_frame))
-
-        events: List[GapEvent] = []
-        for new_id, tr in enumerate(completed_tracks, start=1):
-            mean_conf = float(np.mean(tr.confidences)) if tr.confidences else 0.0
-            span = max(1, tr.last_seen_frame - tr.first_frame + 1)
-            tcs = float(min(1.0, tr.hit_count / span))
-            events.append(GapEvent(
-                track_id=new_id,
-                camera_id=self.camera_id,
-                start_frame=tr.first_frame,
-                end_frame=tr.last_seen_frame,
-                confidence=mean_conf,
-                hit_count=tr.hit_count,
-                center_x_trajectory=list(tr.centers),
-                fps=fps,
-                temporal_consistency_score=tcs,
-                hit_frames=list(tr.hit_frames),
-                bbox_history=[list(b) for b in tr.bboxes],
-            ))
-
-        # Effective frame count = whatever we actually iterated through
-        effective_frames = frame_idx
-        # Some containers misreport CAP_PROP_FRAME_COUNT; trust what we read.
-        total_frames = max(effective_frames, total_frames_meta if total_frames_meta > 0 else 0)
-
-        elapsed = time.time() - t0
-        if self.verbose:
-            print(f"[GapTracker/{self.camera_id}] done in {elapsed:.1f}s  "
-                  f"emitted {len(events)} confirmed gaps  "
-                  f"({frame_idx} frames processed)")
-            # Filter-stage diagnostics -- helps spot "no bbox shown" cases.
-            print(f"  YOLO boxes: total={self._diag_total_yolo_boxes}  "
-                  f"after_class={self._diag_after_class}  "
-                  f"after_conf={self._diag_after_conf}  "
-                  f"kept={self._diag_kept}")
-            if self._diag_total_yolo_boxes > 0 and self._diag_kept == 0:
-                print(f"  ⚠ All {self._diag_total_yolo_boxes} YOLO boxes were "
-                      f"rejected by filters.  Lower --side/top-confidence or "
-                      f"--side/top-min-height-ratio for this camera.")
-
-        return LocalCameraTracks(
-            camera_id=self.camera_id,
-            video_path=video_path,
-            fps=fps,
-            total_frames=total_frames,
-            width=width,
-            height=height,
-            gaps=events,
-            raw_frame_detections=raw_detections if keep_raw_detections else {},
-        )
-
-    # ------------------------------------------------------------------
-    # Per-frame YOLO inference
-    # ------------------------------------------------------------------
     def _detect_gaps(self, frame: np.ndarray, frame_h: int) -> List[Dict[str, Any]]:
         results = self.model(frame, verbose=False)[0]
         dets: List[Dict[str, Any]] = []

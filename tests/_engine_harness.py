@@ -231,6 +231,10 @@ REVIEWED_IN_WORKTREE = (
     # test_counting_engine_swap.test_the_entry_point_diverges_ONLY_by_the_
     # train_window_stage, and reversible with --no-train-window.
     "wagon_count/run_global_count.py",
+    # The GapTracker stepper refactor -- see the note in
+    # tests/test_counting_engine_swap.py. Proven event-for-event equivalent to
+    # the pre-refactor implementation by tests/test_gap_stepper_equivalence.py.
+    "wagon_count/tracker_engine.py",
 )
 
 

@@ -95,6 +95,23 @@ from features.evidence_aggregator import EvidenceAggregator, Observation
 FEATURE_NAME = "door"
 
 
+class _NoInferenceSentinel:
+    """Stands in for the model during Phase 2. Calling it is a bug."""
+
+    names: dict = {}
+
+    def __call__(self, *a, **k):
+        raise RuntimeError(
+            "model inference attempted during Phase 2 aggregation -- "
+            "evidence was already collected in the single decode pass")
+
+    def __bool__(self):
+        return True
+
+
+_SENTINEL_NO_INFERENCE = _NoInferenceSentinel()
+
+
 # -----------------------------------------------------------------------------
 # Canonicalization of legacy state strings
 # -----------------------------------------------------------------------------
@@ -616,6 +633,13 @@ def run(
     # When supplied, these are CAMERA-LOCAL segments (L_<CAM>_<n>) presented
     # through the same attribute shape, so the loop body below is unchanged.
     segments: Optional[Sequence[Any]] = None,
+    # Phase 2 of the unified architecture. When supplied, Door/Damage/Load
+    # evidence was ALREADY collected from the original video in the single
+    # decode pass and assigned to this wagon by TimelineEvidence.fuse(), so
+    # this processor performs NO inference: it reads the aggregated result and
+    # runs the unchanged persistence / fusion code below it. When None the
+    # legacy path runs exactly as before.
+    collected: Any = None,
     inference_mode: str = "legacy",
     sample_stride: int = 2,
 ) -> Dict[str, str]:
@@ -639,7 +663,15 @@ def run(
             f"door inference_mode must be 'legacy' or 'sampled', got {mode!r}")
 
     model_path = os.path.join(feature_models_dir, C.MODEL_DOOR_STATE)
-    yolo_model = load_yolo(model_path)
+    # Phase 2 loads NO weights. With `collected` supplied every detection was
+    # already made during the single decode pass, so opening the model here
+    # would be dead weight AND would let a missing .pt file fail a run that
+    # needs no inference. The sentinel keeps the "model present" branches below
+    # truthy without being callable -- if anything downstream ever tries to
+    # score with it, that is a bug and it raises loudly rather than silently
+    # re-inferring.
+    yolo_model = (_SENTINEL_NO_INFERENCE if collected is not None
+                  else load_yolo(model_path))
 
     feature_out = os.path.join(output_dir, FEATURE_NAME)
     os.makedirs(feature_out, exist_ok=True)
@@ -679,6 +711,9 @@ def run(
                 continue
 
             def _one_camera(cam):
+                if collected is not None:
+                    # Pure aggregation over evidence already collected.
+                    return collected.door_for(gw_id, cam)
                 if mode == "sampled":
                     return _run_sampled_one_camera(
                         yolo_model, tracker_cfg, cache_root, gw_id, cam,

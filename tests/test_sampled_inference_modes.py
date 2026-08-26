@@ -406,7 +406,8 @@ class TestStage1IsUntouched(unittest.TestCase):
                            cwd=V4_ROOT, capture_output=True, text=True)
         if r.returncode != 0:
             self.skipTest("git unavailable")
-        allowed = {"wagon_count/run_global_count.py"}
+        allowed = {"wagon_count/run_global_count.py",
+                   "wagon_count/tracker_engine.py"}
         changed = {ln.split()[-1] for ln in r.stdout.splitlines() if ln.strip()}
         # An empty set is the normal state once the change is committed; what
         # must never appear is a SECOND modified counting module.

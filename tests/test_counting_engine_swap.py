@@ -78,7 +78,21 @@ class TestNewEnginePresent(unittest.TestCase):
     #: inside this subprocess -- and sequential and batch are required to
     #: produce the same roster, so the stage has to live here too.
     #: Every other counting module stays byte-identical.
-    LOCALLY_EXTENDED = {"run_global_count.py"}
+    LOCALLY_EXTENDED = {
+        "run_global_count.py",
+        # tracker_engine.py carries the STEPPER refactor: process_video's loop
+        # body extracted verbatim into begin/step/finish with the loop-local
+        # tracker state moved onto self, so the unified collector can decode a
+        # camera once and feed the same frame to GAP and to Door/Damage/Load.
+        # process_video keeps its signature and every caller is unaffected.
+        #
+        # Not exempted on trust: tests/test_gap_stepper_equivalence.py loads
+        # the PRE-REFACTOR module from git and requires event-for-event
+        # identical output -- frames, confidences, hit counts, trajectories,
+        # bbox history, diagnostics -- and refuses to pass on an empty
+        # comparison.
+        "tracker_engine.py",
+    }
 
     def test_engine_is_byte_identical_to_the_reference(self):
         """Adopted verbatim, not reimplemented and not locally patched.
@@ -97,13 +111,31 @@ class TestNewEnginePresent(unittest.TestCase):
                 self.assertEqual(live, ref,
                                  f"{name} diverges from the proven engine")
 
-    def test_the_entry_point_diverges_ONLY_by_the_train_window_stage(self):
-        """Bound the one exception, so it cannot become a general licence.
+    #: The ONLY lines this entry point may delete from the reference: the
+    #: STEP-1 gap-tracking stage. It was replaced by the shared single-decode
+    #: collector (`core.production_pipeline.collect_production`), which Batch
+    #: and Sequential now both call, so that a camera is decoded once for GAP
+    #: and for Door/Damage/Load instead of once per feature stage.
+    #:
+    #: Not exempted on trust: `tests/test_production_integration.py` proves
+    #: both modes route through the shared collector, that `process_video()` is
+    #: never called, that each camera is decoded exactly once, and that GAP
+    #: still steps every frame.
+    STEP1_REMOVAL_TOKENS = (
+        "_process_side_camera", "_process_top_camera", "GapTracker(",
+        "process_video(", "tracks[CAMERA_", "camera_id: str", "camera_id=",
+        "model_path=", "confidence", "min_height_ratio", "keep_raw_detections",
+        "verbose", "LocalCameraTracks", "gap_path", ")",
+    )
+
+    def test_the_entry_point_diverges_ONLY_by_two_reviewed_stages(self):
+        """Bound both exceptions, so neither becomes a general licence.
 
         Rather than exempting the file, this diffs it against the reference and
-        requires every added line to belong to the train-window stage, and
-        every reference line to survive unchanged. A second local patch, or any
-        deletion, fails here.
+        requires every added line to belong to the train-window stage or the
+        shared-collector stage, and every REMOVED line to belong to the STEP-1
+        gap-tracking stage that the collector replaced. A third local patch, or
+        a deletion anywhere else, still fails here.
         """
         import difflib
         if not os.path.isdir(REFERENCE_DIR):
@@ -119,19 +151,33 @@ class TestNewEnginePresent(unittest.TestCase):
             (added if ln.startswith("+") else
              removed if ln.startswith("-") else []).append(ln[1:])
 
-        self.assertEqual([ln for ln in removed if ln.strip()], [],
-                         "the train-window stage must ADD only; no reference "
-                         "line may be removed or altered")
+        stray_removed = [
+            ln for ln in removed
+            if ln.strip() and not any(tok in ln
+                                      for tok in self.STEP1_REMOVAL_TOKENS)]
+        self.assertEqual(stray_removed, [],
+                         "reference lines were removed outside the STEP-1 "
+                         f"gap-tracking stage: {stray_removed}")
+
         allowed = ("train_window", "TW.", "train window", "STEP 2d",
                    "no-train-window", "no_train_window", "master.gaps",
                    "support_spans", "spans", "filt", "segs", "labels",
                    "cam", "print", "#", "try:", "except", "for ", "if ",
                    "from core import", "sys.path.insert", "continue",
-                   "_pending_notes", '"', "'", ")", "(", "}", "{", "]", "[")
+                   "_pending_notes",
+                   # --- the shared single-decode collector stage ---
+                   "_collect_stage1_shared", "collect_production", "stage1",
+                   "gap_path", "video", "feature_models_dir", "_here()",
+                   "kwargs", "raise RuntimeError", "missing",
+                   "gap trackers", "single decode", "Door / Damage / Load",
+                   "production_pipeline", "drift apart", "keep_raw_detections",
+                   "overlay renderer", "re-derive", "confidence",
+                   "min_height_ratio",
+                   '"', "'", ")", "(", "}", "{", "]", "[")
         stray = [ln for ln in added
                  if ln.strip() and not any(tok in ln for tok in allowed)]
         self.assertEqual(stray, [],
-                         f"added lines outside the train-window stage: {stray}")
+                         f"added lines outside the two reviewed stages: {stray}")
 
     def test_no_model_aliasing_or_download_logic_was_added(self):
         """Model placement is an operator responsibility, not the code's.

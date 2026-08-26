@@ -416,10 +416,40 @@ def assemble(
     # Same processors, same strides, same order as master_runner: LOAD runs to
     # completion first so the damage processor's loaded-wagon floor-damage
     # filter always reads a fully-written wagon_states/load/<gw>.json.
+    # PHASE 2 of the unified architecture. Each camera already collected its
+    # Door / Damage / Load evidence during its SINGLE decode and persisted it
+    # under <evidence_root>/raw_evidence/. Here it is assigned to the canonical
+    # GW_n roster by `TimelineEvidence.fuse()` and aggregated by the three
+    # extracted pure functions. The processors then run their unchanged
+    # persistence / fusion code over that result, loading no model and opening
+    # no video.
+    #
+    # One call, into the module Batch also calls -- this file contains no raw
+    # collection, no aggregation and no timestamp-to-wagon logic of its own.
+    from core.production_pipeline import (
+        RAW_EVIDENCE_DIRNAME, phase2_from_disk,
+    )
+
+    collected = None
+    t_p2 = time.perf_counter()
+    try:
+        collected = phase2_from_disk(
+            evidence_dir=os.path.join(evidence_root, RAW_EVIDENCE_DIRNAME),
+            wagons=list(state.wagons), mode="sequential",
+            camera_offsets={c: {"offset": o} for c, o in
+                            (resolved or {}).items()},
+            verbose=verbose)
+    except Exception as e:
+        print(f"[EVIDENCE-AGGREGATE] Phase 2 unavailable ({e}); features "
+              f"fall back to the per-wagon path")
+        traceback.print_exc(limit=3)
+    res.timings["phase2_aggregate"] = round(time.perf_counter() - t_p2, 3)
+
     feature_kwargs = dict(state=state, cache_root=global_cache,
                           feature_models_dir=feat_models_dir,
                           output_dir=states_root,
-                          evidence_root=global_evidence, verbose=verbose)
+                          evidence_root=global_evidence,
+                          collected=collected, verbose=verbose)
     t0 = time.perf_counter()
     for name, extra in _FEATURE_ORDER:
         try:

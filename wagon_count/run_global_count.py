@@ -153,30 +153,32 @@ def _resolve_model(name: str, models_dir: str) -> str:
 # Per-camera processing
 # =============================================================================
 
-def _process_side_camera(
-    camera_id: str, video_path: str, gap_model_path: str,
-    confidence: float, min_height_ratio: float,
-    keep_raw_detections: bool, verbose: bool,
-) -> LocalCameraTracks:
-    tracker = GapTracker(
-        camera_id=camera_id, model_path=gap_model_path,
-        confidence=confidence, min_height_ratio=min_height_ratio,
-        verbose=verbose,
-    )
-    return tracker.process_video(video_path, keep_raw_detections=keep_raw_detections)
+def _collect_stage1_shared(**kwargs):
+    """Batch's Phase 1. A delegation, deliberately containing no logic.
 
+    Everything -- building the gap trackers, the single decode, GAP stepping
+    every frame, Door / Damage / Load on their strides -- lives in
+    `core.production_pipeline`, which Sequential calls too. Nothing about raw
+    collection is reimplemented in this file; if it were, the two modes could
+    drift apart on exactly the details the shared module exists to fix.
 
-def _process_top_camera(
-    camera_id: str, video_path: str, top_gap_model_path: str,
-    confidence: float, min_height_ratio: float,
-    keep_raw_detections: bool, verbose: bool,
-) -> LocalCameraTracks:
-    tracker = GapTracker(
-        camera_id=camera_id, model_path=top_gap_model_path,
-        confidence=confidence, min_height_ratio=min_height_ratio,
-        verbose=verbose,
-    )
-    return tracker.process_video(video_path, keep_raw_detections=keep_raw_detections)
+    `keep_raw_detections` is accepted and dropped: the collector always keeps
+    raw detections because the overlay renderer needs them and there is no
+    longer a second pass that could re-derive them.
+    """
+    from core.production_pipeline import collect_production, write_raw_evidence
+
+    kwargs.pop("keep_raw_detections", None)
+    evidence_out = kwargs.pop("evidence_out", "")
+    stage1 = collect_production(**kwargs)
+    if evidence_out:
+        # Stage 1 runs in a SUBPROCESS, so the raw evidence has to cross the
+        # process boundary as data. Stage 3 reads it back and aggregates; it is
+        # never re-collected and never re-inferred.
+        written = write_raw_evidence(stage1, evidence_out)
+        print("[EVIDENCE-COLLECT] persisted %d camera artifact(s) -> %s"
+              % (len(written), evidence_out))
+    return stage1
 
 
 def _classify_master_pre_fusion(
@@ -576,32 +578,39 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("-" * 70)
     print("  STEP 1  Per-camera gap tracking")
     print("-" * 70)
+    # ONE decode per camera. GAP steps every frame through begin/step/finish;
+    # Door / Damage / Load score the SAME decoded frames on their strides. The
+    # shared collector in core/production_pipeline.py is the only
+    # implementation -- Sequential calls it too. `process_video()` is
+    # deliberately not called: it would open a second decode of every camera.
     tracks: Dict[str, LocalCameraTracks] = {}
+    stage1 = None
     try:
-        tracks[CAMERA_RIGHT_UP] = _process_side_camera(
-            CAMERA_RIGHT_UP, right_up_video, right_up_gap_path,
-            confidence=args.side_confidence,
-            min_height_ratio=args.side_min_height_ratio,
+        stage1 = _collect_stage1_shared(
+            videos={
+                CAMERA_RIGHT_UP: right_up_video,
+                CAMERA_LEFT_UP: left_up_video,
+                CAMERA_RIGHT_UP_TOP: right_up_top_video,
+                CAMERA_LEFT_UP_TOP: left_up_top_video,
+            },
+            side_gap_paths={CAMERA_RIGHT_UP: right_up_gap_path,
+                            CAMERA_LEFT_UP: left_up_gap_path},
+            top_gap_path=top_gap_path,
+            side_confidence=args.side_confidence,
+            side_min_height_ratio=args.side_min_height_ratio,
+            top_confidence=args.top_confidence,
+            top_min_height_ratio=args.top_min_height_ratio,
+            feature_models_dir=os.path.join(_here(), "..", "models",
+                                            "features"),
+            evidence_out=os.path.join(args.output, "raw_evidence"),
             keep_raw_detections=keep_raw, verbose=verbose,
         )
-        tracks[CAMERA_LEFT_UP] = _process_side_camera(
-            CAMERA_LEFT_UP, left_up_video, left_up_gap_path,
-            confidence=args.side_confidence,
-            min_height_ratio=args.side_min_height_ratio,
-            keep_raw_detections=keep_raw, verbose=verbose,
-        )
-        tracks[CAMERA_RIGHT_UP_TOP] = _process_top_camera(
-            CAMERA_RIGHT_UP_TOP, right_up_top_video, top_gap_path,
-            confidence=args.top_confidence,
-            min_height_ratio=args.top_min_height_ratio,
-            keep_raw_detections=keep_raw, verbose=verbose,
-        )
-        tracks[CAMERA_LEFT_UP_TOP] = _process_top_camera(
-            CAMERA_LEFT_UP_TOP, left_up_top_video, top_gap_path,
-            confidence=args.top_confidence,
-            min_height_ratio=args.top_min_height_ratio,
-            keep_raw_detections=keep_raw, verbose=verbose,
-        )
+        stage1.assert_no_second_decode()
+        tracks = dict(stage1.tracks)
+        missing = [c for c in ALL_CAMERAS if c not in tracks]
+        if missing:
+            raise RuntimeError("collector produced no tracks for: %s"
+                               % ", ".join(missing))
     except Exception as e:
         print(f"ERROR: per-camera tracking failed: {e}", file=sys.stderr)
         traceback.print_exc()

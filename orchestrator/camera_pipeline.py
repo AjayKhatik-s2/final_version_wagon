@@ -78,9 +78,22 @@ class CameraPipelineConfig:
     gap_validation: bool = True
     temporal_classification: bool = True
     wagon_recovery: bool = True
+    # --- unified evidence collection (Phase 1) --------------------------
+    # Door / Damage / Load now score the SAME decoded frames the gap tracker
+    # steps, so they need their model directory here rather than a second
+    # pass later. An empty tuple collects gap only, which is what the
+    # Stage-1-only tests want.
+    feature_models_dir: str = ""
+    collect_features: tuple = ("door", "damage", "load")
 
 
 DEFAULT_CONFIG = CameraPipelineConfig()
+
+#: camera_id -> Stage1Result from that camera's single decode. Populated by
+#: `_track_stitch_validate` and drained onto the CameraPipelineResult, so the
+#: raw feature evidence survives Stage 1 without changing the shape of the
+#: three-value return the two camera paths already share.
+_LAST_COLLECTION: Dict[str, Any] = {}
 
 
 @dataclass
@@ -92,6 +105,9 @@ class CameraPipelineResult:
     classifications: List[Any] = field(default_factory=list)
     stitch: Any = None
     validation: Any = None
+    #: Stage1Result from the SINGLE decode -- carries the timestamped raw
+    #: Door/Damage/Load evidence for Phase 2. Never wagon-assigned here.
+    collection: Any = None
     recovery: Any = None
     wagon_region: Any = None
     reclassified_after_recovery: bool = False
@@ -112,14 +128,27 @@ def _track_stitch_validate(
     cfg: CameraPipelineConfig, gv_cfg, stitch_cfg, verbose: bool,
 ):
     """STEP 1 + 1a + 1b, in run_global_count's exact order."""
-    # STEP 1 -- per-camera gap tracking (unchanged GapTracker)
-    tracker = GapTracker(
-        camera_id=camera_id, model_path=gap_model_path,
-        confidence=confidence, min_height_ratio=min_height_ratio,
-        verbose=verbose,
-    )
-    tracks = tracker.process_video(
-        video_path, keep_raw_detections=cfg.keep_raw_detections)
+    # STEP 1 -- ONE decode of this camera, through the SAME shared collector
+    # Batch uses. GAP steps every frame via begin/step/finish; Door / Damage /
+    # Load score the same decoded frames on their strides, and their
+    # timestamped evidence is carried on the result for Phase 2.
+    # `process_video()` is deliberately not called: it would decode twice.
+    from core.production_pipeline import collect_production
+
+    stage1 = collect_production(
+        videos={camera_id: video_path},
+        side_gap_paths={camera_id: gap_model_path},
+        top_gap_path=gap_model_path,
+        side_confidence=confidence, side_min_height_ratio=min_height_ratio,
+        top_confidence=confidence, top_min_height_ratio=min_height_ratio,
+        feature_models_dir=cfg.feature_models_dir,
+        features=tuple(cfg.collect_features),
+        verbose=verbose)
+    stage1.assert_no_second_decode()
+    tracks = stage1.tracks.get(camera_id)
+    if tracks is None:
+        raise RuntimeError(f"collector produced no gap tracks for {camera_id}")
+    _LAST_COLLECTION[camera_id] = stage1
 
     # STEP 1a -- fragment reassembly BEFORE validation
     sres = fstitch.reassemble_fragments(
@@ -272,6 +301,7 @@ def run_master_camera(
         camera_id=camera_id, tracks=master,
         segments=_segments_to_local(camera_id, master, classifications),
         classifications=list(classifications), stitch=sres, validation=vres,
+        collection=_LAST_COLLECTION.pop(camera_id, None),
         recovery=recovery, wagon_region=None,
         reclassified_after_recovery=reclassified, notes=notes)
 
@@ -339,4 +369,5 @@ def run_support_camera(
         camera_id=camera_id, tracks=tracks,
         segments=_segments_to_local(camera_id, tracks, classifications),
         classifications=classifications, stitch=sres, validation=vres,
+        collection=_LAST_COLLECTION.pop(camera_id, None),
         recovery=None, wagon_region=region, notes=notes)

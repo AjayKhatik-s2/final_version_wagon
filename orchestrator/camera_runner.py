@@ -145,6 +145,18 @@ def run_camera(
             raise FileNotFoundError(f"video not available: {video_path}")
 
         # ---- Stage 1: the proven camera-local chain --------------------
+        # PHASE 1 of the unified architecture happens inside this chain: ONE
+        # decode of the original video feeds GapTracker.step() on every frame
+        # AND Door / Damage / Load on their strides. Only the features this
+        # camera is authoritative for are collected; the collector drops the
+        # rest, so nothing is scored twice or scored where it is meaningless.
+        import dataclasses as _dc
+
+        stage1_cfg = _dc.replace(
+            cp.DEFAULT_CONFIG,
+            feature_models_dir=feat_models_dir,
+            collect_features=tuple(sorted(enabled & {"door", "damage",
+                                                     "load"})))
         t0 = time.perf_counter()
         if camera_id == C.MASTER_CAMERA:
             out = cp.run_master_camera(
@@ -153,7 +165,7 @@ def run_camera(
                                             "right_up_wagon_gap.pt"),
                 side_cls_path=os.path.join(recon_models_dir,
                                            "side_classification.pt"),
-                verbose=verbose)
+                cfg=stage1_cfg, verbose=verbose)
         else:
             is_top = camera_id in C.TOP_CAMERAS
             gap_model = "top_gap.pt" if is_top else "left_up_wagon_gap.pt"
@@ -164,8 +176,22 @@ def run_camera(
                 camera_id=camera_id, video_path=video_path,
                 gap_model_path=os.path.join(recon_models_dir, gap_model),
                 classifier_path=cls_path if os.path.exists(cls_path) else None,
-                is_top=is_top, verbose=verbose)
+                is_top=is_top, cfg=stage1_cfg, verbose=verbose)
         _t("stage1", t0)
+
+        # Persist the raw evidence next to the other camera bundles. Global
+        # assembly runs in a different process, reads every camera's artifact
+        # from this one directory, and aggregates -- it never re-collects.
+        if out.collection is not None:
+            from core.production_pipeline import (
+                RAW_EVIDENCE_DIRNAME, write_raw_evidence,
+            )
+            written = write_raw_evidence(
+                out.collection,
+                os.path.join(evidence_root, RAW_EVIDENCE_DIRNAME))
+            if verbose and written:
+                print(f"[EVIDENCE-COLLECT] {camera_id} persisted "
+                      f"{len(written)} artifact(s)")
 
         bundle.advance("TRACKING", fps=out.tracks.fps,
                        total_frames=out.tracks.total_frames,
@@ -232,11 +258,40 @@ def run_camera(
         # bit-for-bit unaffected, and only the camera PDFs lose their images.
         roster = as_feature_wagons(out.segments, camera_id)
         states_dir = os.path.join(bundle.dir, "features")
+
+        # PHASE 2, camera-local. The SAME shared aggregation the global
+        # assembler uses, over the SAME evidence this camera already
+        # collected -- only the roster differs, being this camera's own
+        # L_<CAM>_<n> spans rather than GW_n. No second decode, no second
+        # aggregation implementation, and no model loaded here.
+        local_collected = None
+        if out.collection is not None and roster:
+            try:
+                from core.master_timeline import CameraClock
+                from core.production_pipeline import aggregate_phase2
+                from core.timeline_evidence import TimelineEvidence
+
+                ev = TimelineEvidence(mode="sequential-camera-local")
+                ev.extend(out.collection.observations)
+                fps = float(out.tracks.fps or 0.0)
+                local_collected = aggregate_phase2(
+                    evidence=ev, wagons=list(roster),
+                    stage1=out.collection,
+                    clocks=({camera_id: CameraClock(
+                        camera_id, fps=fps,
+                        total_frames=int(out.tracks.total_frames or 0))}
+                        if fps > 0 else None),
+                    verbose=verbose)
+            except Exception as e:
+                print(f"[EVIDENCE-AGGREGATE] {camera_id} camera-local Phase 2 "
+                      f"unavailable ({e}); falling back to the per-wagon path")
+
         common = dict(state=None, cache_root=cache_root,
                       feature_models_dir=feat_models_dir,
                       output_dir=states_dir,
                       evidence_root=os.path.join(bundle.dir, "evidence"),
-                      segments=roster, verbose=verbose)
+                      segments=roster, collected=local_collected,
+                      verbose=verbose)
         plan = _feature_plan(camera_id, enabled) if camera_local_features else []
         if not plan and verbose:
             print(f"[SEQ/{camera_id}] camera-local features SKIPPED -- "
