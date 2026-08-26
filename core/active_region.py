@@ -231,6 +231,49 @@ class ActiveRegionResult:
     gate_violations: List[str] = field(default_factory=list)
     suspect_merged_segments: List[Dict[str, Any]] = field(default_factory=list)
 
+    #: Which cameras were allowed to define the canonical structure, stated so
+    #: the invariant is auditable from the output rather than only from prose.
+    timeline_master: str = ""
+    side_support: List[str] = field(default_factory=list)
+
+    @property
+    def top_predictions_ignored(self) -> int:
+        """Top-camera WAGON predictions that would have moved a boundary.
+
+        These are exactly the classifications the side-camera authority rule
+        exists to reject: a top camera calling WAGON over a leading engine or a
+        trailing brake van. Counting them makes the rule's effect visible --
+        "zero" means the top cameras agreed, not that nothing was checked.
+        """
+        return len([p for p in self.ignored_predictions
+                    if p.get("camera") in C.TOP_CAMERAS])
+
+    def structure_authority(self) -> Dict[str, Any]:
+        tops = [p for p in self.ignored_predictions
+                if p.get("camera") in C.TOP_CAMERAS]
+        per_cam: Dict[str, Dict[str, int]] = {}
+        for cam in C.TOP_CAMERAS:
+            mine = [p for p in tops if p.get("camera") == cam]
+            per_cam[cam] = {
+                "would_have_moved_start": len(
+                    [p for p in mine if p.get("reason") == REASON_NOT_OPEN]),
+                "would_have_moved_end": len(
+                    [p for p in mine if p.get("reason") == REASON_CLOSED]),
+                "total_ignored": len(mine),
+            }
+        return {
+            "timeline_master": self.timeline_master or C.CAMERA_RIGHT_UP,
+            "side_support": list(self.side_support),
+            "non_authoritative_cameras": list(C.TOP_CAMERAS),
+            "top_camera_classification_is_read_only": True,
+            "top_predictions_ignored_total": len(tops),
+            "would_have_moved_start": sum(
+                v["would_have_moved_start"] for v in per_cam.values()),
+            "would_have_moved_end": sum(
+                v["would_have_moved_end"] for v in per_cam.values()),
+            "per_top_camera": per_cam,
+        }
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "found": self.found, "reason": self.reason,
@@ -248,6 +291,7 @@ class ActiveRegionResult:
             "suspect_merged_segments": list(self.suspect_merged_segments),
             "start_reason": self.start.reason,
             "end_reason": self.end.reason,
+            "structure_authority": self.structure_authority(),
         }
 
 
@@ -426,6 +470,14 @@ def resolve(
                         "start_time": round(gs, 3), "end_time": round(seg_e, 3),
                         "confidence": round(conf, 4),
                         "reason": REASON_NOT_OPEN})
+
+    # Record WHO was allowed to define this structure. RIGHT_UP is the master
+    # timeline; LEFT_UP is side-camera corroboration; the two top cameras are
+    # evidence only. Stated in the output so the rule is checkable from a
+    # delivered artifact and not only from reading this module.
+    res.timeline_master = str(getattr(state, "master_camera", "")
+                              or C.CAMERA_RIGHT_UP)
+    res.side_support = [c for c in C.SIDE_CAMERAS if c != res.timeline_master]
 
     res.transitions.append(ACTIVE)
     res.eligible_global_ids = [str(getattr(w, "global_id", "") or "")
