@@ -100,12 +100,23 @@ class RawCameraEvidence:
         }
 
 
-def _load(feature: str, models_dir: str, verbose: bool):
+def _load(feature: str, models_dir: str):
+    """Load a feature model EXACTLY as the per-wagon processors load it.
+
+    `features._common.load_yolo` takes the path and nothing else -- it is a
+    cached loader that also installs the `weights_only=False` torch.load shim,
+    and every other caller in the tree invokes it as `load_yolo(model_path)`.
+    Passing a `verbose=` keyword here raised TypeError on the first real EC2
+    run. It is dropped rather than absorbed by a new loader parameter: an
+    ignored kwarg would let the same mistake pass silently next time, and the
+    collector must use the same loader behaviour as the old path, not a
+    look-alike of it.
+    """
     from features._common import load_yolo
     path = os.path.join(models_dir, MODEL_FILES[feature])
     if not os.path.isfile(path):
         return None
-    return load_yolo(path, verbose=verbose)
+    return load_yolo(path)
 
 
 def _score_door(model, frame, fi, cam, clock, conf):
@@ -302,7 +313,7 @@ def collect_camera(
 
     built = {}
     for f in wanted:
-        m = (models or {}).get(f) or _load(f, feature_models_dir, verbose)
+        m = (models or {}).get(f) or _load(f, feature_models_dir)
         if m is None:
             res.skipped = f"{res.skipped} {f}:model-missing".strip()
             continue
