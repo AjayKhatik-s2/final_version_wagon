@@ -101,6 +101,10 @@ class BatchOutcome:
     processed_video_urls:  Dict[str, str] = field(default_factory=dict)
     # Stage-6 external delivery (dashboard per-camera feed + ML API callback).
     dashboard_result: Dict[str, Any] = field(default_factory=dict)
+    #: `delivery.global_train_webhook` -- the fused report's POST to the
+    #: receiver's global endpoint, stored there as the virtual GLOBAL_FUSED
+    #: camera.
+    global_ingest_result: Dict[str, Any] = field(default_factory=dict)
     ml_api_result: Dict[str, Any] = field(default_factory=dict)
     final_status: str = "unknown"
     error: Optional[str] = None
@@ -735,6 +739,23 @@ def process_batch(
     else:
         print("  dashboard ingest disabled "
               "(WAGONEYE_DASHBOARD_INGEST_ENABLED=false)")
+
+    # ---- Stage 6c: the FUSED report -> the receiver's global endpoint ----
+    # Deliberately after the per-camera ingest above and after the S3 upload:
+    # the receiver stores this as a virtual fifth camera (GLOBAL_FUSED) that
+    # supersedes the four provisional per-camera documents, so it must arrive
+    # last. Non-fatal by construction -- the report is already written and
+    # already in S3, so a receiver outage costs a dashboard row, not the train.
+    try:
+        from delivery import global_train_webhook as GTW
+        out.global_ingest_result = GTW.publish(
+            report_json_path=out.report_json_path or "",
+            batch_key=batch.batch_key, verbose=verbose).to_dict()
+        print(f"  [global-ingest] {out.global_ingest_result.get('posted')}"
+              f"  wagons={out.global_ingest_result.get('wagons')}")
+    except Exception as e:  # noqa: BLE001 - never fail a completed train
+        print(f"  [global-ingest] FAILED (non-fatal): {type(e).__name__}: {e}",
+              file=sys.stderr)
 
     out.ml_api_result = ml_api.submit_batch(
         batch_key=batch.batch_key,

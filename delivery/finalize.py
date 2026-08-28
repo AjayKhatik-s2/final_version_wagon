@@ -59,6 +59,10 @@ class DeliveryResult:
     batch_key: str = ""
     batch_root: str = ""
     uploaded: bool = False
+    #: `delivery.evidence_links` -- how many evidence links the report ended up
+    #: carrying, how many could not be resolved, and whether
+    #: `evidence_base_url` was removed (api mode has no predictable base).
+    evidence_links: Dict[str, Any] = field(default_factory=dict)
     report_pdf_url: str = ""
     report_json_url: str = ""
     camera_pdf_urls: Dict[str, str] = field(default_factory=dict)
@@ -201,6 +205,53 @@ def deliver(
             return res
 
     from delivery import s3_upload
+    from delivery import artifact_uploader as AU
+
+    # ---- evidence FIRST, so the report can carry the real URLs -----------
+    # Order matters and did not used to. While uploads went straight to S3 the
+    # key was `train_batch/<key>/evidence/<rel>`, which Stage 5 could compute,
+    # so the report could be written and uploaded before the files it linked to
+    # even existed. Through the Artifact Upload API the BACKEND chooses the key:
+    # there is no base to prefix and no path to predict, so the only correct URL
+    # for a file is the one its own upload returned. The evidence therefore goes
+    # up before the report, and the report is rewritten from the result.
+    _uploader = None
+    try:
+        _uploader = AU.ArtifactUploader(s3_client=s3_client, verbose=verbose)
+    except Exception as e:  # noqa: BLE001 - a config error must be loud, not fatal
+        res.errors.append(f"artifact uploader unavailable: {e}")
+        log.error("[FINALIZE] artifact uploader unavailable: %s", e)
+
+    _evidence_urls: dict = {}
+    if art["evidence"] and _uploader is not None:
+        try:
+            _ev = s3_upload.upload_tree_detailed(
+                s3_client, art["evidence"], key, sub_prefix="evidence",
+                session_ts=key, uploader=_uploader)
+            res.archived["evidence"] = _ev.count
+            _evidence_urls = dict(_ev.urls)
+            if _ev.failed:
+                res.errors.append(f"archive evidence: {_ev.failed} file(s) failed")
+            if verbose:
+                log.info("[FINALIZE] evidence: %d uploaded via %s, %d failed",
+                         _ev.count, _ev.via or "?", _ev.failed)
+        except Exception as e:  # noqa: BLE001
+            res.errors.append(f"archive evidence: {e}")
+            log.error("[FINALIZE] archive evidence failed: %s", e)
+
+    # ---- rewrite the report's evidence links from what was uploaded ------
+    if art["combined_json"]:
+        try:
+            from delivery import evidence_links
+            res.evidence_links = evidence_links.rewrite(
+                report_json_path=art["combined_json"],
+                url_map=_evidence_urls,
+                mode=(_uploader.mode if _uploader is not None
+                      else AU.upload_mode()),
+                verbose=verbose).to_dict()
+        except Exception as e:  # noqa: BLE001 - links must not fail a delivery
+            res.errors.append(f"evidence link rewrite: {e}")
+            log.error("[FINALIZE] evidence link rewrite failed: %s", e)
 
     # ---- reports (microservice-first for PDFs, same as the live path) ----
     try:
@@ -233,7 +284,9 @@ def deliver(
         ("global_state", art["global_state"], {"skip_extensions": {".jpg", ".jpeg"}}),
         ("wagon_states", art["wagon_states"], {}),
         ("reports", art["reports_dir"], {}),
-        ("evidence", art["evidence"], {}),
+        # `evidence` is deliberately absent: it went up first, above, so the
+        # report could be rewritten with the URLs the uploads returned. Leaving
+        # it here would upload every frame twice.
         ("processed_videos", art["processed_videos"], {}),
     ):
         if not path:

@@ -80,6 +80,9 @@ class AssemblyResult:
     state_json_path: str = ""
     report_pdf_path: str = ""
     report_json_path: str = ""
+    #: `delivery.global_train_webhook` -- the fused report's POST to the
+    #: receiver's global endpoint (the virtual GLOBAL_FUSED camera).
+    global_ingest: Dict[str, Any] = field(default_factory=dict)
     yolo_calls_during_assembly: int = 0     # must stay 0
     delivery: Any = None                   # delivery.finalize.DeliveryResult
     # Stage 4b + the URL maps the published documents embed.
@@ -733,6 +736,21 @@ def assemble(
             )
         except Exception as e:  # noqa: BLE001 - delivery must not fail assembly
             print(f"[ASSEMBLY] delivery failed (non-fatal): {e}")
+
+        # ---- Stage 6c: the FUSED report -> the receiver's global endpoint ----
+        # After delivery, so the document is in S3 before the receiver is told
+        # about it, and after the per-camera posts, so the virtual GLOBAL_FUSED
+        # camera supersedes the four provisional ones rather than racing them.
+        # Inside `if deliver:` for the same reason the rest of Stage 6 is: an
+        # assembly run being validated must not publish to the live dashboard.
+        try:
+            from delivery import global_train_webhook as GTW
+            res.global_ingest = GTW.publish(
+                report_json_path=res.report_json_path,
+                batch_key=batch_key, verbose=verbose).to_dict()
+        except Exception as e:  # noqa: BLE001 - never fail a finished train
+            print(f"[GLOBAL-INGEST] FAILED (non-fatal): "
+                  f"{type(e).__name__}: {e}")
         res.timings["delivery"] = round(time.perf_counter() - t0, 3)
     elif verbose:
         print("[ASSEMBLY] delivery DISABLED (no S3 upload, no dashboard ingest, "

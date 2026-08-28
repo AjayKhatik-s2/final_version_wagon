@@ -81,13 +81,24 @@ def key_mode() -> str:
 
 
 def is_enabled() -> bool:
-    """Per-camera immediate publishing.  OFF unless explicitly turned on.
+    """Per-camera immediate publishing.  ON by default since 2026-08-28.
 
-    Off by default because it publishes camera-local numbering, which a consumer
-    expecting canonical `GW_n` counts would misread.  Turn it on with
-    `--deliver-per-camera` or `WAGONEYE_PER_CAMERA_INGEST=true`.
+    It was off because it publishes CAMERA-LOCAL numbering -- wagon n is that
+    camera's nth segment, not the fused `GW_n` -- and a consumer expecting
+    canonical counts would misread it.
+
+    That objection no longer applies: the receiver's flow now expects these four
+    provisional documents and then supersedes them with the fused report, stored
+    as a virtual fifth camera (`GLOBAL_FUSED`, see
+    `delivery.global_train_webhook`). With the global post wired, leaving this
+    off meant a train reached the dashboard only ~55 minutes after its first
+    camera sealed, and a train that failed before assembly reached it never --
+    the four cameras that DID finish were simply discarded.
+
+    Still switchable: `WAGONEYE_PER_CAMERA_INGEST=false` turns it off for a run
+    that must not publish provisional numbering.
     """
-    return _env_bool("WAGONEYE_PER_CAMERA_INGEST", False)
+    return _env_bool("WAGONEYE_PER_CAMERA_INGEST", True)
 
 
 @dataclass
@@ -161,7 +172,11 @@ def source_video_name(raw_video_name: str, camera_id: str) -> str:
 
 
 def _upload_assets(s3_client, bucket: str,
-                   assets: Sequence[Tuple[str, str]]) -> Tuple[int, int]:
+                   assets: Sequence[Tuple[str, str]],
+                   *, uploader=None, camera_id: str = "",
+                   session_ts: str = "",
+                   urls: Optional[Dict[str, str]] = None,
+                   ) -> Tuple[int, int]:
     """Upload the evidence JPEGs a document references. Returns (ok, failed).
 
     De-duplicated: the same frame is legitimately referenced from several places
@@ -172,6 +187,11 @@ def _upload_assets(s3_client, bucket: str,
     the document from being published, because the document still carries the
     wagon data that is the point of the early post.
     """
+    from delivery import artifact_uploader as AU
+    if uploader is None:
+        uploader = AU.ArtifactUploader(s3_client=s3_client, verbose=False)
+    if urls is None:
+        urls = {}
     ok = failed = 0
     # dict.fromkeys keeps first-seen order while dropping repeats.
     for local, key in dict.fromkeys(assets):
@@ -179,8 +199,13 @@ def _upload_assets(s3_client, bucket: str,
             failed += 1
             continue
         try:
-            s3_client.upload_file(local, bucket, key,
-                                  ExtraArgs={"ContentType": "image/jpeg"})
+            out = uploader.upload(
+                local, AU.artifact_type_for(key, sub_prefix="evidence"),
+                camera_id=(camera_id
+                            or C.CAMERA_S3_FOLDER.get(C.MASTER_CAMERA,
+                                                      C.MASTER_CAMERA)), session_ts=session_ts,
+                s3_bucket=bucket, s3_key=key, content_type="image/jpeg")
+            urls[key] = out.https_url
             ok += 1
         except Exception as e:  # noqa: BLE001
             log.warning("[PER-CAMERA] evidence upload failed %s: %s", key, e)
@@ -405,15 +430,25 @@ def publish(
     # Evidence FIRST, then the JSON. A reader that sees the document must find
     # the images it names; publishing the document before its images would show a
     # broken page for as long as the uploads took.
-    res.assets_uploaded, res.assets_failed = _upload_assets(s3_client, bucket,
-                                                            assets)
+    res.assets_uploaded, res.assets_failed = _upload_assets(
+        s3_client, bucket, assets, camera_id=DASH.full_camera_id(cam),
+        session_ts=batch_key)
     if res.assets_failed:
         res.errors.append(f"{res.assets_failed} evidence file(s) failed to "
                           f"upload")
 
     try:
-        s3_client.upload_file(res.local_json, bucket, key,
-                              ExtraArgs={"ContentType": "application/json"})
+        from delivery import artifact_uploader as AU
+        _up = AU.ArtifactUploader(s3_client=s3_client, verbose=False)
+        _out = _up.upload(res.local_json, "inspection_json",
+                          camera_id=DASH.full_camera_id(cam), session_ts=batch_key,
+                          s3_bucket=bucket, s3_key=key,
+                          content_type="application/json")
+        # The document's own location comes from the RESULT: in `api` mode the
+        # backend chose the key, so `res.s3_uri` computed from bucket + key
+        # would name an object that does not exist -- and this URI is what the
+        # dashboard ingest POST points at.
+        res.s3_uri = _out.s3_uri
         res.status = "uploaded"
     except Exception as e:  # noqa: BLE001
         res.status = "upload_failed"

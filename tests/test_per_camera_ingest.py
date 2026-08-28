@@ -102,11 +102,23 @@ def _restore(saved):
 
 class TestEnableGate(unittest.TestCase):
 
-    def test_off_by_default(self):
+    def test_on_by_default(self):
+        """ON since 2026-08-28. The receiver's flow expects these four
+        provisional documents and then supersedes them with the fused report
+        (the virtual GLOBAL_FUSED camera), so withholding them delayed every
+        train's first dashboard appearance by ~55 minutes and lost the finished
+        cameras entirely whenever a train failed before assembly."""
         saved = os.environ.pop("WAGONEYE_PER_CAMERA_INGEST", None)
         try:
-            self.assertFalse(CI.is_enabled(),
-                             "camera-local numbering must not publish unasked")
+            self.assertTrue(CI.is_enabled())
+        finally:
+            _restore(saved)
+
+    def test_env_can_still_turn_it_off(self):
+        saved = os.environ.get("WAGONEYE_PER_CAMERA_INGEST")
+        os.environ["WAGONEYE_PER_CAMERA_INGEST"] = "false"
+        try:
+            self.assertFalse(CI.is_enabled())
         finally:
             _restore(saved)
 
@@ -118,7 +130,10 @@ class TestEnableGate(unittest.TestCase):
             _restore(saved)
 
     def test_publish_is_a_no_op_when_disabled(self):
-        saved = os.environ.pop("WAGONEYE_PER_CAMERA_INGEST", None)
+        # Disabled EXPLICITLY: this used to rely on the default being off, so
+        # flipping that default silently turned the test into "publish works".
+        saved = os.environ.get("WAGONEYE_PER_CAMERA_INGEST")
+        os.environ["WAGONEYE_PER_CAMERA_INGEST"] = "false"
         try:
             with tempfile.TemporaryDirectory() as root:
                 b, _ = _bundle(root)
@@ -721,11 +736,34 @@ class TestProvisionalImagesAreActuallyUploaded(unittest.TestCase):
             self.assertEqual(res.assets_failed, 0, res.errors)
 
     def test_images_are_uploaded_before_the_json(self):
-        """Publishing the document first would show a broken page meanwhile."""
+        """Publishing the document first would show a broken page meanwhile.
+
+        Matched on the JSON upload's ARGUMENT rather than on a method name: the
+        upload now goes through `artifact_uploader` instead of
+        `s3_client.upload_file`, and a test keyed to the old call silently
+        stopped testing the ordering when that changed.
+        """
+        import ast
         import inspect as _inspect
-        src = _inspect.getsource(CI.publish)
-        self.assertLess(src.index("_upload_assets"),
-                        src.index("upload_file(res.local_json"))
+        import textwrap
+        src = textwrap.dedent(_inspect.getsource(CI.publish))
+        tree = ast.parse(src)
+        assets_line = json_line = None
+        for n in ast.walk(tree):
+            if not isinstance(n, ast.Call):
+                continue
+            name = getattr(n.func, "attr", getattr(n.func, "id", ""))
+            if name == "_upload_assets" and assets_line is None:
+                assets_line = n.lineno
+            if name == "upload" and json_line is None:
+                # the JSON upload is the one handed `res.local_json`
+                for a in n.args:
+                    if (isinstance(a, ast.Attribute)
+                            and a.attr == "local_json"):
+                        json_line = n.lineno
+        self.assertIsNotNone(assets_line, "no _upload_assets call")
+        self.assertIsNotNone(json_line, "no JSON upload call")
+        self.assertLess(assets_line, json_line)
 
     def test_duplicate_references_upload_once(self):
         from delivery.camera_inspection import _upload_assets

@@ -488,6 +488,17 @@ INGEST_API_URL_UAT = _env(
     "https://cctv-wagon-uat-api.suvidhaen.com/inspections/ingest",
 )
 
+# --- Artifact Upload API (delivery/artifact_uploader.py) -------------------
+# "api" mode POSTs every artifact to the backend, which owns the bucket and the
+# keys, so the ML host needs no AWS credentials for publishing. "s3" mode is the
+# original direct-boto3 behaviour and stays the default: switching transports
+# moves where every artifact lands.
+ARTIFACT_UPLOAD_API_URL = _env(
+    "WAGONEYE_ARTIFACT_UPLOAD_API_URL",
+    "https://ms-pnr-location-notification-api.suvidhaen.com/"
+    "cctv-receiver/artifacts/upload",
+)
+
 # V4 ML_API_ENDPOINT + ML_API_SECRET (sent as the `X-ML-SECRET` header).
 ML_API_ENDPOINT = _env(
     "WAGONEYE_ML_API_ENDPOINT",

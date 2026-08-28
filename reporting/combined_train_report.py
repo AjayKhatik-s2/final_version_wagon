@@ -74,6 +74,73 @@ def _datetime_str() -> str:
 # JSON
 # -----------------------------------------------------------------------------
 
+def evidence_base_url(batch_key: str) -> str:
+    """Where the Stage-6 tree upload puts this train's evidence.
+
+    One function, used for every link in this document, so a consumer never has
+    to assemble a base path itself. Reuses the SAME layout
+    `delivery.dashboard_ingest.evidence_url` publishes -- the upload mirrors
+    `evidence/` verbatim, so the local relative path IS the S3 relative path.
+    """
+    return (f"https://{C.S3_OUTPUT_BUCKET}.s3.{C.S3_REGION}.amazonaws.com/"
+            f"{C.S3_TRAIN_BATCH_PREFIX}/{batch_key}/evidence")
+
+
+def _damage_photo(evidence_root: Optional[str], gw_id: str,
+                  row: Dict[str, Any]) -> Optional[str]:
+    """The relative path of the JPEG this ONE damage row is describing.
+
+    A damage row already carries the two things that identify its picture --
+    `track_idx` orders observations within the wagon and `camera_id` says who
+    saw it -- but it carried no reference to the file, so a consumer could show
+    "GW_25 has floor damage" and had no way to show the photo of it.
+
+    Camera-scoped name first (`track_1__RIGHT_UP_TOP.jpg`), because the two top
+    cameras write into one directory and the index alone collides; they
+    photograph the same roof from opposite sides, so a mix-up renders as a
+    plausible picture of the wrong camera. The bare legacy name is accepted only
+    when the row's own camera owns it, which is what keeps the fallback from
+    reintroducing that substitution.
+    """
+    if not evidence_root:
+        return None
+    from core.evidence_identity import (damage_track_slot,
+                                        legacy_damage_track_slot)
+    idx, cam = row.get("track_idx"), str(row.get("camera_id") or "")
+    if idx is None or not cam:
+        return None
+    try:
+        idx = int(idx)
+    except (TypeError, ValueError):
+        return None
+    d = os.path.join(evidence_root, gw_id, "damage")
+    for name in (f"{damage_track_slot(idx, cam)}.jpg",
+                 f"{legacy_damage_track_slot(idx)}.jpg"):
+        if os.path.isfile(os.path.join(d, name)):
+            return f"{gw_id}/damage/{name}"
+    return None
+
+
+def _attach_damage_photos(wagons, evidence_root: Optional[str],
+                          base_url: str) -> None:
+    """Give every damage row a link to its own picture.
+
+    Additive: `evidence_path` (relative, matching `evidence_pages`) and
+    `evidence_url` (absolute). A row whose file is not on disk gets neither
+    rather than a link that 404s -- a missing key is a fact a consumer can
+    handle, a broken URL is one it cannot.
+    """
+    for u in wagons:
+        gw = str(getattr(u, "global_id", "") or "")
+        for row in (getattr(u, "top_damage_details", None) or []):
+            if not isinstance(row, dict):
+                continue
+            rel = _damage_photo(evidence_root, gw, row)
+            if rel:
+                row["evidence_path"] = rel
+                row["evidence_url"] = f"{base_url}/{rel}"
+
+
 def _evidence_pages(evidence_root: Optional[str], wagons) -> Dict[str, Dict[str, str]]:
     if not evidence_root or not os.path.isdir(evidence_root):
         return {}
@@ -92,7 +159,8 @@ def _evidence_pages(evidence_root: Optional[str], wagons) -> Dict[str, Dict[str,
                 p = os.path.join(evidence_root, u.global_id, feat, fn)
                 if os.path.isfile(p):
                     key = f"{feat}_{os.path.splitext(fn)[0]}"
-                    snaps[key] = os.path.relpath(p, start=evidence_root).replace(os.sep, "/")
+                    snaps[key] = os.path.relpath(
+                        p, start=evidence_root).replace(os.sep, "/")
         if snaps:
             pages[u.global_id] = snaps
     return pages
@@ -254,6 +322,11 @@ def _build_json(
 ) -> Dict[str, Any]:
     wagons_in_order, _synth = canonical_wagons(state, unified)
     summary = summarize_wagons(wagons_in_order)
+    # One base for every picture in this document, and a link on each damage row
+    # to its OWN photo. Done before the wagons are serialized so the links are
+    # part of the record rather than something a consumer has to assemble.
+    _base = evidence_base_url(batch_key)
+    _attach_damage_photos(wagons_in_order, evidence_root, _base)
     doc: Dict[str, Any] = {
         "schema":      _REPORT_SCHEMA,
         "batch_key":   batch_key,
@@ -276,7 +349,14 @@ def _build_json(
         "stage0_corrections_applied": list(state.corrections_applied),
         "per_camera_local_counts": dict(state.per_camera_local_counts),
         "wagons": [u.to_dict() for u in wagons_in_order],
+        # Absolute prefix for every relative evidence path in this document, so
+        # a consumer never has to know the bucket, the region or the key layout.
+        "evidence_base_url": _base,
         "evidence_pages": _evidence_pages(evidence_root, wagons_in_order),
+        "evidence_page_urls": {
+            gw: {k: f"{_base}/{rel}" for k, rel in snaps.items()}
+            for gw, snaps in _evidence_pages(evidence_root,
+                                             wagons_in_order).items()},
     }
     if legacy_view_model is not None:
         doc["legacy_view_model"] = {

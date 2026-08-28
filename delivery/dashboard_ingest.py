@@ -456,12 +456,20 @@ class _UrlMaker:
         if self.skip_upload or self.s3 is None:
             return f"https://{self.inspection_bucket}.s3.{self.region}.amazonaws.com/{key}"
         try:
-            self.s3.upload_file(local, self.inspection_bucket, key,
-                                ExtraArgs={"ContentType": "image/jpeg"})
+            from delivery import artifact_uploader as AU
+            out = AU.ArtifactUploader(s3_client=self.s3, verbose=False).upload(
+                local, AU.artifact_type_for(rel, sub_prefix="evidence"),
+                camera_id=(self.folder
+                           or C.CAMERA_S3_FOLDER.get(C.MASTER_CAMERA,
+                                                     C.MASTER_CAMERA)),
+                session_ts=self.batch_key,
+                s3_bucket=self.inspection_bucket, s3_key=key,
+                content_type="image/jpeg")
         except Exception as e:  # pragma: no cover - network path
             log.warning("[DASHBOARD] evidence copy failed %s: %s", key, e)
             return None
-        return f"https://{self.inspection_bucket}.s3.{self.region}.amazonaws.com/{key}"
+        # From the RESULT, not computed: in `api` mode the backend chose the key.
+        return out.https_url
 
 
 # -----------------------------------------------------------------------------
@@ -920,8 +928,17 @@ def _run_inner(*, batch_root, s3_client, skip_upload, skip_ingest,
             entry["status"] = "prepared_local_only"
         else:
             try:
-                s3_client.upload_file(local_json, inspection_bucket_name, s3_key,
-                                      ExtraArgs={"ContentType": "application/json"})
+                from delivery import artifact_uploader as AU
+                _out = AU.ArtifactUploader(s3_client=s3_client,
+                                           verbose=False).upload(
+                    local_json, "inspection_json",
+                    camera_id=full_camera_id(camera), session_ts=batch_key,
+                    s3_bucket=inspection_bucket_name, s3_key=s3_key,
+                    content_type="application/json")
+                # The ingest POST points at this URI, so it has to be where the
+                # object actually landed rather than where we asked for it.
+                s3_uri = _out.s3_uri
+                entry["s3_uri"] = s3_uri
                 entry["status"] = "uploaded"
             except Exception as e:
                 log.error("[DASHBOARD] JSON upload failed %s: %s", s3_uri, e)

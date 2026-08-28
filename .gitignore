@@ -39,3 +39,11 @@ env/
 .idea/
 .DS_Store
 Thumbs.db
+
+# --- Secrets --------------------------------------------------------------
+# `.env` holds the Artifact Upload API token (X-ML-Upload-Token) and any AWS
+# keys the host still needs. It is per-machine configuration, never source.
+# `.env.example` IS committed, with placeholders only.
+.env
+.env.*
+!.env.example
